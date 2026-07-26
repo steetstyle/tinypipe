@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use tinypipe_api::storage::GraphStorage;
-use tinypipe_api::types::GraphId;
+use tinypipe_api::types::{GraphId, Version};
 use tinypipe_api::types::{Context, Value};
 use tinypipe_compiler::{auto_repair, compile, transform};
 use tinypipe_storage::SqliteStorage;
@@ -44,6 +44,9 @@ fn main() {
         eprintln!("Commands:");
         eprintln!("  create <name> <code>              Create a new graph from code");
         eprintln!("  create --from-llm <name> <desc>    Create a graph from natural language");
+        eprintln!("  deploy <id> [version]              Deploy a graph version (default: current)");
+        eprintln!("  rollback <id> <version>            Rollback to a previous version");
+        eprintln!("  versions <id>                      List all versions of a graph");
         eprintln!("  update <id> <code>                Update a graph (new version)");
         eprintln!("  execute <id> [json_input]         Execute a graph");
         eprintln!("  list                              List graphs");
@@ -96,6 +99,35 @@ fn main() {
         "list" => {
             cmd_list();
         }
+        "deploy" => {
+            if args.len() < 3 {
+                eprintln!("Usage: tinypipe-cli deploy <id> [version]");
+                std::process::exit(1);
+            }
+            let version = args.get(3).and_then(|v| v.parse::<u64>().ok()).map(Version);
+            cmd_deploy(&args[2], version);
+        }
+        "rollback" => {
+            if args.len() < 4 {
+                eprintln!("Usage: tinypipe-cli rollback <id> <version>");
+                std::process::exit(1);
+            }
+            let version = match args[3].parse::<u64>() {
+                Ok(v) => Version(v),
+                Err(_) => {
+                    eprintln!("Error: version must be a number, got '{}'", args[3]);
+                    std::process::exit(1);
+                }
+            };
+            cmd_rollback(&args[2], version);
+        }
+        "versions" => {
+            if args.len() < 3 {
+                eprintln!("Usage: tinypipe-cli versions <id>");
+                std::process::exit(1);
+            }
+            cmd_versions(&args[2]);
+        }
         "check" => {
             if args.len() < 3 {
                 eprintln!("Usage: tinypipe-cli check <code>");
@@ -105,7 +137,7 @@ fn main() {
         }
         _ => {
             eprintln!("Unknown command: {command}");
-            eprintln!("Commands: create, update, execute, list, check");
+            eprintln!("Commands: create, deploy, rollback, versions, update, execute, list, check");
             std::process::exit(1);
         }
     }
@@ -384,6 +416,109 @@ fn cmd_execute(id: &str, input_json: &str) {
             eprintln!("  Error: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// `tinypipe-cli deploy <id> [version]` — deploy a graph version.
+fn cmd_deploy(id: &str, version: Option<Version>) {
+    let storage = open_storage();
+    let graph_id = resolve_graph_id(&storage, id);
+
+    let deploy_version = match version {
+        Some(v) => v,
+        None => {
+            // Default: deploy current version
+            let graph = storage.load_graph(&graph_id).unwrap_or_else(|e| {
+                eprintln!("Error loading graph: {e}");
+                std::process::exit(1);
+            });
+            graph.version
+        }
+    };
+
+    match storage.deploy(&graph_id, deploy_version) {
+        Ok(()) => {
+            println!("✓ Deployed {} (version {})", graph_id.0, deploy_version.0);
+            let g = storage.load_graph(&graph_id).unwrap_or_else(|e| {
+                eprintln!("Error reloading graph: {e}");
+                std::process::exit(1);
+            });
+            println!("  Status: {} — Active version: v{}", g.status, deploy_version.0);
+        }
+        Err(e) => {
+            eprintln!("✗ Deploy failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `tinypipe-cli rollback <id> <version>` — rollback to a previous version.
+fn cmd_rollback(id: &str, version: Version) {
+    let storage = open_storage();
+    let graph_id = resolve_graph_id(&storage, id);
+
+    match storage.rollback(&graph_id, version) {
+        Ok(()) => {
+            let g = storage.load_graph(&graph_id).unwrap_or_else(|e| {
+                eprintln!("Error reloading graph: {e}");
+                std::process::exit(1);
+            });
+            println!("✓ Rolled back to v{} — new version is v{}", version.0, g.version.0);
+            println!("  Code: {}", g.code);
+            if g.active {
+                println!("  Status: deployed (active_version updated)");
+            }
+        }
+        Err(e) => {
+            eprintln!("✗ Rollback failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `tinypipe-cli versions <id>` — list all versions of a graph.
+fn cmd_versions(id: &str) {
+    let storage = open_storage();
+    let graph_id = resolve_graph_id(&storage, id);
+
+    // Load graph to get current info
+    let graph = match storage.load_graph(&graph_id) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error loading graph: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let versions = match storage.list_versions(&graph_id) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error listing versions: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if versions.is_empty() {
+        println!("No versions found for graph '{}'.", graph.name);
+        return;
+    }
+
+    println!("Versions for '{}' ({}):", graph.name, graph_id.0);
+    println!("{:<8} {:<8} {:<20} Code", "Version", "Active", "Created");
+    println!("{}", "-".repeat(90));
+    let active_ver = graph.active_version.map(|v| v.0);
+    for (ver, code, created) in &versions {
+        let is_active = if Some(*ver) == active_ver {
+            "◄── DEPLOYED"
+        } else if *ver == graph.version.0 {
+            "   (latest)"
+        } else {
+            ""
+        };
+        let preview: String = code.lines().next()
+            .unwrap_or(code)
+            .chars().take(50).collect();
+        println!("  v{:<5} {:<11} {:<20} {}", ver, is_active, created, preview);
     }
 }
 

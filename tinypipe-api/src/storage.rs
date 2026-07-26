@@ -18,6 +18,8 @@ pub struct GraphDefinition {
     pub code: String,
     pub execution_plan: Option<Vec<u8>>,
     pub active: bool,
+    /// Hangi versiyonun deploy edildiği (None = draft).
+    pub active_version: Option<Version>,
     pub parent_id: Option<GraphId>,
     /// Branch tree: hangi node'dan fork edildi (string ID).
     pub fork_node: Option<String>,
@@ -37,6 +39,14 @@ pub trait GraphStorage: Send + Sync {
 
     /// Graph'ı deployment'a al. `active` flag'ini yeni versiyona çevir.
     fn deploy(&self, id: &GraphId, version: Version) -> Result<(), StorageError>;
+
+    /// Graph'ı belirtilen versiyona döndür (rollback).
+    /// `graphs` tablosundaki code + version'ı eski versiyona çeker,
+    /// `active_version`'ı da günceller (eğer deploy edilmişse).
+    fn rollback(&self, id: &GraphId, version: Version) -> Result<(), StorageError>;
+
+    /// Bir graph'ın tüm versiyonlarını listele.
+    fn list_versions(&self, id: &GraphId) -> Result<Vec<(u64, String, String)>, StorageError>;
 
     /// Graph'ın execution_plan blob'unu (FlatBuffers IR) yükle.
     fn load_plan(&self, id: &GraphId) -> Result<Vec<u8>, StorageError>;
@@ -107,6 +117,14 @@ mod tests {
 
         fn deploy(&self, _id: &GraphId, _version: Version) -> Result<(), StorageError> {
             Ok(())
+        }
+
+        fn rollback(&self, _id: &GraphId, _version: Version) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn list_versions(&self, _id: &GraphId) -> Result<Vec<(u64, String, String)>, StorageError> {
+            Ok(vec![(1, "def graph(): pass".into(), "0".into())])
         }
 
         fn load_plan(&self, _id: &GraphId) -> Result<Vec<u8>, StorageError> {

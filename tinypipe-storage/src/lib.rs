@@ -356,6 +356,77 @@ impl GraphStorage for SqliteStorage {
         Ok(())
     }
 
+    fn list_versions(&self, id: &GraphId) -> Result<Vec<(u64, String, String)>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT version, code, created_at FROM graph_versions WHERE graph_id = ?1 ORDER BY version ASC"
+        ).map_err(|e| StorageError::Internal(format!("list_versions prepare: {}", e)))?;
+        let rows = stmt.query_map(params![id.0], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }).map_err(|e| StorageError::Internal(format!("list_versions query: {}", e)))?;
+        let mut versions = Vec::new();
+        for row in rows {
+            versions.push(row.map_err(|e| StorageError::Internal(format!("list_versions row: {}", e)))?);
+        }
+        Ok(versions)
+    }
+
+    fn rollback(&self, id: &GraphId, version: Version) -> Result<(), StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let ver = version.0 as i64;
+
+        // 1. Verify target version exists in graph_versions
+        let (old_code, old_created): (String, String) = conn.query_row(
+            "SELECT code, created_at FROM graph_versions WHERE graph_id = ?1 AND version = ?2",
+            params![id.0, ver],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|_| StorageError::VersionNotFound(version, id.clone()))?;
+
+        // 2. Update the main graph row: code + version + updated_at
+        //    Don't change the current version counter — rollback creates a NEW version
+        //    that restores old code. This preserves audit trail.
+        let now = Self::now();
+
+        // Get current max version
+        let max_ver: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM graph_versions WHERE graph_id = ?1",
+            params![id.0],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        let new_version = max_ver + 1;
+
+        conn.execute(
+            "UPDATE graphs SET code = ?1, version = ?2, updated_at = ?3 WHERE id = ?4",
+            params![old_code, new_version, now, id.0],
+        ).map_err(|e| StorageError::Internal(format!("rollback update failed: {}", e)))?;
+
+        // 3. Insert a new version snapshot with the old code + a note
+        conn.execute(
+            "INSERT INTO graph_versions (graph_id, version, code, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id.0, new_version, old_code, now],
+        ).map_err(|e| StorageError::Internal(format!("rollback version insert failed: {}", e)))?;
+
+        // 4. If deployed, update active_version to the rollback version
+        let is_deployed: bool = conn.query_row(
+            "SELECT COUNT(*) FROM graphs WHERE id = ?1 AND status = 'deployed'",
+            params![id.0],
+            |row| row.get::<_, i64>(0),
+        ).map(|c| c > 0).unwrap_or(false);
+        if is_deployed {
+            conn.execute(
+                "UPDATE graphs SET active_version = ?1 WHERE id = ?2",
+                params![new_version, id.0],
+            ).map_err(|e| StorageError::Internal(format!("rollback active_version failed: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
     fn load_plan(&self, id: &GraphId) -> Result<Vec<u8>, StorageError> {
         let conn = self.conn.lock().unwrap();
         let plan: Vec<u8> = conn.query_row(
@@ -374,6 +445,7 @@ impl GraphStorage for SqliteStorage {
             params![id.0],
             |row| {
                 let parent_id: Option<String> = row.get(6)?;
+                let active_ver: Option<i64> = row.get(5)?;
                 Ok(GraphDefinition {
                     id: GraphId::new(&row.get::<_, String>(0)?),
                     name: row.get(1)?,
@@ -381,7 +453,8 @@ impl GraphStorage for SqliteStorage {
                     status: row.get(3)?,
                     code: row.get(4)?,
                     execution_plan: None, // loaded separately via load_plan
-                    active: row.get::<_, Option<i64>>(5)?.is_some(),
+                    active: active_ver.is_some(),
+                    active_version: active_ver.map(|v| Version(v as u64)),
                     parent_id: parent_id.map(|p| GraphId::new(&p)),
                     fork_node: row.get(7)?,
                     fork_label: row.get(8)?,
@@ -547,6 +620,7 @@ impl GraphStorage for SqliteStorage {
 
         let rows = stmt.query_map(params![id.0], |row| {
             let parent_id: Option<String> = row.get(6)?;
+            let active_ver: Option<i64> = row.get(5)?;
             Ok(GraphDefinition {
                 id: GraphId::new(&row.get::<_, String>(0)?),
                 name: row.get(1)?,
@@ -554,7 +628,8 @@ impl GraphStorage for SqliteStorage {
                 status: row.get(3)?,
                 code: row.get(4)?,
                 execution_plan: None,
-                active: row.get::<_, Option<i64>>(5)?.is_some(),
+                active: active_ver.is_some(),
+                active_version: active_ver.map(|v| Version(v as u64)),
                 parent_id: parent_id.map(|p| GraphId::new(&p)),
                 fork_node: row.get(7)?,
                 fork_label: row.get(8)?,
@@ -638,6 +713,45 @@ mod tests {
         let g = store.load_graph(&id).unwrap();
         assert_eq!(g.status, "deployed");
         assert!(g.active);
+    }
+
+    #[test]
+    fn test_rollback_restores_old_code() {
+        let store = setup();
+        let id = store.create_graph("test", "def graph(): return 1").unwrap();
+        store.update_graph(&id, "def graph(): return 2").unwrap();
+        store.update_graph(&id, "def graph(): return 3").unwrap();
+
+        // Rollback to v1
+        store.rollback(&id, Version(1)).unwrap();
+        let g = store.load_graph(&id).unwrap();
+        assert_eq!(g.code, "def graph(): return 1");
+        // Version should be 4 (rollback creates a new version, preserving history)
+        assert_eq!(g.version.0, 4, "rollback should create a new version");
+    }
+
+    #[test]
+    fn test_rollback_updates_active_version_if_deployed() {
+        let store = setup();
+        let id = store.create_graph("test", "def graph(): return 1").unwrap();
+        store.deploy(&id, Version(1)).unwrap();
+        store.update_graph(&id, "def graph(): return 2").unwrap();
+        store.deploy(&id, Version(2)).unwrap();
+
+        // Rollback to v1 (should also update active_version since it's deployed)
+        store.rollback(&id, Version(1)).unwrap();
+        let g = store.load_graph(&id).unwrap();
+        assert_eq!(g.code, "def graph(): return 1");
+        assert!(g.active, "deployed graph should remain active after rollback");
+        assert_eq!(g.version.0, 3);
+    }
+
+    #[test]
+    fn test_rollback_nonexistent_version_returns_error() {
+        let store = setup();
+        let id = store.create_graph("test", "def graph(): pass").unwrap();
+        let result = store.rollback(&id, Version(99));
+        assert!(matches!(result, Err(StorageError::VersionNotFound(_, _))));
     }
 
     #[test]
