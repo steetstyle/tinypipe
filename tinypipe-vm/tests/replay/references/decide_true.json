@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "nodes": [
+    {"id": "input_x", "op": "Input", "args": [{"key": "name", "value": "x"}]},
+    {"id": "decide1", "op": "Decide", "args": [{"key": "condition", "value": "x > 0"}]},
+    {"id": "true_branch", "op": "Act", "args": [{"key": "type", "value": "return"}, {"key": "value", "value": "\"ok\""}]},
+    {"id": "false_branch", "op": "Act", "args": [{"key": "type", "value": "return"}, {"key": "value", "value": "\"ok\""}]}
+  ],
+  "edges": [
+    {"from": "input_x", "to": "decide1", "condition": null, "mapping": null, "priority": null, "label": null, "kind": "Data"},
+    {"from": "decide1", "to": "true_branch", "condition": "true", "mapping": null, "priority": null, "label": null, "kind": "Data"},
+    {"from": "decide1", "to": "false_branch", "condition": "false", "mapping": null, "priority": null, "label": null, "kind": "Data"}
+  ],
+  "metadata": {
+    "compiler_version": "0.1.0", "compiled_at": "", "node_count": 4, "edge_count": 3,
+    "max_node_execution_count": 10000, "max_context_memory_bytes": 10485760,
+    "max_recursion_depth": 5, "max_execution_time_ms": 30000, "optimizations": [],
+    "tool_deps": [],
+    "subgraph_dependencies": []
+  }
+}

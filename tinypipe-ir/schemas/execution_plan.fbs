@@ -1,0 +1,111 @@
+// FlatBuffers schema for tinypipe compiled execution plans.
+//
+// This schema describes the binary format produced by the compiler backend (codegen)
+// and consumed by the zero-copy VM. The Rust types in compiled.rs mirror this schema.
+//
+// IMPORTANT: Field IDs (@0, @1, ...) must NEVER be reused. When a field is removed,
+// mark it as `deprecated` and reserve its ID for forward compatibility.
+//
+// To regenerate Rust bindings:
+//   flatc --rust execution_plan.fbs
+
+// ─── Enums ──────────────────────────────────────────────────────
+
+enum Opcode : ubyte {
+    Input = 0,
+    Call = 1,
+    Calc = 2,
+    Decide = 3,
+    Switch = 4,
+    Act = 5,
+    Parallel = 6,
+    Loop = 7,
+    Wait = 8,
+    Merge = 9,
+    Error = 10,
+}
+
+enum EdgeKind : ubyte {
+    EK_Data = 0,
+    EK_Control = 1,
+}
+
+// Matches tinypipe_ir::plan::Type
+enum Type : ubyte {
+    Unspecified = 0,
+    Int = 1,
+    Float = 2,
+    String = 3,
+    Bool = 4,
+    Null = 5,
+    Any = 6,
+    List = 7,
+    Map = 8,
+}
+
+// ─── Tables ─────────────────────────────────────────────────────
+
+table CompiledArg {
+    key: string;                                  // @0
+    value: string;                                // @1 — JSON-encoded value
+}
+
+table MappingEntry {
+    from: string;                                 // @0
+    to: string;                                   // @1
+}
+
+table IdEntry {
+    id: string;                                   // @0
+    index: uint;                                  // @1
+}
+
+table ToolDep {
+    name: string;                                 // @0
+    version: string;                              // @1 — semver constraint
+    pure: bool = false;                           // @2
+    schema_hash: string;                          // @3 — SHA256 of input+output schemas
+}
+
+table CompiledNode {
+    index: uint;                                  // @0 — topological order index
+    id: string;                                   // @1 — human-readable (debug/audit)
+    op: Opcode;                                   // @2 — enum, 1 byte
+    args: [CompiledArg];                          // @3 — key-value params
+    inferred_type: Type = Unspecified;            // @4
+    branch_id: uint = 4294967295;                 // @5 — PARALLEL branch ID, default u32::MAX = None
+}
+
+table CompiledEdge {
+    from_index: uint;                             // @0
+    to_index: uint;                               // @1
+    condition: string;                            // @2 — empty = unconditional
+    mapping: [MappingEntry];                      // @3 — optional key rename
+    priority: int = 0;                            // @4 — 0 = default
+    label: string;                                // @5 — empty = no label
+    kind: EdgeKind = EK_Data;                     // @6
+}
+
+table CompiledMetadata {
+    compiler_version: string;                     // @0
+    compiled_at: string;                          // @1
+    node_count: uint;                             // @2
+    edge_count: uint;                             // @3
+    max_node_execution_count: uint = 10000;       // @4
+    max_context_memory_bytes: uint = 10485760;    // @5 — 10 MB
+    max_recursion_depth: uint = 5;               // @6
+    max_execution_time_ms: uint = 30000;          // @7
+    optimizations: [string];                      // @8
+    tool_deps: [ToolDep];                         // @9
+    subgraph_dependencies: [string];              // @10
+}
+
+table ExecutionPlan {
+    version: ushort = 3;                          // @0 — v3: FlatBuffers canonical format
+    nodes: [CompiledNode];                        // @1
+    edges: [CompiledEdge];                        // @2
+    metadata: CompiledMetadata;                   // @3
+    id_map: [IdEntry];                            // @4 — string ID → uint32 index
+}
+
+root_type ExecutionPlan;

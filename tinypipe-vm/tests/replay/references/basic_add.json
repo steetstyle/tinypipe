@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "nodes": [
+    {"id": "input_x", "op": "Input", "args": [{"key": "name", "value": "x"}]},
+    {"id": "calc_add", "op": "Calc", "args": [{"key": "expr", "value": "x + 1"}, {"key": "output", "value": "result"}]},
+    {"id": "output", "op": "Act", "args": [{"key": "type", "value": "return"}, {"key": "value", "value": "result"}]}
+  ],
+  "edges": [
+    {"from": "input_x", "to": "calc_add", "condition": null, "mapping": null, "priority": null, "label": null, "kind": "Data"},
+    {"from": "calc_add", "to": "output", "condition": null, "mapping": null, "priority": null, "label": null, "kind": "Data"}
+  ],
+  "metadata": {
+    "compiler_version": "0.1.0",
+    "compiled_at": "",
+    "node_count": 3,
+    "edge_count": 2,
+    "max_node_execution_count": 10000,
+    "max_context_memory_bytes": 10485760,
+    "max_recursion_depth": 5,
+    "max_execution_time_ms": 30000,
+    "optimizations": [],
+    "tool_deps": [],
+    "subgraph_dependencies": []
+  }
+}

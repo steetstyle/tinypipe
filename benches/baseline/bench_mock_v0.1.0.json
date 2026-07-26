@@ -1,0 +1,13 @@
+{
+  "benchmark": "bench_mock",
+  "version": "0.1.0",
+  "timestamp": "2026-07-26T00:00:00Z",
+  "results": [
+    {"name": "mock_tools factory", "mean_us": 0.721, "p50_us": 0.717, "p95_us": 0.756, "p99_us": 0.833, "min_us": 0.669, "max_us": 1.426},
+    {"name": "resolve 'math.add'", "mean_us": 0.091, "p50_us": 0.089, "p95_us": 0.095, "p99_us": 0.097, "min_us": 0.084, "max_us": 3.782},
+    {"name": "dispatch 'math.add'", "mean_us": 0.055, "p50_us": 0.054, "p95_us": 0.057, "p99_us": 0.059, "min_us": 0.052, "max_us": 0.127},
+    {"name": "dispatch 'echo'", "mean_us": 0.069, "p50_us": 0.068, "p95_us": 0.073, "p99_us": 0.074, "min_us": 0.065, "max_us": 3.377},
+    {"name": "dispatch 'test.error' (error path)", "mean_us": 0.061, "p50_us": 0.060, "p95_us": 0.063, "p99_us": 0.064, "min_us": 0.058, "max_us": 0.328},
+    {"name": "resolve nonexistent (error path)", "mean_us": 0.055, "p50_us": 0.052, "p95_us": 0.055, "p99_us": 0.057, "min_us": 0.048, "max_us": 24.037}
+  ]
+}

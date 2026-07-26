@@ -1,0 +1,24 @@
+[package]
+name = "tinypipe-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tinypipe-ir = { path = "../tinypipe-ir" }
+tinypipe-api = { path = "../tinypipe-api" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bench]]
+name = "bench_mock"
+harness = false
+
+[[bench]]
+name = "bench_executor"
+harness = false

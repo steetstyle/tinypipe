@@ -1,0 +1,20 @@
+[package]
+name = "tinypipe-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+llm = ["tinypipe-compiler/llm"]
+
+[dependencies]
+tinypipe-api = { path = "../tinypipe-api" }
+tinypipe-ir = { path = "../tinypipe-ir" }
+tinypipe-compiler = { path = "../tinypipe-compiler" }
+tinypipe-vm = { path = "../tinypipe-vm" }
+tinypipe-storage = { path = "../tinypipe-storage" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "tinypipe-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+bincode.workspace = true
+flatbuffers.workspace = true
+
+[build-dependencies]
+# flatc is invoked directly via build.rs (not via a cargo plugin)
+
+[dev-dependencies]
+serde_json.workspace = true
