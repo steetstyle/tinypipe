@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 
 use tinypipe_api::storage::GraphStorage;
+use tinypipe_api::types::GraphId;
 use tinypipe_api::types::{Context, Value};
 use tinypipe_compiler::{auto_repair, compile, transform};
 use tinypipe_storage::SqliteStorage;
@@ -260,6 +261,27 @@ fn detect_llm_provider() -> Box<dyn tinypipe_compiler::llm::LlmBackend> {
     }.into_backend()
 }
 
+/// Resolve a user-provided identifier to a GraphId.
+/// If the input is a valid UUID, use it directly.
+/// Otherwise, look up by name in the storage.
+fn resolve_graph_id(storage: &SqliteStorage, input: &str) -> GraphId {
+    // Try as UUID first
+    if let Ok(items) = storage.list_all_graphs(None, None) {
+        // Check if input matches a UUID directly
+        let by_uuid = items.iter().find(|g| g.id == input);
+        if let Some(item) = by_uuid {
+            return GraphId::new(&item.id);
+        }
+        // Check by name
+        let by_name = items.iter().find(|g| g.name == input);
+        if let Some(item) = by_name {
+            return GraphId::new(&item.id);
+        }
+    }
+    // Fallback: treat as UUID anyway (will get a proper error from storage)
+    GraphId::new(input)
+}
+
 /// `tinypipe-cli update <id> <code>` — compile new code and save as a new version.
 fn cmd_update(id: &str, code: &str) {
     let output = match compile(code) {
@@ -272,7 +294,7 @@ fn cmd_update(id: &str, code: &str) {
     };
 
     let storage = open_storage();
-    let graph_id = tinypipe_api::types::GraphId::new(id);
+    let graph_id = resolve_graph_id(&storage, id);
     match storage.update_graph(&graph_id, code) {
         Ok(version) => {
             println!("✓ Graph updated: {} (version {})", id, version.0);
@@ -292,7 +314,7 @@ fn cmd_update(id: &str, code: &str) {
 /// `tinypipe-cli execute <id> [json_input]` — load and execute a graph.
 fn cmd_execute(id: &str, input_json: &str) {
     let storage = open_storage();
-    let graph_id = tinypipe_api::types::GraphId::new(id);
+    let graph_id = resolve_graph_id(&storage, id);
     let graph_def = match storage.load_graph(&graph_id) {
         Ok(g) => g,
         Err(e) => {
@@ -406,7 +428,10 @@ fn cmd_check(code: &str) {
 // ─── Helpers ───────────────────────────────────────────────────────
 
 fn open_storage() -> SqliteStorage {
-    SqliteStorage::in_memory().expect("Failed to create in-memory storage")
+    let db_path = std::env::var("TINYPIPE_DB")
+        .unwrap_or_else(|_| "./tinypipe.db".to_string());
+    SqliteStorage::open(&db_path)
+        .unwrap_or_else(|_| panic!("Failed to open storage at '{}'", db_path))
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
