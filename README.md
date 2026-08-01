@@ -237,7 +237,7 @@ The compiler pipeline:
 | `execute <id> <json> --pause-after N` | Run, pause after N nodes, save a checkpoint |
 | `resume <execution_id> [--max-nodes N]` | Resume a paused execution from its checkpoint |
 | `scheduler run [--max-nodes N]` | Resume all paused executions (budgeted loop mode with `--max-nodes`) |
-| `plan <id> [version] [--format text\|mermaid\|dot]` | Dump the compiled plan (mermaid/dot graphs renderable in mermaid.live / graphviz) |
+| `plan <id> [version]` | Dump the compiled plan as plain text |
 | `list` | List all graphs |
 
 IDs can be either a UUID or the graph name (the CLI resolves it).
@@ -516,7 +516,7 @@ It checks `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, then falls back to a local Olla
 tinypipe-api/        — shared types (Context, Value, GraphId, Scope)
 tinypipe-compiler/   — sanitizer, transformer, validator, optimizer, codegen
 tinypipe-ir/         — ExecutionPlan + CompiledPlan + FlatBuffers schema
-                       + plan_dump: text/mermaid/dot renderers (CLI'den bağımsız)
+                       + plan_dump: plain-text renderer (CLI'den bağımsız)
 tinypipe-storage/    — SQLite implementation of GraphStorage trait
 tinypipe-tools/      — MockToolRegistry + built-in tools (each tool in its own file):
                        math.add/mul, string.len, echo, test.*, http_request (ureq),
