@@ -188,11 +188,25 @@ def graph(x: int, y: int):
 ```
 
 ```python
-# Dict/array subscript with constant keys
+# Dict/array subscript — constant or dynamic keys
 def graph():
     d = {"key": 42}
     return d["key"]
 ```
+
+```python
+# Dynamic keys: items[i], items[a + b], items[obj.attr], nested d["a"]["b"],
+# chains items[i].name — all supported. Negative indices use Python semantics.
+def graph(items: list, i: int):
+    return items[i].name
+```
+
+Subscript semantics are **strict**: a missing key or out-of-bounds index is a
+runtime error, and subscripting `null` errors too. For *optional* lookups (a key
+or element that may legitimately not exist) use the lenient tools instead:
+`call("array.find", array=items, key="product_id", value=101)` returns the first
+matching element or `null`, and `call("dict.get", obj=d, key="x", default=0)`
+returns the value, the `default`, or `null`. Check `null` with `== null`.
 
 ```python
 # Graph metadata — META(...) at module level, before `def graph`.
@@ -229,7 +243,7 @@ def graph(x: int, y: int):
     return 0
 ```
 
-**What's forbidden:** `import`, `class`, `lambda`, `while`, `try`/`except`, `async`, comprehensions, f-strings, walrus operator (`:=`), `global`, `nonlocal`, `yield`, `del`, decorators, nested functions, dynamic subscript keys (`items[a + b]`).
+**What's forbidden:** `import`, `class`, `lambda`, `while`, `try`/`except`, `async`, comprehensions, f-strings, walrus operator (`:=`), `global`, `nonlocal`, `yield`, `del`, decorators, nested functions, slicing (`items[a:b]`), `**kwargs`.
 
 **Money & numbers — kuruş-int rule:** the type system is `int`/`float` only; there is no `Decimal`/money type. Money amounts are always integer **kuruş** (100 kuruş = 1 TL): store, compute and return amounts as `int` — e.g. `price = 2499` means 24.99 TL — never as `float`. If a computation involves division, round back to integer kuruş at the boundary (`total = round(total / 1.18)` is fine as long as the money value itself stays `int`; the rule is that a money value must never *be* a float). Convention: name money variables with a `_kurus` (or `_cents`) suffix so the unit is explicit, e.g. `vat_kurus`, `total_cents`.
 
@@ -485,6 +499,38 @@ def graph():
     n = call("array.len", array=items)
     return {"count": n, "items": items}
 
+# seed_posts — input comes from the caller via kwargs
+def graph(user_id: int):
+    resp = call("http_request",
+                url="https://jsonplaceholder.typicode.com/posts?userId=" + user_id)
+    items = call("json.parse", json=resp.body)
+    n = call("array.len", array=items)
+    return {"count": n, "items": items}
+
+# seed_albums — same shape, albums per user
+def graph(user_id: int):
+    resp = call("http_request",
+                url="https://jsonplaceholder.typicode.com/albums?userId=" + user_id)
+    items = call("json.parse", json=resp.body)
+    n = call("array.len", array=items)
+    return {"count": n, "items": items}
+
+# seed_photos — no input needed (fixed album)
+def graph():
+    resp = call("http_request",
+                url="https://jsonplaceholder.typicode.com/photos?albumId=1")
+    items = call("json.parse", json=resp.body)
+    n = call("array.len", array=items)
+    return {"count": n, "items": items}
+
+# seed_todos — todos per user
+def graph(user_id: int):
+    resp = call("http_request",
+                url="https://jsonplaceholder.typicode.com/todos?userId=" + user_id)
+    items = call("json.parse", json=resp.body)
+    n = call("array.len", array=items)
+    return {"count": n, "items": items}
+
 # seed_comments — input comes from the caller via kwargs
 def graph(post_id: int):
     resp = call("http_request",
@@ -504,7 +550,7 @@ def graph(user_id: int):
     photos = call("subgraph:seed_photos")
     todos = call("subgraph:seed_todos", user_id=user_id)
     total_comments = 0
-    for i in range(10):
+    for i in range(len(posts.items)):
         p = call("list.get", array=posts.items, index=i)
         c = call("subgraph:seed_comments", post_id=p.id)   # per-post subgraph call
         total_comments = total_comments + c.count
@@ -513,7 +559,8 @@ def graph(user_id: int):
 ```
 
 ```bash
-$ tinypipe-cli create seed_users "<code>" && tinypipe-cli create seed_comments "<code>"
+$ tinypipe-cli create seed_users "<code>"      # then the same for seed_posts,
+$ tinypipe-cli create seed_comments "<code>"   # seed_albums, seed_photos, seed_todos
 $ tinypipe-cli create dashboard_seeds "<parent code>"
 $ tinypipe-cli execute dashboard_seeds '{"user_id": 1}'
 ✓ Execution completed
@@ -667,7 +714,7 @@ rejected with `Unauthenticated` and its tools never register.
 ```bash
 # See the remote tools next to built-ins
 $ tinypipe-cli tools list
-Built-in tools (16): array.len, echo, env.get, ...
+Built-in tools (18): array.len, echo, env.get, ...
 Daemon tools (2 via 127.0.0.1:50051):
   send_email — Sends an email (stub). [timeout 5000ms]
   text.reverse — Reverses a string.
@@ -825,6 +872,7 @@ tinypipe-storage/    — SQLite implementation of GraphStorage trait
 tinypipe-tools/      — MockToolRegistry + built-in tools (each tool in its own file):
                        math.add/mul, string.len, echo, test.*, http_request (ureq),
                        json.parse, array.len, list.get, array.count_where,
+                       array.find, dict.get,
                        postgres (blocking NoTLS) — heavy deps live only here
 tinypipe-vm/         — DAG interpreter + pause/resume + parallel tool execution
 tinypipe-scheduler/  — resumes paused executions from checkpoints
@@ -844,9 +892,9 @@ benches/             — baseline benchmarks
 - The VM executes plans correctly (22 μs for a 3-node graph)
 - Versioning, deploy, and rollback all work with full audit trail
 - Pause/resume with persisted checkpoints, scheduler, and threaded PARALLEL blocks
-- Scope isolation and subscript restrictions are enforced
+- Scope isolation is enforced; subscripts are strict (missing key/index → runtime error)
 - Real tools via `tinypipe-tools`: `http_request` (GET/POST with headers/body), `json.parse`,
-  `array.len`/`list.get`/`array.count_where`, and `postgres` (query with params) —
+  `array.len`/`list.get`/`array.count_where`/`array.find`/`dict.get`, and `postgres` (query with params) —
   dispatchable from DSL with `call("http_request", url=..., ...)`; loops with `range()`
   and string concatenation (`"..." + x`) are first-class DSL features
 - Remote tools: `tinypipe-daemon` + workers in any language (Go SDK in
