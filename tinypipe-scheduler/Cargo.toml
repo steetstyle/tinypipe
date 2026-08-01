@@ -1,0 +1,17 @@
+[package]
+name = "tinypipe-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Resumes paused tinypipe executions (checkpoint-based scheduler)"
+
+[dependencies]
+tinypipe-api = { path = "../tinypipe-api" }
+tinypipe-ir = { path = "../tinypipe-ir" }
+tinypipe-vm = { path = "../tinypipe-vm" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tinypipe-storage = { path = "../tinypipe-storage" }

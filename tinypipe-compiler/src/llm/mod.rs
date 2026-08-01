@@ -34,15 +34,15 @@
 
 pub mod provider;
 
+use crate::auto_repair;
 use std::fmt;
 use std::time::{Duration, Instant};
 use tinypipe_ir::compiled::CompiledPlan;
 use tinypipe_ir::plan::ExecutionPlan;
-use crate::auto_repair;
 
 // ─── Re-exports ───────────────────────────────────────────────────────
 
-pub use provider::{Provider, OllamaConfig};
+pub use provider::{OllamaConfig, Provider};
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -86,7 +86,9 @@ impl fmt::Display for LlmError {
             LlmError::InvalidCode(msg) => write!(f, "LLM generated invalid code: {}", msg),
             LlmError::CompilerRejected(msg) => write!(f, "Compiler rejected LLM output: {}", msg),
             LlmError::NoBackend => write!(f, "No LLM backend configured"),
-            LlmError::RateLimited(dur) => write!(f, "LLM rate limited, retry in {}s", dur.as_secs()),
+            LlmError::RateLimited(dur) => {
+                write!(f, "LLM rate limited, retry in {}s", dur.as_secs())
+            }
             LlmError::Other(msg) => write!(f, "LLM error: {}", msg),
         }
     }
@@ -114,13 +116,13 @@ pub trait LlmBackend: Send + Sync {
     fn generate_plan(&self, prompt: &str, context: &LlmContext) -> Result<ExecutionPlan, LlmError> {
         // Default: generate code, compile it
         let code = self.generate_code(prompt, context)?;
-        crate::transform::transform(&code)
-            .map_err(|errors| {
-                let msgs: Vec<String> = errors.iter()
-                    .map(|e| format!("{}:{} — {}", e.line, e.column, e.message))
-                    .collect();
-                LlmError::InvalidCode(msgs.join("\n"))
-            })
+        crate::transform::transform(&code).map_err(|errors| {
+            let msgs: Vec<String> = errors
+                .iter()
+                .map(|e| format!("{}:{} — {}", e.line, e.column, e.message))
+                .collect();
+            LlmError::InvalidCode(msgs.join("\n"))
+        })
     }
 
     /// Provider name for logging/metrics.
@@ -324,7 +326,7 @@ pub fn compile_from_natural_language(
 
     // All attempts exhausted
     Err(LlmError::CompilerRejected(
-        last_error.unwrap_or_else(|| "Max repair attempts reached".into())
+        last_error.unwrap_or_else(|| "Max repair attempts reached".into()),
     ))
 }
 
@@ -356,10 +358,7 @@ That should do it.
     fn test_extract_code_from_response_generic_block() {
         let response = "```\ndef graph(x):\n    return x\n```";
         let code = extract_code_from_response(response);
-        assert_eq!(
-            code.as_deref(),
-            Some("def graph(x):\n    return x")
-        );
+        assert_eq!(code.as_deref(), Some("def graph(x):\n    return x"));
     }
 
     #[test]
@@ -398,17 +397,14 @@ That should do it.
     #[test]
     fn test_compile_from_natural_language_mock_ok() {
         // Must have at least one INPUT node and reach a terminal (ACT)
-        let backend = MockBackend::new(Ok(
-            "def graph(x: int):\n    return x".into()
-        ));
+        let backend = MockBackend::new(Ok("def graph(x: int):\n    return x".into()));
         let context = LlmContext::default();
-        let result = compile_from_natural_language(
-            "return input x",
-            &backend,
-            &context,
-            3,
+        let result = compile_from_natural_language("return input x", &backend, &context, 3);
+        assert!(
+            result.is_ok(),
+            "Should compile successfully: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Should compile successfully: {:?}", result.err());
         let plan = result.unwrap();
         assert!(plan.version >= 1);
         assert!(!plan.nodes.is_empty());
@@ -422,20 +418,17 @@ That should do it.
             Ok("def graph(x: int):\n    return x".into()),
         ]);
         let context = LlmContext::default();
-        let result = compile_from_natural_language(
-            "return input x",
-            &backend,
-            &context,
-            3,
+        let result = compile_from_natural_language("return input x", &backend, &context, 3);
+        assert!(
+            result.is_ok(),
+            "Should succeed after repair: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Should succeed after repair: {:?}", result.err());
     }
 
     #[test]
     fn test_compile_from_natural_language_mock_all_fail() {
-        let backend = MockBackend::new(Ok(
-            "def graph(x: int):\n    invalid syntax{{{}}".into()
-        ));
+        let backend = MockBackend::new(Ok("def graph(x: int):\n    invalid syntax{{{}}".into()));
         let context = LlmContext::default();
         let result = compile_from_natural_language(
             "return input x",

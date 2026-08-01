@@ -1146,9 +1146,11 @@ dependencies = [
  "tinypipe-api",
  "tinypipe-compiler",
  "tinypipe-ir",
+ "tinypipe-scheduler",
  "tinypipe-storage",
  "tinypipe-vm",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1175,6 +1177,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "tinypipe-scheduler"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "tinypipe-api",
+ "tinypipe-ir",
+ "tinypipe-storage",
+ "tinypipe-vm",
+ "tracing",
 ]
 
 [[package]]

@@ -52,7 +52,8 @@ pub fn infer_node_type(node: &Node) -> Type {
     match node.op {
         Opcode::Input => {
             // INPUT may have a type annotation in args
-            node.args.iter()
+            node.args
+                .iter()
                 .find(|a| a.key == "type")
                 .and_then(|a| match &a.value {
                     ArgValue::String(s) => parse_type_name(s),
@@ -61,7 +62,9 @@ pub fn infer_node_type(node: &Node) -> Type {
                 .unwrap_or(Type::Any)
         }
         Opcode::Calc => {
-            let expr = node.args.iter()
+            let expr = node
+                .args
+                .iter()
                 .find(|a| a.key == "expr")
                 .and_then(|a| match &a.value {
                     ArgValue::String(s) => Some(s.as_str()),
@@ -86,10 +89,7 @@ pub fn infer_node_type(node: &Node) -> Type {
 }
 
 /// Validate a single node's type constraints.
-fn validate_node(
-    node: &Node,
-    types: &std::collections::HashMap<&str, Type>,
-) -> Result<(), String> {
+fn validate_node(node: &Node, types: &std::collections::HashMap<&str, Type>) -> Result<(), String> {
     match node.op {
         Opcode::Calc => validate_calc(node),
         Opcode::Decide => validate_decide(node, types),
@@ -100,7 +100,9 @@ fn validate_node(
 
 /// Validate a CALC expression for type errors.
 fn validate_calc(node: &Node) -> Result<(), String> {
-    let expr = match node.args.iter()
+    let expr = match node
+        .args
+        .iter()
         .find(|a| a.key == "expr")
         .and_then(|a| match &a.value {
             ArgValue::String(s) => Some(s.as_str()),
@@ -205,7 +207,10 @@ fn infer_expr_type(expr: &str) -> Type {
     }
 
     // Pure numeric literal
-    if trimmed.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.') {
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '-' || c == '.')
+    {
         if trimmed.contains('.') {
             return Type::Float;
         }
@@ -219,9 +224,12 @@ fn infer_expr_type(expr: &str) -> Type {
     }
 
     // Comparison operators → Bool
-    if trimmed.contains("==") || trimmed.contains("!=")
-        || trimmed.contains(">=") || trimmed.contains("<=")
-        || trimmed.contains(">") || trimmed.contains("<")
+    if trimmed.contains("==")
+        || trimmed.contains("!=")
+        || trimmed.contains(">=")
+        || trimmed.contains("<=")
+        || trimmed.contains(">")
+        || trimmed.contains("<")
     {
         return Type::Bool;
     }
@@ -266,16 +274,14 @@ mod tests {
     use super::*;
 
     fn calc_node(id: &str, expr: &str) -> Node {
-        Node::new(id, Opcode::Calc)
-            .with_arg("expr", ArgValue::String(expr.into()))
+        Node::new(id, Opcode::Calc).with_arg("expr", ArgValue::String(expr.into()))
     }
 
     #[test]
     fn test_check_no_errors() {
         let nodes = vec![
             calc_node("n1", "x + 1"),
-            Node::new("n2", Opcode::Act)
-                .with_arg("type", ArgValue::String("return".into())),
+            Node::new("n2", Opcode::Act).with_arg("type", ArgValue::String("return".into())),
         ];
         let errors = check_types(&nodes);
         assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
@@ -283,43 +289,48 @@ mod tests {
 
     #[test]
     fn test_check_string_division() {
-        let nodes = vec![
-            calc_node("n1", "\"hello\" / 2"),
-        ];
+        let nodes = vec![calc_node("n1", "\"hello\" / 2")];
         let errors = check_types(&nodes);
-        assert!(!errors.is_empty(), "expected type error for string division");
+        assert!(
+            !errors.is_empty(),
+            "expected type error for string division"
+        );
         assert!(errors[0].message.contains("Type error"));
         assert!(errors[0].message.contains("string"));
     }
 
     #[test]
     fn test_check_string_multiplication() {
-        let nodes = vec![
-            calc_node("n1", "\"hello\" * 3"),
-        ];
+        let nodes = vec![calc_node("n1", "\"hello\" * 3")];
         let errors = check_types(&nodes);
         // String * int is debatable — but our rules disallow it
-        assert!(!errors.is_empty(), "expected type error for string multiplication");
+        assert!(
+            !errors.is_empty(),
+            "expected type error for string multiplication"
+        );
     }
 
     #[test]
     fn test_check_bool_arithmetic() {
-        let nodes = vec![
-            calc_node("n1", "true / false"),
-        ];
+        let nodes = vec![calc_node("n1", "true / false")];
         let errors = check_types(&nodes);
-        assert!(!errors.is_empty(), "expected type error for bool arithmetic");
+        assert!(
+            !errors.is_empty(),
+            "expected type error for bool arithmetic"
+        );
         assert!(errors[0].message.contains("boolean"));
     }
 
     #[test]
     fn test_check_string_concat_ok() {
         // string + string is OK
-        let nodes = vec![
-            calc_node("n1", "\"hello\" + \" world\""),
-        ];
+        let nodes = vec![calc_node("n1", "\"hello\" + \" world\"")];
         let errors = check_types(&nodes);
-        assert!(errors.is_empty(), "expected no error for string concat, got: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "expected no error for string concat, got: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -399,24 +410,23 @@ mod tests {
 
     #[test]
     fn test_decide_string_numeric_warning() {
-        let nodes = vec![
-            Node::new("d1", Opcode::Decide)
-                .with_arg("source", ArgValue::String("\"hello\"".into()))
-                .with_arg("value", ArgValue::String("42".into()))
-                .with_arg("op", ArgValue::String("eq".into())),
-        ];
+        let nodes = vec![Node::new("d1", Opcode::Decide)
+            .with_arg("source", ArgValue::String("\"hello\"".into()))
+            .with_arg("value", ArgValue::String("42".into()))
+            .with_arg("op", ArgValue::String("eq".into()))];
         let errors = check_types(&nodes);
-        assert!(!errors.is_empty(), "expected warning for string vs numeric compare");
+        assert!(
+            !errors.is_empty(),
+            "expected warning for string vs numeric compare"
+        );
     }
 
     #[test]
     fn test_decide_numeric_ok() {
-        let nodes = vec![
-            Node::new("d1", Opcode::Decide)
-                .with_arg("source", ArgValue::String("$x".into()))
-                .with_arg("value", ArgValue::String("42".into()))
-                .with_arg("op", ArgValue::String("eq".into())),
-        ];
+        let nodes = vec![Node::new("d1", Opcode::Decide)
+            .with_arg("source", ArgValue::String("$x".into()))
+            .with_arg("value", ArgValue::String("42".into()))
+            .with_arg("op", ArgValue::String("eq".into()))];
         let errors = check_types(&nodes);
         assert!(errors.is_empty(), "expected no error, got: {:?}", errors);
     }

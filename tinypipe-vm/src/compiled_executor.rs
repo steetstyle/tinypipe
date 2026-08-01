@@ -26,6 +26,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use tinypipe_api::tool_registry::ToolRegistry;
@@ -34,12 +35,21 @@ use tinypipe_ir::compiled::{CompiledEdge, CompiledNode, CompiledPlan};
 use tinypipe_ir::plan::{EdgeKind, Opcode};
 
 use crate::error::{check_version_compatibility, ExecutionError, ExecutionResult};
+use crate::pause::{Checkpoint, ExecutionOutcome, LoopState, PausePolicy, StepObserver};
+
+/// `run_node`'un dönüşü: node tamamlandı ya da (sadece LOOP gövdesi içinde)
+/// pause politikası tetiklendi.
+#[derive(Debug)]
+enum NodeOutcome {
+    Ok,
+    Paused(LoopState),
+}
 
 /// Execution engine for CompiledPlan (binary bincode or FlatBuffers format).
 pub struct CompiledExecutor<'a> {
     plan: &'a CompiledPlan,
     registry: &'a dyn ToolRegistry,
-    recursion_depth: Cell<u32>,
+    recursion_depth: AtomicU32,
     max_recursion_depth: u32,
     /// Pre-computed count of incoming Control edges per node index.
     control_pred_count: Vec<u32>,
@@ -61,7 +71,7 @@ impl<'a> CompiledExecutor<'a> {
         CompiledExecutor {
             plan,
             registry,
-            recursion_depth: Cell::new(0),
+            recursion_depth: AtomicU32::new(0),
             max_recursion_depth: plan.metadata.max_recursion_depth,
             control_pred_count,
         }
@@ -69,19 +79,32 @@ impl<'a> CompiledExecutor<'a> {
 
     /// Execute the compiled plan with the given input context.
     pub fn execute(&self, inputs: Context) -> Result<ExecutionResult, ExecutionError> {
-        // Check IR version compatibility
-        check_version_compatibility(self.plan.version)
-            .map_err(|msg| ExecutionError::VersionMismatch(msg))?;
+        match self.execute_with(inputs, &PausePolicy::default(), None)? {
+            ExecutionOutcome::Completed(result) => Ok(result),
+            ExecutionOutcome::Paused(_) => {
+                // Default policy never pauses; this is unreachable in practice.
+                unreachable!("default pause policy cannot pause")
+            }
+        }
+    }
+
+    /// Execute with a pause policy and optional step observer.
+    ///
+    /// Pause denetimleri ana passtaki `run_node` çağrıları arasında (ve LOOP
+    /// gövdesi içinde body node başına) yapılır. PARALLEL branch thread'leri
+    /// pause'a tabi değildir — kendi içlerinde her zaman tamamlanır.
+    pub fn execute_with(
+        &self,
+        inputs: Context,
+        policy: &PausePolicy,
+        mut observer: Option<&mut dyn StepObserver>,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        check_version_compatibility(self.plan.version).map_err(ExecutionError::VersionMismatch)?;
 
         let start = Instant::now();
         let time_limit_us = (self.plan.metadata.max_execution_time_ms as u64) * 1000;
         let mem_limit = self.plan.metadata.max_context_memory_bytes as u64;
         let node_budget = self.plan.metadata.max_node_execution_count;
-
-        // Build a string ID → index map for reverse lookups (only needed for INPUT matching)
-        let id_to_index: HashMap<&str, u32> = self.plan.nodes.iter()
-            .map(|n| (n.id.as_str(), n.index))
-            .collect();
 
         let mut ctx = inputs;
         let mut node_outputs: HashMap<u32, Value> = HashMap::new();
@@ -104,578 +127,1234 @@ impl<'a> CompiledExecutor<'a> {
         }
 
         // --- Phase 1: Determine execution order via Kahn's algorithm on compiled edges ---
-        let order = self.topological_order(&id_to_index)?;
+        let order = self.topological_order()?;
 
         // --- Phase 1b: Pre-compute loop body node sets ---
         // Maps a LOOP node index → set of body node indices (to skip during main pass)
         let loop_bodies: HashMap<u32, HashSet<u32>> = self.identify_loop_bodies();
         let mut loop_skipped: HashSet<u32> = HashSet::new();
 
-        // --- Phase 2: Execute nodes in order ---
-        for node_index in &order {
-            // Skip nodes that are inside a loop body (handled by loop execution inline)
-            if loop_skipped.contains(node_index) {
-                continue;
-            }
-
-            let node = self.plan.get_node(*node_index)
+        // --- Phase 2: Execute nodes in order (pause-aware) ---
+        for (position, node_index) in order.iter().enumerate() {
+            let node = self
+                .plan
+                .get_node(*node_index)
                 .ok_or_else(|| ExecutionError::NodeNotFound(format!("index {}", node_index)))?;
 
-            // Skip if not enabled by edge propagation
-            if !enabled.contains(node_index) {
-                continue;
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_node_start(&node.id);
             }
 
-            // Check control-flow dependencies: all control predecessors must have completed.
-            let idx = *node_index as usize;
-            if idx < n && control_satisfied[idx].get() < self.control_pred_count[idx] {
-                // Control predecessors not yet complete — defer execution.
-                // This ensures sequential ordering: e.g., a statement after an if/else
-                // with an early-return branch only executes when the fall-through path
-                // reaches the MERGE node.
-                continue;
+            match self.run_node(
+                node,
+                &mut ctx,
+                &mut node_outputs,
+                &mut execution_order,
+                &mut enabled,
+                &control_satisfied,
+                &loop_bodies,
+                &mut loop_skipped,
+                &mut node_count,
+                &mut output,
+                start,
+                time_limit_us,
+                node_budget,
+                mem_limit,
+                &order,
+                Some(policy),
+            )? {
+                NodeOutcome::Paused(loop_state) => {
+                    return Ok(ExecutionOutcome::Paused(self.build_checkpoint(
+                        &ctx,
+                        &node_outputs,
+                        &enabled,
+                        &control_satisfied,
+                        &loop_skipped,
+                        &execution_order,
+                        &output,
+                        node_count,
+                        position,
+                        start.elapsed().as_micros() as u64,
+                        Some(loop_state),
+                    )));
+                }
+                NodeOutcome::Ok => {}
             }
 
-            // Budget checks
-            node_count += 1;
-            let elapsed = start.elapsed();
-            if elapsed.as_micros() as u64 > time_limit_us {
-                return Err(ExecutionError::TimeLimitExceeded(time_limit_us / 1000));
-            }
-            if node_count > node_budget {
-                return Err(ExecutionError::NodeBudgetExceeded(node_count, node_budget));
-            }
-            let ctx_bytes = ctx.estimated_bytes();
-            if ctx_bytes > mem_limit {
-                return Err(ExecutionError::MemoryLimitExceeded(mem_limit, ctx_bytes));
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_node_end(&node.id);
             }
 
-            execution_order.push(node.id.clone());
-
-            // ── Scope isolation: active branch'i node'un branch_id'sine göre ayarla ──
-            if let Some(bid) = node.branch_id {
-                ctx.set_branch(bid);
-            } else {
-                ctx.clear_branch();
-            }
-
-            match node.op {
-                Opcode::Input => {
-                    let name = node.args.iter()
-                        .find(|a| a.key == "name")
-                        .map(|a| a.value.trim_matches('"'))
-                        .unwrap_or(&node.id);
-                    let default = node.args.iter()
-                        .find(|a| a.key == "default");
-                    if let Some(val) = ctx.get(name) {
-                        node_outputs.insert(node.index, val.clone());
-                    } else if let Some(d) = default {
-                        let v = parse_json_value(&d.value);
-                        node_outputs.insert(node.index, v);
-                    }
-                    // Propagate edges
-                    self.propagate_edges(node, &mut ctx, &mut node_outputs, &mut enabled, &control_satisfied)?;
-                }
-
-                Opcode::Calc => {
-                    let expr = node.args.iter()
-                        .find(|a| a.key == "expr")
-                        .map(|a| &a.value)
-                        .unwrap_or(&node.id);
-                    let result = eval_expression(expr, &ctx, &node_outputs)?;
-                    node_outputs.insert(node.index, result.clone());
-                    // Output arg writes result to context for downstream nodes
-                    if let Some(output_name) = node.args.iter()
-                        .find(|a| a.key == "output")
-                        .map(|a| a.value.trim_matches('"'))
-                    {
-                        if !output_name.is_empty() {
-                            ctx.set(output_name.to_owned(), result);
-                        }
-                    }
-                    self.propagate_edges(node, &mut ctx, &mut node_outputs, &mut enabled, &control_satisfied)?;
-                }
-
-                Opcode::Call => {
-                    let target = node.args.iter()
-                        .find(|a| a.key == "target")
-                        .map(|a| a.value.trim_matches('"'))
-                        .unwrap_or("unknown");
-                    let output_name = node.args.iter()
-                        .find(|a| a.key == "output_name")
-                        .map(|a| a.value.trim_matches('"'));
-
-                    let mut params = HashMap::new();
-                    for arg in &node.args {
-                        if arg.key == "target" || arg.key == "output_name"
-                            || arg.key == "on_error" || arg.key == "fallback_value" {
-                            continue;
-                        }
-                        let val = resolve_arg_value(&arg.value, &ctx, &node_outputs);
-                        params.insert(arg.key.clone(), val);
-                    }
-
-                    // ── Subgraph dispatch (v2) ─────────────────────────────
-                    if target.starts_with("subgraph:") {
-                        let subgraph_name = target.trim_start_matches("subgraph:");
-                        if self.recursion_depth.get() >= self.max_recursion_depth {
-                            return Err(ExecutionError::RecursionLimitExceeded(
-                                subgraph_name.into(),
-                            ));
-                        }
-                        self.recursion_depth.set(self.recursion_depth.get() + 1);
-                        let subgraph_result = self.registry
-                            .execute_subgraph(subgraph_name, ctx.clone())
-                            .map_err(|e| ExecutionError::CallFailed(
-                                subgraph_name.into(),
-                                e.to_string(),
-                            ));
-                        self.recursion_depth.set(self.recursion_depth.get() - 1);
-                        let subgraph_ctx = subgraph_result?;
-                        // Merge subgraph context into current context
-                        for (k, v) in subgraph_ctx.variables {
-                            ctx.set(k, v);
-                        }
-                        node_outputs.insert(node.index, Value::Null);
-                        self.propagate_edges(node, &mut ctx, &mut node_outputs, &mut enabled, &control_satisfied)?;
-                        continue;
-                    }
-
-                    let call_target = tinypipe_api::types::CallTarget {
-                        name: target.to_string(),
-                        args: Vec::new(),
-                        kwargs: params,
-                    };
-
-                    // Schema drift detection (v2.6): check tool schema_hash before dispatch
-                    if !target.starts_with("rpc:") {
-                        let tool_name = target.trim_start_matches("tool:");
-                        if let Some(tool_dep) = self.plan.metadata.tool_deps.iter()
-                            .find(|d| d.name == tool_name && !d.schema_hash.is_empty())
-                        {
-                            let latest_hash = match self.registry.latest_schema_hash(tool_name) {
-                                Ok(h) => h,
-                                Err(_) => String::new(),
-                            };
-                            if !latest_hash.is_empty() && tool_dep.schema_hash != latest_hash {
-                                return Err(ExecutionError::SchemaDriftDetected(
-                                    tool_name.to_string(),
-                                    tool_dep.schema_hash.clone(),
-                                    latest_hash,
-                                ));
-                            }
-                        }
-                    }
-
-                    match self.registry.dispatch(&call_target, &ctx) {
-                        Ok(val) => {
-                            if let Some(name) = output_name {
-                                ctx.set(name.to_string(), val.clone());
-                            }
-                            node_outputs.insert(node.index, val);
-                        }
-                        Err(e) => {
-                            let on_error = node.args.iter()
-                                .find(|a| a.key == "on_error")
-                                .map(|a| a.value.trim_matches('"'))
-                                .unwrap_or("abort");
-                            let err_val = match on_error {
-                                "continue_with_null" => Value::Null,
-                                "continue_with_fallback" => {
-                                    let fallback = node.args.iter()
-                                        .find(|a| a.key == "fallback_value");
-                                    if let Some(fb) = fallback {
-                                        parse_json_value(&fb.value)
-                                    } else {
-                                        Value::Null
-                                    }
-                                }
-                                _ => {
-                                    return Err(ExecutionError::CallFailed(target.to_string(), e.to_string()));
-                                }
-                            };
-                            if let Some(name) = output_name {
-                                ctx.set(name.to_string(), err_val.clone());
-                            }
-                            node_outputs.insert(node.index, err_val);
-                        }
-                    }
-                    self.propagate_edges(node, &mut ctx, &mut node_outputs, &mut enabled, &control_satisfied)?;
-                }
-
-                Opcode::Decide => {
-                    // Native compiled format: source/op/value
-                    let source = node.args.iter()
-                        .find(|a| a.key == "source")
-                        .map(|a| resolve_arg_value(&a.value, &ctx, &node_outputs))
-                        .unwrap_or(Value::Null);
-                    let op = node.args.iter()
-                        .find(|a| a.key == "op")
-                        .map(|a| a.value.trim_matches('"').to_string())
-                        .unwrap_or_default();
-                    let cmp_val = node.args.iter()
-                        .find(|a| a.key == "value")
-                        .map(|a| parse_json_value(&a.value))
-                        .unwrap_or(Value::Null);
-
-                    // Compiled format: condition string (e.g. "x > 0")
-                    let decision = if !op.is_empty() {
-                        evaluate_condition(&source, &op, &cmp_val)?
-                    } else if let Some(cond) = node.args.iter()
-                        .find(|a| a.key == "condition")
-                        .map(|a| a.value.trim_matches('"'))
-                    {
-                        eval_expression(cond, &ctx, &node_outputs)
-                            .map(|v| is_truthy(&v))
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
-                    node_outputs.insert(node.index, Value::Bool(decision));
-                    self.propagate_edges(node, &mut ctx, &mut node_outputs, &mut enabled, &control_satisfied)?;
-                }
-
-                Opcode::Act => {
-                    let action_type = node.args.iter()
-                        .find(|a| a.key == "type" || a.key == "action_type")
-                        .map(|a| a.value.trim_matches('"').to_string())
-                        .unwrap_or_default();
-                    let act_output = Value::String(format!("[ACT:{}]", action_type));
-                    node_outputs.insert(node.index, act_output);
-
-                    if action_type == "return" {
-                        let content = node.args.iter()
-                            .find(|a| a.key == "content" || a.key == "value")
-                            .map(|a| resolve_arg_value(&a.value, &ctx, &node_outputs));
-                        if let Some(ref v) = content {
-                            output = Some(v.clone());
-                            node_outputs.insert(node.index, v.clone());
-                        } else {
-                            // Use all_variables() to include active branch scope
-                            let val = Value::Object(ctx.all_variables());
-                            output = Some(val.clone());
-                            node_outputs.insert(node.index, val);
-                        }
-                    }
-                    self.propagate_edges(node, &mut ctx, &mut node_outputs, &mut enabled, &control_satisfied)?;
-                }
-
-                Opcode::Switch => {
-                    // Evaluate the source expression to determine which branch to take
-                    let source = node.args.iter()
-                        .find(|a| a.key == "source")
-                        .map(|a| resolve_arg_value(&a.value, &ctx, &node_outputs))
-                        .unwrap_or(Value::Null);
-                    let source_str = format_value(&source);
-
-                    // Find all outgoing edges from this Switch node
-                    let switch_edges: Vec<&CompiledEdge> = self.plan.edges.iter()
-                        .filter(|e| e.from_index == node.index)
-                        .collect();
-
-                    // Match source value against edge conditions
-                    let mut matched = false;
-                    for edge in &switch_edges {
-                        match &edge.condition {
-                            Some(cond) if *cond == source_str => {
-                                // Case match — enable this edge
-                                if let Some(ref mapping) = edge.mapping {
-                                    for (from_key, to_key) in mapping {
-                                        if let Some(val) = ctx.get(from_key).cloned() {
-                                            ctx.set(to_key.clone(), val);
-                                        }
-                                    }
-                                }
-                                enabled.insert(edge.to_index);
-                                matched = true;
-                            }
-                            Some(cond) if cond == "default" && !matched => {
-                                // Default case — only if no other case matched
-                                if let Some(ref mapping) = edge.mapping {
-                                    for (from_key, to_key) in mapping {
-                                        if let Some(val) = ctx.get(from_key).cloned() {
-                                            ctx.set(to_key.clone(), val);
-                                        }
-                                    }
-                                }
-                                enabled.insert(edge.to_index);
-                            }
-                            None if !matched => {
-                                // Unconditional edge as fallback
-                                if let Some(ref mapping) = edge.mapping {
-                                    for (from_key, to_key) in mapping {
-                                        if let Some(val) = ctx.get(from_key).cloned() {
-                                            ctx.set(to_key.clone(), val);
-                                        }
-                                    }
-                                }
-                                enabled.insert(edge.to_index);
-                            }
-                            _ => {}
-                        }
-                    }
-                    node_outputs.insert(node.index, Value::String(source_str));
-                }
-
-                Opcode::Parallel => {
-                    // ── Scope isolation: branch scope'larını başlat ──
-                    // Parent context'in snapshot'ını al, her branch için scope hazırla
-                    ctx.enter_parallel();
-
-                    // Enable all outgoing edges — children execute naturally via edge propagation
-                    // In v1, execution is sequential (single thread), but PARALLEL acts as
-                    // a grouping node that fans out to multiple branches
-                    for edge in &self.plan.edges {
-                        if edge.from_index == node.index {
-                            // Edge mapping: parent değişkenlerini branch scope'a kopyala
-                            if let Some(ref mapping) = edge.mapping {
-                                for (from_key, to_key) in mapping {
-                                    if let Some(val) = ctx.get(from_key).cloned() {
-                                        ctx.set(to_key.clone(), val);
-                                    }
-                                }
-                            }
-                            enabled.insert(edge.to_index);
-                        }
-                    }
-                    node_outputs.insert(node.index, Value::Null);
-                }
-
-                Opcode::Loop => {
-                    let max_iter = node.args.iter()
-                        .find(|a| a.key == "max_iterations")
-                        .map(|a| a.value.parse::<u32>().unwrap_or(100))
-                        .unwrap_or(100);
-                    let target_name = node.args.iter()
-                        .find(|a| a.key == "target")
-                        .map(|a| a.value.trim_matches('"').to_string());
-
-                    // Find body node indices — nodes reachable from LOOP via edges without condition
-                    let mut body_indices: Vec<u32> = Vec::new();
-                    for edge in &self.plan.edges {
-                        if edge.from_index == node.index && edge.condition.is_none() {
-                            body_indices.push(edge.to_index);
-                        }
-                    }
-
-                    if !body_indices.is_empty() {
-                        // Collect all body nodes reachable from the first body edge
-                        let body_set: HashSet<u32> = self.collect_reachable_indices(&body_indices);
-                        let body_vec: Vec<u32> = order.iter()
-                            .filter(|idx| body_set.contains(idx))
-                            .copied()
-                            .collect();
-
-                        // Mark body nodes as skipped so the main pass doesn't re-execute them
-                        for bidx in &body_set {
-                            loop_skipped.insert(*bidx);
-                        }
-
-                        // Execute loop body up to max_iterations
-                        for iteration in 0..max_iter {
-                            // Provide the loop variable value in context
-                            if let Some(ref name) = target_name {
-                                ctx.set(name.clone(), Value::Int(iteration as i64));
-                            }
-                            // Check for break condition via DECIDE node in body
-                            let mut should_break = false;
-
-                            for body_idx in &body_vec {
-                                let body_node = self.plan.get_node(*body_idx)
-                                    .ok_or_else(|| ExecutionError::NodeNotFound(format!("body index {}", body_idx)))?;
-
-                                // Budget and time checks
-                                node_count += 1;
-                                let elapsed = start.elapsed();
-                                if elapsed.as_micros() as u64 > time_limit_us {
-                                    return Err(ExecutionError::TimeLimitExceeded(time_limit_us / 1000));
-                                }
-                                if node_count > node_budget {
-                                    return Err(ExecutionError::NodeBudgetExceeded(node_count, node_budget));
-                                }
-
-                                match body_node.op {
-                                    Opcode::Calc => {
-                                        let expr = body_node.args.iter()
-                                            .find(|a| a.key == "expr")
-                                            .map(|a| &a.value)
-                                            .unwrap_or(&body_node.id);
-                                        let result = eval_expression(expr, &ctx, &node_outputs)?;
-                                        node_outputs.insert(body_node.index, result);
-                                    }
-                                    Opcode::Call => {
-                                        let target = body_node.args.iter()
-                                            .find(|a| a.key == "target")
-                                            .map(|a| a.value.trim_matches('"'))
-                                            .unwrap_or("unknown");
-                                        let output_name = body_node.args.iter()
-                                            .find(|a| a.key == "output_name")
-                                            .map(|a| a.value.trim_matches('"'));
-
-                                        let mut params = HashMap::new();
-                                        for arg in &body_node.args {
-                                            if arg.key == "target" || arg.key == "output_name" {
-                                                continue;
-                                            }
-                                            let val = resolve_arg_value(&arg.value, &ctx, &node_outputs);
-                                            params.insert(arg.key.clone(), val);
-                                        }
-
-                                        let ct = tinypipe_api::types::CallTarget {
-                                            name: target.to_string(),
-                                            args: Vec::new(),
-                                            kwargs: params,
-                                        };
-
-                                        match self.registry.dispatch(&ct, &ctx) {
-                                            Ok(val) => {
-                                                if let Some(name) = output_name {
-                                                    ctx.set(name.to_string(), val.clone());
-                                                }
-                                                node_outputs.insert(body_node.index, val);
-                                            }
-                                            Err(e) => {
-                                                return Err(ExecutionError::CallFailed(target.to_string(), e.to_string()));
-                                            }
-                                        }
-                                    }
-                                    Opcode::Decide => {
-                                        let source = body_node.args.iter()
-                                            .find(|a| a.key == "source")
-                                            .map(|a| resolve_arg_value(&a.value, &ctx, &node_outputs))
-                                            .unwrap_or(Value::Null);
-                                        let op = body_node.args.iter()
-                                            .find(|a| a.key == "op")
-                                            .map(|a| a.value.trim_matches('"').to_string())
-                                            .unwrap_or_default();
-                                        let cmp_val = body_node.args.iter()
-                                            .find(|a| a.key == "value")
-                                            .map(|a| parse_json_value(&a.value))
-                                            .unwrap_or(Value::Null);
-
-                                        let decision = evaluate_condition(&source, &op, &cmp_val)?;
-                                        node_outputs.insert(body_node.index, Value::Bool(decision));
-
-                                        // Check if this is a break condition
-                                        if !decision {
-                                            should_break = true;
-                                        }
-                                    }
-                                    Opcode::Input => {
-                                        // Re-read input each iteration (allows loop variable updates)
-                                        let name = body_node.args.iter()
-                                            .find(|a| a.key == "name")
-                                            .map(|a| a.value.trim_matches('"'))
-                                            .unwrap_or(&body_node.id);
-                                        if let Some(val) = ctx.get(name) {
-                                            node_outputs.insert(body_node.index, val.clone());
-                                        }
-                                    }
-                                    Opcode::Act => {
-                                        let action_type = body_node.args.iter()
-                                            .find(|a| a.key == "type" || a.key == "action_type")
-                                            .map(|a| a.value.trim_matches('"').to_string())
-                                            .unwrap_or_default();
-                                        if action_type == "return" {
-                                            // Early return from loop
-                                            let content = body_node.args.iter()
-                                                .find(|a| a.key == "content" || a.key == "value")
-                                                .map(|a| resolve_arg_value(&a.value, &ctx, &node_outputs));
-                                            if let Some(v) = content {
-                                                node_outputs.insert(body_node.index, v);
-                                            } else {
-                                                node_outputs.insert(body_node.index, Value::Null);
-                                            }
-                                            should_break = true;
-                                        } else {
-                                            node_outputs.insert(body_node.index, Value::String(format!("[ACT:{}]", action_type)));
-                                        }
-                                    }
-                                    _ => {
-                                        node_outputs.insert(body_node.index, Value::Null);
-                                    }
-                                }
-                            }
-
-                            if should_break {
-                                break;
-                            }
-                        }
-                    }
-
-                    // After loop completes, propagate edges from LOOP to downstream nodes
-                    for edge in &self.plan.edges {
-                        if edge.from_index == node.index && !loop_bodies.get(&node.index)
-                            .map(|body| body.contains(&edge.to_index))
-                            .unwrap_or(false)
-                        {
-                            if edge.kind == EdgeKind::Control {
-                                // Control edges are tracked via control_satisfied
-                                let to = edge.to_index as usize;
-                                if to < control_satisfied.len() {
-                                    control_satisfied[to].set(control_satisfied[to].get() + 1);
-                                }
-                                continue;
-                            }
-                            if let Some(ref mapping) = edge.mapping {
-                                for (from_key, to_key) in mapping {
-                                    if let Some(val) = ctx.get(from_key).cloned() {
-                                        ctx.set(to_key.clone(), val);
-                                    }
-                                }
-                            }
-                            enabled.insert(edge.to_index);
-                        }
-                    }
-                    node_outputs.insert(node.index, Value::Null);
-                }
-
-                Opcode::Wait => {
-                    let secs = node.args.iter()
-                        .find(|a| a.key == "duration_secs")
-                        .map(|a| a.value.parse::<i64>().unwrap_or(0))
-                        .unwrap_or(0);
-                    let max_secs = 300i64;
-                    if secs > max_secs {
-                        return Err(ExecutionError::Custom(
-                            format!("WAIT duration {}s exceeds v1 maximum of {}s", secs, max_secs)
-                        ));
-                    }
-                    if secs > 0 {
-                        std::thread::sleep(std::time::Duration::from_secs(secs as u64));
-                    }
-                    node_outputs.insert(node.index, Value::Null);
-                    self.propagate_edges(node, &mut ctx, &mut node_outputs, &mut enabled, &control_satisfied)?;
-                }
-
-                Opcode::Merge => {
-                    // ── Scope isolation: tüm branch scope'larını birleştir ──
-                    ctx.merge_branches();
-                    // Snapshot the merged context as output
-                    let merged_vars = ctx.variables.clone();
-                    node_outputs.insert(node.index, Value::Object(merged_vars));
-                    self.propagate_edges(node, &mut ctx, &mut node_outputs, &mut enabled, &control_satisfied)?;
-                }
-
-                Opcode::Error => {
-                    let msg = node.args.iter()
-                        .find(|a| a.key == "message")
-                        .map(|a| a.value.trim_matches('"').to_string())
-                        .unwrap_or_else(|| "execution error".into());
-                    return Err(ExecutionError::Custom(msg));
-                }
+            // Son node'dan sonra pause anlamsız (devam edilecek node yok) — atla.
+            if position + 1 < order.len() && policy.should_pause(node_count, &node.id) {
+                return Ok(ExecutionOutcome::Paused(self.build_checkpoint(
+                    &ctx,
+                    &node_outputs,
+                    &enabled,
+                    &control_satisfied,
+                    &loop_skipped,
+                    &execution_order,
+                    &output,
+                    node_count,
+                    position + 1,
+                    start.elapsed().as_micros() as u64,
+                    None,
+                )));
             }
         }
 
         let duration = start.elapsed().as_micros() as u64;
 
-        Ok(ExecutionResult {
+        Ok(ExecutionOutcome::Completed(ExecutionResult {
             context: ctx,
             execution_order,
             node_count,
             duration_us: duration,
             output,
-        })
+        }))
+    }
+
+    /// A paused execution'ı checkpoint'ten devam ettirir.
+    pub fn resume(
+        &self,
+        checkpoint: &Checkpoint,
+        policy: &PausePolicy,
+        mut observer: Option<&mut dyn StepObserver>,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        check_version_compatibility(self.plan.version).map_err(ExecutionError::VersionMismatch)?;
+
+        let start = Instant::now();
+        let start = start
+            .checked_sub(std::time::Duration::from_micros(checkpoint.elapsed_us))
+            .unwrap_or(start);
+        let time_limit_us = (self.plan.metadata.max_execution_time_ms as u64) * 1000;
+        let mem_limit = self.plan.metadata.max_context_memory_bytes as u64;
+        let node_budget = self.plan.metadata.max_node_execution_count;
+
+        let mut ctx = checkpoint.context.clone();
+        let mut node_outputs = checkpoint.node_outputs.clone();
+        let mut execution_order = checkpoint.execution_order.clone();
+        let mut node_count = checkpoint.node_count;
+        let mut output = checkpoint.output.clone();
+        let mut enabled = checkpoint.enabled.clone();
+        let n = self.plan.nodes.len();
+        let control_satisfied: Vec<Cell<u32>> = checkpoint
+            .control_satisfied
+            .iter()
+            .map(|v| Cell::new(*v))
+            .chain((checkpoint.control_satisfied.len()..n).map(|_| Cell::new(0u32)))
+            .collect();
+        let mut loop_skipped = checkpoint.loop_skipped.clone();
+
+        let order = self.topological_order()?;
+        let loop_bodies: HashMap<u32, HashSet<u32>> = self.identify_loop_bodies();
+
+        // LOOP gövdesi ortasında kaldıysak önce loop'u devam ettir
+        let mut resumed_loop = false;
+        if let Some(ls) = &checkpoint.loop_state {
+            let loop_node = self
+                .plan
+                .get_node(ls.loop_index)
+                .ok_or_else(|| ExecutionError::NodeNotFound(format!("loop {}", ls.loop_index)))?;
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_node_start(&loop_node.id);
+            }
+            match self.run_loop(
+                loop_node,
+                &mut ctx,
+                &mut node_outputs,
+                &mut enabled,
+                &control_satisfied,
+                &loop_bodies,
+                &mut loop_skipped,
+                &mut node_count,
+                start,
+                time_limit_us,
+                node_budget,
+                mem_limit,
+                &order,
+                Some((ls.iteration, ls.body_position)),
+                Some(policy),
+            )? {
+                NodeOutcome::Paused(ls2) => {
+                    return Ok(ExecutionOutcome::Paused(self.build_checkpoint(
+                        &ctx,
+                        &node_outputs,
+                        &enabled,
+                        &control_satisfied,
+                        &loop_skipped,
+                        &execution_order,
+                        &output,
+                        node_count,
+                        checkpoint.position,
+                        start.elapsed().as_micros() as u64,
+                        Some(ls2),
+                    )));
+                }
+                NodeOutcome::Ok => {}
+            }
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_node_end(&loop_node.id);
+            }
+            resumed_loop = true;
+        }
+
+        // Ana passtan kaldığımız yerden devam et.
+        // LOOP gövdesi ortasında kaldıysak LOOP node'u zaten run_loop ile
+        // çalıştırıldı — pozisyonu bir ileri taşı (node tekrar çalışmasın).
+        let start_position = checkpoint.position + usize::from(resumed_loop);
+        for position in start_position..order.len() {
+            let idx = order[position];
+            let node = self
+                .plan
+                .get_node(idx)
+                .ok_or_else(|| ExecutionError::NodeNotFound(format!("index {}", idx)))?;
+
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_node_start(&node.id);
+            }
+
+            match self.run_node(
+                node,
+                &mut ctx,
+                &mut node_outputs,
+                &mut execution_order,
+                &mut enabled,
+                &control_satisfied,
+                &loop_bodies,
+                &mut loop_skipped,
+                &mut node_count,
+                &mut output,
+                start,
+                time_limit_us,
+                node_budget,
+                mem_limit,
+                &order,
+                Some(policy),
+            )? {
+                NodeOutcome::Paused(loop_state) => {
+                    return Ok(ExecutionOutcome::Paused(self.build_checkpoint(
+                        &ctx,
+                        &node_outputs,
+                        &enabled,
+                        &control_satisfied,
+                        &loop_skipped,
+                        &execution_order,
+                        &output,
+                        node_count,
+                        position,
+                        start.elapsed().as_micros() as u64,
+                        Some(loop_state),
+                    )));
+                }
+                NodeOutcome::Ok => {}
+            }
+
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_node_end(&node.id);
+            }
+
+            // Son node'dan sonra pause anlamsız (devam edilecek node yok) — atla.
+            if position + 1 < order.len() && policy.should_pause(node_count, &node.id) {
+                return Ok(ExecutionOutcome::Paused(self.build_checkpoint(
+                    &ctx,
+                    &node_outputs,
+                    &enabled,
+                    &control_satisfied,
+                    &loop_skipped,
+                    &execution_order,
+                    &output,
+                    node_count,
+                    position + 1,
+                    start.elapsed().as_micros() as u64,
+                    None,
+                )));
+            }
+        }
+
+        let duration = start.elapsed().as_micros() as u64;
+
+        Ok(ExecutionOutcome::Completed(ExecutionResult {
+            context: ctx,
+            execution_order,
+            node_count,
+            duration_us: duration,
+            output,
+        }))
+    }
+
+    fn build_checkpoint(
+        &self,
+        ctx: &Context,
+        node_outputs: &HashMap<u32, Value>,
+        enabled: &HashSet<u32>,
+        control_satisfied: &[Cell<u32>],
+        loop_skipped: &HashSet<u32>,
+        execution_order: &[String],
+        output: &Option<Value>,
+        node_count: u32,
+        position: usize,
+        elapsed_us: u64,
+        loop_state: Option<LoopState>,
+    ) -> Checkpoint {
+        Checkpoint {
+            node_count,
+            position,
+            elapsed_us,
+            loop_state,
+            context: ctx.clone(),
+            node_outputs: node_outputs.clone(),
+            enabled: enabled.clone(),
+            control_satisfied: control_satisfied.iter().map(|c| c.get()).collect(),
+            loop_skipped: loop_skipped.clone(),
+            execution_order: execution_order.to_vec(),
+            output: output.clone(),
+        }
+    }
+
+    /// Execute a single node (skip checks, budget checks, dispatch, edge propagation).
+    ///
+    /// Used by both the main execution pass and parallel branch threads, so every
+    /// opcode has identical semantics regardless of where it runs. Returns
+    /// `NodeOutcome::Paused` when a LOOP body node triggers the pause policy.
+    #[allow(clippy::too_many_arguments)]
+    fn run_node(
+        &self,
+        node: &CompiledNode,
+        ctx: &mut Context,
+        node_outputs: &mut HashMap<u32, Value>,
+        execution_order: &mut Vec<String>,
+        enabled: &mut HashSet<u32>,
+        control_satisfied: &[Cell<u32>],
+        loop_bodies: &HashMap<u32, HashSet<u32>>,
+        loop_skipped: &mut HashSet<u32>,
+        node_count: &mut u32,
+        output: &mut Option<Value>,
+        start: Instant,
+        time_limit_us: u64,
+        node_budget: u32,
+        mem_limit: u64,
+        order: &[u32],
+        pause: Option<&PausePolicy>,
+    ) -> Result<NodeOutcome, ExecutionError> {
+        // Skip nodes that are inside a loop body (handled by loop execution inline)
+        if loop_skipped.contains(&node.index) {
+            return Ok(NodeOutcome::Ok);
+        }
+
+        // Skip if not enabled by edge propagation
+        if !enabled.contains(&node.index) {
+            return Ok(NodeOutcome::Ok);
+        }
+
+        // Check control-flow dependencies: all control predecessors must have completed.
+        let idx = node.index as usize;
+        let n = self.plan.nodes.len();
+        if idx < n && control_satisfied[idx].get() < self.control_pred_count[idx] {
+            // Control predecessors not yet complete — defer execution.
+            // This ensures sequential ordering: e.g., a statement after an if/else
+            // with an early-return branch only executes when the fall-through path
+            // reaches the MERGE node.
+            return Ok(NodeOutcome::Ok);
+        }
+
+        // Budget checks
+        *node_count += 1;
+        let elapsed = start.elapsed();
+        if elapsed.as_micros() as u64 > time_limit_us {
+            return Err(ExecutionError::TimeLimitExceeded(time_limit_us / 1000));
+        }
+        if *node_count > node_budget {
+            return Err(ExecutionError::NodeBudgetExceeded(*node_count, node_budget));
+        }
+        let ctx_bytes = ctx.estimated_bytes();
+        if ctx_bytes > mem_limit {
+            return Err(ExecutionError::MemoryLimitExceeded(mem_limit, ctx_bytes));
+        }
+
+        execution_order.push(node.id.clone());
+
+        // ── Scope isolation: active branch'i node'un branch_id'sine göre ayarla ──
+        if let Some(bid) = node.branch_id {
+            ctx.set_branch(bid);
+        } else {
+            ctx.clear_branch();
+        }
+
+        match node.op {
+            Opcode::Input => {
+                let name = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "name")
+                    .map(|a| a.value.trim_matches('"'))
+                    .unwrap_or(&node.id);
+                let default = node.args.iter().find(|a| a.key == "default");
+                if let Some(val) = ctx.get(name) {
+                    node_outputs.insert(node.index, val.clone());
+                } else if let Some(d) = default {
+                    let v = parse_json_value(&d.value);
+                    node_outputs.insert(node.index, v);
+                }
+                // Propagate edges
+                self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
+            }
+
+            Opcode::Calc => {
+                let expr = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "expr")
+                    .map(|a| &a.value)
+                    .unwrap_or(&node.id);
+                let result = eval_expression(expr, ctx, node_outputs)?;
+                node_outputs.insert(node.index, result.clone());
+                // Output arg writes result to context for downstream nodes
+                if let Some(output_name) = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "output")
+                    .map(|a| a.value.trim_matches('"'))
+                {
+                    if !output_name.is_empty() {
+                        ctx.set(output_name.to_owned(), result);
+                    }
+                }
+                self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
+            }
+
+            Opcode::Call => {
+                let target = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "target")
+                    .map(|a| a.value.trim_matches('"'))
+                    .unwrap_or("unknown");
+                let output_name = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "output_name")
+                    .map(|a| a.value.trim_matches('"'));
+
+                let mut params = HashMap::new();
+                for arg in &node.args {
+                    if arg.key == "target"
+                        || arg.key == "output_name"
+                        || arg.key == "on_error"
+                        || arg.key == "fallback_value"
+                    {
+                        continue;
+                    }
+                    let val = resolve_arg_value(&arg.value, ctx, node_outputs);
+                    params.insert(arg.key.clone(), val);
+                }
+
+                // ── Subgraph dispatch (v2) ─────────────────────────────
+                if target.starts_with("subgraph:") {
+                    let subgraph_name = target.trim_start_matches("subgraph:");
+                    if self.recursion_depth.load(Ordering::SeqCst) >= self.max_recursion_depth {
+                        return Err(ExecutionError::RecursionLimitExceeded(subgraph_name.into()));
+                    }
+                    self.recursion_depth.fetch_add(1, Ordering::SeqCst);
+                    let subgraph_result = self
+                        .registry
+                        .execute_subgraph(subgraph_name, ctx.clone())
+                        .map_err(|e| {
+                            ExecutionError::CallFailed(subgraph_name.into(), e.to_string())
+                        });
+                    self.recursion_depth.fetch_sub(1, Ordering::SeqCst);
+                    let subgraph_ctx = subgraph_result?;
+                    // Merge subgraph context into current context
+                    for (k, v) in subgraph_ctx.variables {
+                        ctx.set(k, v);
+                    }
+                    node_outputs.insert(node.index, Value::Null);
+                    self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
+                    return Ok(NodeOutcome::Ok);
+                }
+
+                let call_target = tinypipe_api::types::CallTarget {
+                    name: target.to_string(),
+                    args: Vec::new(),
+                    kwargs: params,
+                };
+
+                // Schema drift detection (v2.6): check tool schema_hash before dispatch
+                if !target.starts_with("rpc:") {
+                    let tool_name = target.trim_start_matches("tool:");
+                    if let Some(tool_dep) = self
+                        .plan
+                        .metadata
+                        .tool_deps
+                        .iter()
+                        .find(|d| d.name == tool_name && !d.schema_hash.is_empty())
+                    {
+                        let latest_hash = match self.registry.latest_schema_hash(tool_name) {
+                            Ok(h) => h,
+                            Err(_) => String::new(),
+                        };
+                        if !latest_hash.is_empty() && tool_dep.schema_hash != latest_hash {
+                            return Err(ExecutionError::SchemaDriftDetected(
+                                tool_name.to_string(),
+                                tool_dep.schema_hash.clone(),
+                                latest_hash,
+                            ));
+                        }
+                    }
+                }
+
+                match self.registry.dispatch(&call_target, ctx) {
+                    Ok(val) => {
+                        if let Some(name) = output_name {
+                            ctx.set(name.to_string(), val.clone());
+                        }
+                        node_outputs.insert(node.index, val);
+                    }
+                    Err(e) => {
+                        let on_error = node
+                            .args
+                            .iter()
+                            .find(|a| a.key == "on_error")
+                            .map(|a| a.value.trim_matches('"'))
+                            .unwrap_or("abort");
+                        let err_val = match on_error {
+                            "continue_with_null" => Value::Null,
+                            "continue_with_fallback" => {
+                                let fallback = node.args.iter().find(|a| a.key == "fallback_value");
+                                if let Some(fb) = fallback {
+                                    parse_json_value(&fb.value)
+                                } else {
+                                    Value::Null
+                                }
+                            }
+                            _ => {
+                                return Err(ExecutionError::CallFailed(
+                                    target.to_string(),
+                                    e.to_string(),
+                                ));
+                            }
+                        };
+                        if let Some(name) = output_name {
+                            ctx.set(name.to_string(), err_val.clone());
+                        }
+                        node_outputs.insert(node.index, err_val);
+                    }
+                }
+                self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
+            }
+
+            Opcode::Decide => {
+                // Native compiled format: source/op/value
+                let source = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "source")
+                    .map(|a| resolve_arg_value(&a.value, ctx, node_outputs))
+                    .unwrap_or(Value::Null);
+                let op = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "op")
+                    .map(|a| a.value.trim_matches('"').to_string())
+                    .unwrap_or_default();
+                let cmp_val = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "value")
+                    .map(|a| parse_json_value(&a.value))
+                    .unwrap_or(Value::Null);
+
+                // Compiled format: condition string (e.g. "x > 0")
+                let decision = if !op.is_empty() {
+                    evaluate_condition(&source, &op, &cmp_val)?
+                } else if let Some(cond) = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "condition")
+                    .map(|a| a.value.trim_matches('"'))
+                {
+                    eval_expression(cond, ctx, node_outputs)
+                        .map(|v| is_truthy(&v))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                node_outputs.insert(node.index, Value::Bool(decision));
+                self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
+            }
+
+            Opcode::Act => {
+                let action_type = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "type" || a.key == "action_type")
+                    .map(|a| a.value.trim_matches('"').to_string())
+                    .unwrap_or_default();
+                let act_output = Value::String(format!("[ACT:{}]", action_type));
+                node_outputs.insert(node.index, act_output);
+
+                if action_type == "return" {
+                    let content = node
+                        .args
+                        .iter()
+                        .find(|a| a.key == "content" || a.key == "value")
+                        .map(|a| resolve_arg_value(&a.value, ctx, node_outputs));
+                    if let Some(ref v) = content {
+                        *output = Some(v.clone());
+                        node_outputs.insert(node.index, v.clone());
+                    } else {
+                        // No explicit content: read the predecessor's computed value
+                        // along incoming data edges (graph-faithful return semantics).
+                        let pred_value = self
+                            .plan
+                            .edges
+                            .iter()
+                            .filter(|e| e.to_index == node.index && e.kind == EdgeKind::Data)
+                            .filter_map(|e| node_outputs.get(&e.from_index).cloned())
+                            .next_back();
+                        if let Some(v) = pred_value {
+                            *output = Some(v.clone());
+                            node_outputs.insert(node.index, v);
+                        } else {
+                            // Use all_variables() to include active branch scope
+                            let val = Value::Object(ctx.all_variables());
+                            *output = Some(val.clone());
+                            node_outputs.insert(node.index, val);
+                        }
+                    }
+                }
+                self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
+            }
+
+            Opcode::Switch => {
+                // Evaluate the source expression to determine which branch to take
+                let source = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "source")
+                    .map(|a| resolve_arg_value(&a.value, ctx, node_outputs))
+                    .unwrap_or(Value::Null);
+                let source_str = format_value(&source);
+
+                // Find all outgoing edges from this Switch node
+                let switch_edges: Vec<&CompiledEdge> = self
+                    .plan
+                    .edges
+                    .iter()
+                    .filter(|e| e.from_index == node.index)
+                    .collect();
+
+                // Match source value against edge conditions
+                let mut matched = false;
+                for edge in &switch_edges {
+                    match &edge.condition {
+                        Some(cond) if *cond == source_str => {
+                            // Case match — enable this edge
+                            if let Some(ref mapping) = edge.mapping {
+                                for (from_key, to_key) in mapping {
+                                    if let Some(val) = ctx.get(from_key).cloned() {
+                                        ctx.set(to_key.clone(), val);
+                                    }
+                                }
+                            }
+                            enabled.insert(edge.to_index);
+                            matched = true;
+                        }
+                        Some(cond) if cond == "default" && !matched => {
+                            // Default case — only if no other case matched
+                            if let Some(ref mapping) = edge.mapping {
+                                for (from_key, to_key) in mapping {
+                                    if let Some(val) = ctx.get(from_key).cloned() {
+                                        ctx.set(to_key.clone(), val);
+                                    }
+                                }
+                            }
+                            enabled.insert(edge.to_index);
+                        }
+                        None if !matched => {
+                            // Unconditional edge as fallback
+                            if let Some(ref mapping) = edge.mapping {
+                                for (from_key, to_key) in mapping {
+                                    if let Some(val) = ctx.get(from_key).cloned() {
+                                        ctx.set(to_key.clone(), val);
+                                    }
+                                }
+                            }
+                            enabled.insert(edge.to_index);
+                        }
+                        _ => {}
+                    }
+                }
+                node_outputs.insert(node.index, Value::String(source_str));
+            }
+
+            Opcode::Parallel => {
+                // ── Scope isolation: branch scope'larını başlat ──
+                // Parent context'in snapshot'ını al, her branch için scope hazırla
+                ctx.enter_parallel();
+
+                // Direct children of this PARALLEL node (branch entries + continuation)
+                let children: Vec<u32> = self
+                    .plan
+                    .edges
+                    .iter()
+                    .filter(|e| e.from_index == node.index)
+                    .map(|e| e.to_index)
+                    .collect();
+
+                // Enable all outgoing edges — children execute naturally via edge propagation
+                for edge in &self.plan.edges {
+                    if edge.from_index == node.index {
+                        // Edge mapping: parent değişkenlerini branch scope'a kopyala
+                        if let Some(ref mapping) = edge.mapping {
+                            for (from_key, to_key) in mapping {
+                                if let Some(val) = ctx.get(from_key).cloned() {
+                                    ctx.set(to_key.clone(), val);
+                                }
+                            }
+                        }
+                        enabled.insert(edge.to_index);
+                    }
+                }
+                node_outputs.insert(node.index, Value::Null);
+
+                // Region: everything reachable from the children. Partition region nodes
+                // by branch_id — each branch group runs on its own thread. Nodes without
+                // a branch_id (continuation after the parallel block) run in the main
+                // pass once all branch threads have completed.
+                let region: HashSet<u32> = self.collect_reachable_indices(&children);
+                let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+                for &idx in order {
+                    if region.contains(&idx) {
+                        if let Some(nd) = self.plan.get_node(idx) {
+                            if let Some(bid) = nd.branch_id {
+                                groups.entry(bid).or_default().push(idx);
+                            }
+                        }
+                    }
+                }
+
+                if groups.is_empty() {
+                    return Ok(NodeOutcome::Ok);
+                }
+
+                // Mark branch nodes so the main pass skips them (they run on threads)
+                for group in groups.values() {
+                    for idx in group {
+                        loop_skipped.insert(*idx);
+                    }
+                }
+
+                // Run each branch group on its own thread, then merge results back.
+                let mut bids: Vec<u32> = groups.keys().copied().collect();
+                bids.sort_unstable();
+
+                // Snapshot of control counters before the threads run; per-thread
+                // deltas are merged back so continuation nodes see all control edges.
+                let initial_control: Vec<u32> = control_satisfied.iter().map(|c| c.get()).collect();
+
+                let results: Vec<(
+                    u32,
+                    Context,
+                    HashMap<u32, Value>,
+                    Vec<String>,
+                    u32,
+                    Option<Value>,
+                    HashSet<u32>,
+                    Vec<u32>,
+                )> = std::thread::scope(|s| {
+                    let mut handles = Vec::new();
+                    for bid in &bids {
+                        let group = groups.get(bid).cloned().unwrap_or_default();
+                        let entries: Vec<u32> = children
+                            .iter()
+                            .copied()
+                            .filter(|c| group.contains(c))
+                            .collect();
+                        let mut tctx = ctx.clone();
+                        let t_node_outputs = node_outputs.clone();
+                        let t_enabled: HashSet<u32> = entries.into_iter().collect();
+                        let t_control_satisfied: Vec<Cell<u32>> = control_satisfied
+                            .iter()
+                            .map(|c| Cell::new(c.get()))
+                            .collect();
+                        let t_loop_skipped: HashSet<u32> = loop_skipped
+                            .iter()
+                            .copied()
+                            .filter(|i| !group.contains(i))
+                            .collect();
+                        let bid = *bid;
+                        handles.push(s.spawn(move || {
+                            let mut t_outputs = t_node_outputs;
+                            let mut t_enabled = t_enabled;
+                            let t_control = t_control_satisfied;
+                            let mut t_skipped = t_loop_skipped;
+                            let mut t_order: Vec<String> = Vec::new();
+                            let mut t_node_count: u32 = 0;
+                            let mut t_output: Option<Value> = None;
+                            for idx in &group {
+                                let nd = self.plan.get_node(*idx).ok_or_else(|| {
+                                    ExecutionError::NodeNotFound(format!("region index {}", idx))
+                                })?;
+                                self.run_node(
+                                    nd,
+                                    &mut tctx,
+                                    &mut t_outputs,
+                                    &mut t_order,
+                                    &mut t_enabled,
+                                    &t_control,
+                                    loop_bodies,
+                                    &mut t_skipped,
+                                    &mut t_node_count,
+                                    &mut t_output,
+                                    start,
+                                    time_limit_us,
+                                    node_budget,
+                                    mem_limit,
+                                    order,
+                                    None,
+                                )?;
+                            }
+                            let t_control_final: Vec<u32> =
+                                t_control.iter().map(|c| c.get()).collect();
+                            Ok::<_, ExecutionError>((
+                                bid,
+                                tctx,
+                                t_outputs,
+                                t_order,
+                                t_node_count,
+                                t_output,
+                                t_enabled,
+                                t_control_final,
+                            ))
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .map_err(|_| {
+                                    ExecutionError::Custom("parallel branch thread panicked".into())
+                                })
+                                .and_then(|r| r)
+                        })
+                        .collect::<Result<Vec<_>, ExecutionError>>()
+                })?;
+
+                // ── Merge branch results into the main state ──
+                for (
+                    bid,
+                    mut tctx,
+                    t_outputs,
+                    t_order,
+                    t_node_count,
+                    t_output,
+                    t_enabled,
+                    t_control_final,
+                ) in results
+                {
+                    *node_count += t_node_count;
+                    for (k, v) in t_outputs {
+                        node_outputs.entry(k).or_insert(v);
+                    }
+                    // Thread-side enabled additions propagate to continuation nodes
+                    for idx in t_enabled {
+                        enabled.insert(idx);
+                    }
+                    // Control edge increments from branch nodes are applied to the
+                    // main counters (targets live in the continuation, not the group)
+                    for (idx, (before, after)) in initial_control
+                        .iter()
+                        .zip(t_control_final.iter())
+                        .enumerate()
+                    {
+                        if *after > *before {
+                            control_satisfied[idx].set(*after);
+                        }
+                    }
+                    // Branch scope'u ana context'e ver (MERGE node'u birleştirir)
+                    if let Some(scope) = tctx.take_branch_scope(bid) {
+                        ctx.insert_branch_scope(bid, scope);
+                    }
+                    if output.is_none() {
+                        *output = t_output;
+                    }
+                    execution_order.extend(t_order);
+                }
+            }
+
+            Opcode::Loop => {
+                return self.run_loop(
+                    node,
+                    ctx,
+                    node_outputs,
+                    enabled,
+                    control_satisfied,
+                    loop_bodies,
+                    loop_skipped,
+                    node_count,
+                    start,
+                    time_limit_us,
+                    node_budget,
+                    mem_limit,
+                    order,
+                    None,
+                    pause,
+                );
+            }
+
+            Opcode::Wait => {
+                let secs = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "duration_secs")
+                    .map(|a| a.value.parse::<i64>().unwrap_or(0))
+                    .unwrap_or(0);
+                let max_secs = 300i64;
+                if secs > max_secs {
+                    return Err(ExecutionError::Custom(format!(
+                        "WAIT duration {}s exceeds v1 maximum of {}s",
+                        secs, max_secs
+                    )));
+                }
+                if secs > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(secs as u64));
+                }
+                node_outputs.insert(node.index, Value::Null);
+                self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
+            }
+
+            Opcode::Merge => {
+                // ── Scope isolation: tüm branch scope'larını birleştir ──
+                ctx.merge_branches();
+                // Snapshot the merged context as output
+                let merged_vars = ctx.variables.clone();
+                node_outputs.insert(node.index, Value::Object(merged_vars));
+                self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
+            }
+
+            Opcode::Error => {
+                let msg = node
+                    .args
+                    .iter()
+                    .find(|a| a.key == "message")
+                    .map(|a| a.value.trim_matches('"').to_string())
+                    .unwrap_or_else(|| "execution error".into());
+                return Err(ExecutionError::Custom(msg));
+            }
+        }
+
+        Ok(NodeOutcome::Ok)
+    }
+
+    /// LOOP node gövdesini yürütür (inline).
+    /// `loop_cursor = Some((iteration, body_position))` verilirse loop'a o noktadan
+    /// devam edilir (pause/resume). Pause politikası body node başına denetlenir.
+    #[allow(clippy::too_many_arguments)]
+    fn run_loop(
+        &self,
+        node: &CompiledNode,
+        ctx: &mut Context,
+        node_outputs: &mut HashMap<u32, Value>,
+        enabled: &mut HashSet<u32>,
+        control_satisfied: &[Cell<u32>],
+        loop_bodies: &HashMap<u32, HashSet<u32>>,
+        loop_skipped: &mut HashSet<u32>,
+        node_count: &mut u32,
+        start: Instant,
+        time_limit_us: u64,
+        node_budget: u32,
+        _mem_limit: u64,
+        order: &[u32],
+        loop_cursor: Option<(u32, usize)>,
+        pause: Option<&PausePolicy>,
+    ) -> Result<NodeOutcome, ExecutionError> {
+        let max_iter = node
+            .args
+            .iter()
+            .find(|a| a.key == "max_iterations")
+            .map(|a| a.value.parse::<u32>().unwrap_or(100))
+            .unwrap_or(100);
+        let target_name = node
+            .args
+            .iter()
+            .find(|a| a.key == "target")
+            .map(|a| a.value.trim_matches('"').to_string());
+
+        // Find body node indices — nodes reachable from LOOP via edges without condition
+        let mut body_indices: Vec<u32> = Vec::new();
+        for edge in &self.plan.edges {
+            if edge.from_index == node.index && edge.condition.is_none() {
+                body_indices.push(edge.to_index);
+            }
+        }
+
+        if !body_indices.is_empty() {
+            // Collect body nodes reachable from the FIRST unconditional body edge.
+            // The LOOP node also emits an unconditional continuation edge (to the
+            // next statement after the loop) — including it here would swallow the
+            // continuation into the body set and it would never run in the main pass.
+            let mut body_set: HashSet<u32> = self.collect_reachable_indices(&[body_indices[0]]);
+            if body_indices.len() > 1 {
+                // Continuation hedeflerinden ulaşılabilenler body'den çıkarılır
+                // (compiler plan'larında `return x` body'den reachable olabilir).
+                let mut continuation: HashSet<u32> = HashSet::new();
+                for to in &body_indices[1..] {
+                    continuation.extend(self.collect_reachable_indices(&[*to]));
+                }
+                body_set = body_set.difference(&continuation).copied().collect();
+            }
+            let body_vec: Vec<u32> = order
+                .iter()
+                .filter(|idx| body_set.contains(idx))
+                .copied()
+                .collect();
+
+            // Mark body nodes as skipped so the main pass doesn't re-execute them
+            for bidx in &body_set {
+                loop_skipped.insert(*bidx);
+            }
+
+            // Execute loop body up to max_iterations
+            let (start_iteration, start_body_pos) = loop_cursor.unwrap_or((0, 0));
+
+            // Execute loop body up to max_iterations
+            for iteration in start_iteration..max_iter {
+                // Provide the loop variable value in context
+                if let Some(ref name) = target_name {
+                    ctx.set(name.clone(), Value::Int(iteration as i64));
+                }
+                // Check for break condition via DECIDE node in body
+                let mut should_break = false;
+
+                for (body_pos, body_idx) in body_vec.iter().enumerate() {
+                    // Skip, sadece devam edilen iterasyonun ilk start_body_pos node'u
+                    // için geçerlidir (bu node'lar pause'dan önce çalışmıştı).
+                    if iteration == start_iteration && body_pos < start_body_pos {
+                        continue;
+                    }
+
+                    let body_node = self.plan.get_node(*body_idx).ok_or_else(|| {
+                        ExecutionError::NodeNotFound(format!("body index {}", body_idx))
+                    })?;
+
+                    // Budget and time checks
+                    *node_count += 1;
+                    let elapsed = start.elapsed();
+                    if elapsed.as_micros() as u64 > time_limit_us {
+                        return Err(ExecutionError::TimeLimitExceeded(time_limit_us / 1000));
+                    }
+                    if *node_count > node_budget {
+                        return Err(ExecutionError::NodeBudgetExceeded(*node_count, node_budget));
+                    }
+
+                    match body_node.op {
+                        Opcode::Calc => {
+                            let expr = body_node
+                                .args
+                                .iter()
+                                .find(|a| a.key == "expr")
+                                .map(|a| &a.value)
+                                .unwrap_or(&body_node.id);
+                            let result = eval_expression(expr, ctx, node_outputs)?;
+                            node_outputs.insert(body_node.index, result.clone());
+                            // Output arg writes result to context (loop body persists state)
+                            if let Some(output_name) = body_node
+                                .args
+                                .iter()
+                                .find(|a| a.key == "output")
+                                .map(|a| a.value.trim_matches('"'))
+                            {
+                                if !output_name.is_empty() {
+                                    ctx.set(output_name.to_owned(), result);
+                                }
+                            }
+                        }
+                        Opcode::Call => {
+                            let target = body_node
+                                .args
+                                .iter()
+                                .find(|a| a.key == "target")
+                                .map(|a| a.value.trim_matches('"'))
+                                .unwrap_or("unknown");
+                            let output_name = body_node
+                                .args
+                                .iter()
+                                .find(|a| a.key == "output_name")
+                                .map(|a| a.value.trim_matches('"'));
+
+                            let mut params = HashMap::new();
+                            for arg in &body_node.args {
+                                if arg.key == "target" || arg.key == "output_name" {
+                                    continue;
+                                }
+                                let val = resolve_arg_value(&arg.value, ctx, node_outputs);
+                                params.insert(arg.key.clone(), val);
+                            }
+
+                            let ct = tinypipe_api::types::CallTarget {
+                                name: target.to_string(),
+                                args: Vec::new(),
+                                kwargs: params,
+                            };
+
+                            match self.registry.dispatch(&ct, ctx) {
+                                Ok(val) => {
+                                    if let Some(name) = output_name {
+                                        ctx.set(name.to_string(), val.clone());
+                                    }
+                                    node_outputs.insert(body_node.index, val);
+                                }
+                                Err(e) => {
+                                    return Err(ExecutionError::CallFailed(
+                                        target.to_string(),
+                                        e.to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        Opcode::Decide => {
+                            let source = body_node
+                                .args
+                                .iter()
+                                .find(|a| a.key == "source")
+                                .map(|a| resolve_arg_value(&a.value, ctx, node_outputs))
+                                .unwrap_or(Value::Null);
+                            let op = body_node
+                                .args
+                                .iter()
+                                .find(|a| a.key == "op")
+                                .map(|a| a.value.trim_matches('"').to_string())
+                                .unwrap_or_default();
+                            let cmp_val = body_node
+                                .args
+                                .iter()
+                                .find(|a| a.key == "value")
+                                .map(|a| parse_json_value(&a.value))
+                                .unwrap_or(Value::Null);
+
+                            let decision = evaluate_condition(&source, &op, &cmp_val)?;
+                            node_outputs.insert(body_node.index, Value::Bool(decision));
+
+                            // Check if this is a break condition
+                            if !decision {
+                                should_break = true;
+                            }
+                        }
+                        Opcode::Input => {
+                            // Re-read input each iteration (allows loop variable updates)
+                            let name = body_node
+                                .args
+                                .iter()
+                                .find(|a| a.key == "name")
+                                .map(|a| a.value.trim_matches('"'))
+                                .unwrap_or(&body_node.id);
+                            if let Some(val) = ctx.get(name) {
+                                node_outputs.insert(body_node.index, val.clone());
+                            }
+                        }
+                        Opcode::Act => {
+                            let action_type = body_node
+                                .args
+                                .iter()
+                                .find(|a| a.key == "type" || a.key == "action_type")
+                                .map(|a| a.value.trim_matches('"').to_string())
+                                .unwrap_or_default();
+                            if action_type == "return" {
+                                // Early return from loop
+                                let content = body_node
+                                    .args
+                                    .iter()
+                                    .find(|a| a.key == "content" || a.key == "value")
+                                    .map(|a| resolve_arg_value(&a.value, ctx, node_outputs));
+                                if let Some(v) = content {
+                                    node_outputs.insert(body_node.index, v);
+                                } else {
+                                    let pred_value = self
+                                        .plan
+                                        .edges
+                                        .iter()
+                                        .filter(|e| {
+                                            e.to_index == body_node.index
+                                                && e.kind == EdgeKind::Data
+                                        })
+                                        .filter_map(|e| node_outputs.get(&e.from_index).cloned())
+                                        .next_back();
+                                    if let Some(v) = pred_value {
+                                        node_outputs.insert(body_node.index, v);
+                                    } else {
+                                        node_outputs.insert(body_node.index, Value::Null);
+                                    }
+                                }
+                                should_break = true;
+                            } else {
+                                node_outputs.insert(
+                                    body_node.index,
+                                    Value::String(format!("[ACT:{}]", action_type)),
+                                );
+                            }
+                        }
+                        _ => {
+                            node_outputs.insert(body_node.index, Value::Null);
+                        }
+                    }
+
+                    // Break kararı pause'dan önce onurlandırılır: decide zaten
+                    // loop'u bitirdiyse pause'a takılıp bir sonraki segmentte
+                    // loop yeniden başlamamalı.
+                    if should_break {
+                        break;
+                    }
+
+                    if let Some(p) = pause {
+                        if p.should_pause(*node_count, &body_node.id) {
+                            return Ok(NodeOutcome::Paused(LoopState {
+                                loop_index: node.index,
+                                iteration,
+                                body_position: body_pos + 1,
+                            }));
+                        }
+                    }
+                }
+
+                if should_break {
+                    break;
+                }
+            }
+        }
+
+        // After loop completes, propagate edges from LOOP to downstream nodes
+        for edge in &self.plan.edges {
+            if edge.from_index == node.index
+                && !loop_bodies
+                    .get(&node.index)
+                    .map(|body| body.contains(&edge.to_index))
+                    .unwrap_or(false)
+            {
+                if edge.kind == EdgeKind::Control {
+                    // Control edges are tracked via control_satisfied
+                    let to = edge.to_index as usize;
+                    if to < control_satisfied.len() {
+                        control_satisfied[to].set(control_satisfied[to].get() + 1);
+                    }
+                    // LOOP'un continuation'ı da çalışmalı: hedefi enable et
+                    // (normal akışta Decide arm'ı yapar; loop bitince LOOP kendisi yapar).
+                    enabled.insert(edge.to_index);
+                    continue;
+                }
+                if let Some(ref mapping) = edge.mapping {
+                    for (from_key, to_key) in mapping {
+                        if let Some(val) = ctx.get(from_key).cloned() {
+                            ctx.set(to_key.clone(), val);
+                        }
+                    }
+                }
+                enabled.insert(edge.to_index);
+            }
+        }
+        node_outputs.insert(node.index, Value::Null);
+
+        Ok(NodeOutcome::Ok)
     }
 
     /// Propagate edges from a node to downstream nodes, respecting conditions and mapping.
@@ -758,8 +1437,20 @@ impl<'a> CompiledExecutor<'a> {
             if body_starts.is_empty() {
                 continue;
             }
-            // Collect all nodes reachable from body entry points
-            let body_set: HashSet<u32> = self.collect_reachable_indices(&body_starts);
+            // Sadece İLK unconditional edge'den ulaşılabilenler body set'idir;
+            // devam edge'i (loop'tan sonraki statement) body'e karışmamalı.
+            let mut body_set: HashSet<u32> = self.collect_reachable_indices(&body_starts[..1]);
+            if body_starts.len() > 1 {
+                // Continuation hedefleri (ilk hariç tüm unconditional edge'ler):
+                // bunlardan ulaşılabilen node'lar loop'tan SONRA çalışır.
+                // Compiler plan'larında continuation node'u body'den reachable
+                // olabilir (örn. `return x`), bu yüzden body'den çıkarılmalı.
+                let mut continuation: HashSet<u32> = HashSet::new();
+                for to in &body_starts[1..] {
+                    continuation.extend(self.collect_reachable_indices(&[*to]));
+                }
+                body_set = body_set.difference(&continuation).copied().collect();
+            }
             bodies.insert(node.index, body_set);
         }
         bodies
@@ -780,7 +1471,7 @@ impl<'a> CompiledExecutor<'a> {
     }
 
     /// Topological sort on compiled edges (Kahn's algorithm).
-    fn topological_order(&self, _id_to_index: &HashMap<&str, u32>) -> Result<Vec<u32>, ExecutionError> {
+    fn topological_order(&self) -> Result<Vec<u32>, ExecutionError> {
         let n = self.plan.nodes.len();
         let mut in_degree = vec![0u32; n];
 
@@ -823,10 +1514,37 @@ impl<'a> CompiledExecutor<'a> {
 // ─── Expression evaluation helpers ───────────────────────────────────
 
 /// Simple expression evaluator for CALC nodes and edge conditions.
-fn eval_expression(expr: &str, ctx: &Context, outputs: &HashMap<u32, Value>) -> Result<Value, ExecutionError> {
+fn eval_expression(
+    expr: &str,
+    ctx: &Context,
+    outputs: &HashMap<u32, Value>,
+) -> Result<Value, ExecutionError> {
     let expr = expr.trim().trim_matches('"');
     if expr.is_empty() {
         return Ok(Value::Null);
+    }
+
+    // range(...) — yalnızca loop bound olarak kullanılır (for i in range(n)).
+    if let Some(inner) = expr.strip_prefix("range(") {
+        if let Some(args_str) = inner.strip_suffix(')') {
+            let nums: Option<Vec<i64>> = args_str
+                .split(',')
+                .map(|a| a.trim().parse::<i64>().ok())
+                .collect();
+            if let Some(nums) = nums {
+                return match nums.as_slice() {
+                    [stop] => Ok(Value::Int(*stop)),
+                    [start, stop] => Ok(Value::Int(stop - start)),
+                    [start, stop, step] if *step > 0 => {
+                        Ok(Value::Int((stop - start).max(0) / step))
+                    }
+                    _ => Err(ExecutionError::EvalError(format!(
+                        "cannot evaluate: {}",
+                        expr
+                    ))),
+                };
+            }
+        }
     }
 
     // Boolean constants
@@ -844,18 +1562,29 @@ fn eval_expression(expr: &str, ctx: &Context, outputs: &HashMap<u32, Value>) -> 
     if expr.starts_with('"') && expr.ends_with('"')
         || expr.starts_with('\'') && expr.ends_with('\'')
     {
-        return Ok(Value::String(expr[1..expr.len()-1].to_owned()));
+        return Ok(Value::String(expr[1..expr.len() - 1].to_owned()));
     }
 
     // Not operator
     if expr.starts_with("not ") || expr.starts_with("!") {
-        let rest = if expr.starts_with("not ") { &expr[4..] } else { &expr[1..] };
+        let rest = if expr.starts_with("not ") {
+            &expr[4..]
+        } else {
+            &expr[1..]
+        };
         let val = eval_expression(rest.trim(), ctx, outputs)?;
         return Ok(Value::Bool(!is_truthy(&val)));
     }
 
     // Comparison operators
-    let cmp_ops = [(">=", 2usize), ("<=", 2), ("!=", 2), ("==", 2), (">", 1), ("<", 1)];
+    let cmp_ops = [
+        (">=", 2usize),
+        ("<=", 2),
+        ("!=", 2),
+        ("==", 2),
+        (">", 1),
+        ("<", 1),
+    ];
     for (op_str, op_len) in &cmp_ops {
         if let Some(pos) = expr.find(op_str) {
             let left = expr[..pos].trim();
@@ -905,12 +1634,17 @@ fn eval_expression(expr: &str, ctx: &Context, outputs: &HashMap<u32, Value>) -> 
         ('+', Box::new(|a, b| a.checked_add(b))),
         ('-', Box::new(|a, b| a.checked_sub(b))),
         ('*', Box::new(|a, b| a.checked_mul(b))),
-        ('/', Box::new(|a, b| if b != 0 { a.checked_div(b) } else { None })),
+        (
+            '/',
+            Box::new(|a, b| if b != 0 { a.checked_div(b) } else { None }),
+        ),
     ];
 
     for (op_char, op_fn) in &ops {
         if let Some(pos) = expr.find(*op_char) {
-            if pos == 0 || pos == expr.len() - 1 { continue; }
+            if pos == 0 || pos == expr.len() - 1 {
+                continue;
+            }
             let left = expr[..pos].trim();
             let right = expr[pos + 1..].trim();
             let left_val = resolve_numeric(left, ctx, outputs);
@@ -923,7 +1657,10 @@ fn eval_expression(expr: &str, ctx: &Context, outputs: &HashMap<u32, Value>) -> 
         }
     }
 
-    Err(ExecutionError::EvalError(format!("cannot evaluate: {}", expr)))
+    Err(ExecutionError::EvalError(format!(
+        "cannot evaluate: {}",
+        expr
+    )))
 }
 
 fn resolve_numeric(key: &str, ctx: &Context, _outputs: &HashMap<u32, Value>) -> Option<i64> {
@@ -944,7 +1681,10 @@ fn resolve_numeric(key: &str, ctx: &Context, _outputs: &HashMap<u32, Value>) -> 
 fn resolve_arg_value(value_str: &str, ctx: &Context, _outputs: &HashMap<u32, Value>) -> Value {
     let s = value_str.trim();
     // Strip JSON string quotes for context lookup
-    let clean = s.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(s);
+    let clean = s
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(s);
     // Try context first (e.g. source="x" → ctx.get("x"))
     if let Some(val) = ctx.get(clean) {
         return val.clone();
@@ -982,7 +1722,9 @@ fn format_value(v: &Value) -> String {
 
 fn parse_json_value(s: &str) -> Value {
     let s = s.trim();
-    if s.is_empty() { return Value::Null; }
+    if s.is_empty() {
+        return Value::Null;
+    }
     // Try JSON decode
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
         return json_to_tp(v);
@@ -1007,9 +1749,8 @@ fn json_to_tp(v: serde_json::Value) -> Value {
         J::String(s) => Value::String(s),
         J::Array(arr) => Value::Array(arr.into_iter().map(json_to_tp).collect()),
         J::Object(obj) => {
-            let map: HashMap<String, Value> = obj.into_iter()
-                .map(|(k, v)| (k, json_to_tp(v)))
-                .collect();
+            let map: HashMap<String, Value> =
+                obj.into_iter().map(|(k, v)| (k, json_to_tp(v))).collect();
             Value::Object(map)
         }
     }
@@ -1027,27 +1768,43 @@ fn is_truthy(val: &Value) -> bool {
 }
 
 fn evaluate_condition(source: &Value, op: &str, compare: &Value) -> Result<bool, ExecutionError> {
+    fn numeric_pair<'a>(
+        a: &'a Value,
+        b: &'a Value,
+        op: &str,
+    ) -> Result<(f64, f64), ExecutionError> {
+        let a = value_to_f64(a).ok_or_else(|| {
+            ExecutionError::ConditionError(format!(
+                "condition '{op}': operand '{}' is not numeric",
+                format_value(a)
+            ))
+        })?;
+        let b = value_to_f64(b).ok_or_else(|| {
+            ExecutionError::ConditionError(format!(
+                "condition '{op}': operand '{}' is not numeric",
+                format_value(b)
+            ))
+        })?;
+        Ok((a, b))
+    }
+
     match op {
         "eq" => Ok(source == compare),
         "neq" => Ok(source != compare),
         "gt" => {
-            let a = source.as_f64().unwrap_or(0.0);
-            let b = compare.as_f64().unwrap_or(0.0);
+            let (a, b) = numeric_pair(source, compare, op)?;
             Ok(a > b)
         }
         "gte" => {
-            let a = source.as_f64().unwrap_or(0.0);
-            let b = compare.as_f64().unwrap_or(0.0);
+            let (a, b) = numeric_pair(source, compare, op)?;
             Ok(a >= b)
         }
         "lt" => {
-            let a = source.as_f64().unwrap_or(0.0);
-            let b = compare.as_f64().unwrap_or(0.0);
+            let (a, b) = numeric_pair(source, compare, op)?;
             Ok(a < b)
         }
         "lte" => {
-            let a = source.as_f64().unwrap_or(0.0);
-            let b = compare.as_f64().unwrap_or(0.0);
+            let (a, b) = numeric_pair(source, compare, op)?;
             Ok(a <= b)
         }
         "contains" => {
@@ -1061,7 +1818,10 @@ fn evaluate_condition(source: &Value, op: &str, compare: &Value) -> Result<bool,
             };
             Ok(a.contains(&b))
         }
-        _ => Err(ExecutionError::ConditionError(format!("unknown operator: {}", op))),
+        _ => Err(ExecutionError::ConditionError(format!(
+            "unknown operator: {}",
+            op
+        ))),
     }
 }
 
@@ -1100,10 +1860,10 @@ pub(crate) fn compare_values(a: &Value, b: &Value, cmp: fn(f64, f64) -> bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mocks::mock_tools;
     use tinypipe_api::types::MergeStrategy;
     use tinypipe_ir::compiled::CompiledPlan;
     use tinypipe_ir::plan::{Edge, ExecutionPlan, Node, Opcode};
-    use crate::mocks::mock_tools;
 
     fn compile_plan(plan: ExecutionPlan) -> CompiledPlan {
         CompiledPlan::from_execution_plan(&plan, vec![])
@@ -1112,11 +1872,18 @@ mod tests {
     // ── eval_expression tests (compiled executor's evaluator) ──────
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 testi kasıtlı — literal roundtrip
     fn test_compiled_eval_number() {
         let ctx = Context::new();
         let outputs = HashMap::new();
-        assert_eq!(eval_expression("42", &ctx, &outputs).unwrap(), Value::Int(42));
-        assert_eq!(eval_expression("3.14", &ctx, &outputs).unwrap(), Value::Float(3.14));
+        assert_eq!(
+            eval_expression("42", &ctx, &outputs).unwrap(),
+            Value::Int(42)
+        );
+        assert_eq!(
+            eval_expression("3.14", &ctx, &outputs).unwrap(),
+            Value::Float(3.14)
+        );
     }
 
     #[test]
@@ -1124,7 +1891,10 @@ mod tests {
         let mut ctx = Context::new();
         ctx.set("x".into(), Value::Int(10));
         let outputs = HashMap::new();
-        assert_eq!(eval_expression("x", &ctx, &outputs).unwrap(), Value::Int(10));
+        assert_eq!(
+            eval_expression("x", &ctx, &outputs).unwrap(),
+            Value::Int(10)
+        );
     }
 
     #[test]
@@ -1133,9 +1903,18 @@ mod tests {
         ctx.set("x".into(), Value::Int(5));
         let outputs = HashMap::new();
         // Compiled executor uses i64 arithmetic
-        assert_eq!(eval_expression("x + 3", &ctx, &outputs).unwrap(), Value::Int(8));
-        assert_eq!(eval_expression("10 - 4", &ctx, &outputs).unwrap(), Value::Int(6));
-        assert_eq!(eval_expression("3 * 4", &ctx, &outputs).unwrap(), Value::Int(12));
+        assert_eq!(
+            eval_expression("x + 3", &ctx, &outputs).unwrap(),
+            Value::Int(8)
+        );
+        assert_eq!(
+            eval_expression("10 - 4", &ctx, &outputs).unwrap(),
+            Value::Int(6)
+        );
+        assert_eq!(
+            eval_expression("3 * 4", &ctx, &outputs).unwrap(),
+            Value::Int(12)
+        );
     }
 
     #[test]
@@ -1143,25 +1922,46 @@ mod tests {
         let mut ctx = Context::new();
         ctx.set("x".into(), Value::Int(5));
         let outputs = HashMap::new();
-        assert_eq!(eval_expression("x > 3", &ctx, &outputs).unwrap(), Value::Bool(true));
-        assert_eq!(eval_expression("x > 10", &ctx, &outputs).unwrap(), Value::Bool(false));
-        assert_eq!(eval_expression("x == 5", &ctx, &outputs).unwrap(), Value::Bool(true));
+        assert_eq!(
+            eval_expression("x > 3", &ctx, &outputs).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_expression("x > 10", &ctx, &outputs).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_expression("x == 5", &ctx, &outputs).unwrap(),
+            Value::Bool(true)
+        );
     }
 
     #[test]
     fn test_compiled_eval_not() {
         let ctx = Context::new();
         let outputs = HashMap::new();
-        assert_eq!(eval_expression("not true", &ctx, &outputs).unwrap(), Value::Bool(false));
-        assert_eq!(eval_expression("not false", &ctx, &outputs).unwrap(), Value::Bool(true));
+        assert_eq!(
+            eval_expression("not true", &ctx, &outputs).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_expression("not false", &ctx, &outputs).unwrap(),
+            Value::Bool(true)
+        );
     }
 
     #[test]
     fn test_compiled_eval_null_none() {
         let ctx = Context::new();
         let outputs = HashMap::new();
-        assert_eq!(eval_expression("null", &ctx, &outputs).unwrap(), Value::Null);
-        assert_eq!(eval_expression("None", &ctx, &outputs).unwrap(), Value::Null);
+        assert_eq!(
+            eval_expression("null", &ctx, &outputs).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_expression("None", &ctx, &outputs).unwrap(),
+            Value::Null
+        );
     }
 
     // ── Integration tests ─────────────────────────────────────────
@@ -1178,10 +1978,7 @@ mod tests {
                     .with_arg("type", "return".into())
                     .with_arg("value", "result".into()),
             ],
-            vec![
-                Edge::new("input1", "calc1"),
-                Edge::new("calc1", "output1"),
-            ],
+            vec![Edge::new("input1", "calc1"), Edge::new("calc1", "output1")],
         );
         let compiled = compile_plan(plan);
         let registry = mock_tools();
@@ -1203,7 +2000,7 @@ mod tests {
                 Node::new("decide1", Opcode::Decide)
                     .with_arg("source", "x".into())
                     .with_arg("op", "gt".into())
-                    .with_arg("value", "0".into()),
+                    .with_arg("value", 0i64.into()),
                 Node::new("true_branch", Opcode::Act)
                     .with_arg("type", "return".into())
                     .with_arg("value", "\"ok\"".into()),
@@ -1236,7 +2033,7 @@ mod tests {
                 Node::new("decide1", Opcode::Decide)
                     .with_arg("source", "x".into())
                     .with_arg("op", "gt".into())
-                    .with_arg("value", "0".into()),
+                    .with_arg("value", 0i64.into()),
                 Node::new("true_branch", Opcode::Act)
                     .with_arg("type", "return".into())
                     .with_arg("value", "\"ok\"".into()),
@@ -1262,9 +2059,31 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_condition_type_mismatch_errors() {
+        let err = evaluate_condition(&Value::String("abc".into()), "lt", &Value::Int(5))
+            .expect_err("non-numeric source must error");
+        assert!(matches!(err, ExecutionError::ConditionError(_)));
+        assert!(err.to_string().contains("not numeric"));
+
+        let err = evaluate_condition(&Value::Int(5), "gte", &Value::String("5".into()))
+            .expect_err("non-numeric compare must error");
+        assert!(matches!(err, ExecutionError::ConditionError(_)));
+
+        let ok = evaluate_condition(&Value::Int(3), "lt", &Value::Int(5))
+            .expect("numeric compare must succeed");
+        assert!(ok);
+
+        let ok = evaluate_condition(&Value::Float(5.5), "gte", &Value::Int(5))
+            .expect("int/float mixed compare must succeed");
+        assert!(ok);
+    }
+
+    #[test]
     fn test_compiled_execute_call_tool() {
         let reg = crate::MockToolRegistry::new();
-        reg.add("test.echo", |args| Ok(args.first().cloned().unwrap_or(Value::Null)));
+        reg.add("test.echo", |args| {
+            Ok(args.first().cloned().unwrap_or(Value::Null))
+        });
 
         let plan = ExecutionPlan::new(
             vec![
@@ -1277,10 +2096,7 @@ mod tests {
                     .with_arg("type", "return".into())
                     .with_arg("value", "call_result".into()),
             ],
-            vec![
-                Edge::new("input1", "call1"),
-                Edge::new("call1", "output1"),
-            ],
+            vec![Edge::new("input1", "call1"), Edge::new("call1", "output1")],
         );
         let compiled = compile_plan(plan);
         let exec = CompiledExecutor::new(&compiled, &reg);
@@ -1296,7 +2112,9 @@ mod tests {
         let compiled = compile_plan(plan);
         let registry = mock_tools();
         let exec = CompiledExecutor::new(&compiled, &registry);
-        let result = exec.execute(Context::new()).expect("empty plan should succeed");
+        let result = exec
+            .execute(Context::new())
+            .expect("empty plan should succeed");
         assert_eq!(result.node_count, 0);
         assert!(result.output.is_none());
     }
@@ -1325,12 +2143,9 @@ mod tests {
         let plan = ExecutionPlan::new(
             vec![
                 Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
-                Node::new("err1", Opcode::Error)
-                    .with_arg("message", "something went wrong".into()),
+                Node::new("err1", Opcode::Error).with_arg("message", "something went wrong".into()),
             ],
-            vec![
-                Edge::new("input1", "err1"),
-            ],
+            vec![Edge::new("input1", "err1")],
         );
         let compiled = compile_plan(plan);
         let registry = mock_tools();
@@ -1338,7 +2153,9 @@ mod tests {
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(42));
         let result = exec.execute(inputs);
-        assert!(matches!(result, Err(ExecutionError::Custom(msg)) if msg == "something went wrong"));
+        assert!(
+            matches!(result, Err(ExecutionError::Custom(msg)) if msg == "something went wrong")
+        );
     }
 
     #[test]
@@ -1348,26 +2165,28 @@ mod tests {
                 Node::new("w1", Opcode::Wait).with_arg("duration_secs", 0i64.into()),
                 Node::new("output1", Opcode::Act).with_arg("type", "return".into()),
             ],
-            vec![
-                Edge::new("w1", "output1"),
-            ],
+            vec![Edge::new("w1", "output1")],
         );
         let compiled = compile_plan(plan);
         let registry = mock_tools();
         let exec = CompiledExecutor::new(&compiled, &registry);
         let result = exec.execute(Context::new()).expect("wait should succeed");
-        assert!(result.execution_order.contains(&"w1".to_string()),
-            "expected w1 in execution order, got: {:?}", result.execution_order);
-        assert!(result.execution_order.contains(&"output1".to_string()),
-            "expected output1 in execution order, got: {:?}", result.execution_order);
+        assert!(
+            result.execution_order.contains(&"w1".to_string()),
+            "expected w1 in execution order, got: {:?}",
+            result.execution_order
+        );
+        assert!(
+            result.execution_order.contains(&"output1".to_string()),
+            "expected output1 in execution order, got: {:?}",
+            result.execution_order
+        );
     }
 
     #[test]
     fn test_compiled_execute_wait_exceeds_max() {
         let plan = ExecutionPlan::new(
-            vec![
-                Node::new("w1", Opcode::Wait).with_arg("duration_secs", 301i64.into()),
-            ],
+            vec![Node::new("w1", Opcode::Wait).with_arg("duration_secs", 301i64.into())],
             vec![],
         );
         let compiled = compile_plan(plan);
@@ -1390,9 +2209,7 @@ mod tests {
                 Node::new("w1", Opcode::Wait).with_arg("duration_secs", 1i64.into()),
                 Node::new("output1", Opcode::Act).with_arg("type", "return".into()),
             ],
-            vec![
-                Edge::new("w1", "output1"),
-            ],
+            vec![Edge::new("w1", "output1")],
         );
         let compiled = compile_plan(plan);
         let registry = mock_tools();
@@ -1410,8 +2227,7 @@ mod tests {
         let plan = ExecutionPlan::new(
             vec![
                 Node::new("input1", Opcode::Input).with_arg("name", "color".into()),
-                Node::new("switch1", Opcode::Switch)
-                    .with_arg("source", "color".into()),
+                Node::new("switch1", Opcode::Switch).with_arg("source", "color".into()),
                 Node::new("red_case", Opcode::Act)
                     .with_arg("type", "return".into())
                     .with_arg("value", "\"red-result\"".into()),
@@ -1431,14 +2247,15 @@ mod tests {
         let mut inputs = Context::new();
         inputs.set("color".into(), Value::String("red".into()));
         let result = exec.execute(inputs).expect("switch should succeed");
-        assert_eq!(result.node_count, 3, "should execute input1, switch1, red_case");
+        assert_eq!(
+            result.node_count, 3,
+            "should execute input1, switch1, red_case"
+        );
     }
 
     #[test]
     fn test_compiled_budget_time_limit() {
-        let mut nodes = vec![
-            Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
-        ];
+        let mut nodes = vec![Node::new("input1", Opcode::Input).with_arg("name", "x".into())];
         let mut edges = Vec::new();
         for i in 0..200 {
             let nid = format!("calc{}", i);
@@ -1446,7 +2263,7 @@ mod tests {
             if i == 0 {
                 edges.push(Edge::new("input1", &nid));
             } else {
-                edges.push(Edge::new(&format!("calc{}", i-1), &nid));
+                edges.push(Edge::new(&format!("calc{}", i - 1), &nid));
             }
         }
         let plan = ExecutionPlan {
@@ -1464,8 +2281,11 @@ mod tests {
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(42));
         let result = exec.execute(inputs);
-        assert!(matches!(result, Err(ExecutionError::TimeLimitExceeded(_))),
-            "expected TimeLimitExceeded, got {:?}", result);
+        assert!(
+            matches!(result, Err(ExecutionError::TimeLimitExceeded(_))),
+            "expected TimeLimitExceeded, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1483,18 +2303,18 @@ mod tests {
                     .with_arg("type", "return".into())
                     .with_arg("value", "\"unused\"".into()),
             ],
-            vec![
-                Edge::new("input1", "call1"),
-                Edge::new("call1", "output1"),
-            ],
+            vec![Edge::new("input1", "call1"), Edge::new("call1", "output1")],
         );
         let compiled = compile_plan(plan);
         let exec = CompiledExecutor::new(&compiled, &reg);
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(1));
         let result = exec.execute(inputs);
-        assert!(matches!(result, Err(ExecutionError::CallFailed(_, _))),
-            "expected CallFailed, got {:?}", result);
+        assert!(
+            matches!(result, Err(ExecutionError::CallFailed(_, _))),
+            "expected CallFailed, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1514,17 +2334,17 @@ mod tests {
                     .with_arg("type", "return".into())
                     .with_arg("value", "call_result".into()),
             ],
-            vec![
-                Edge::new("input1", "call1"),
-                Edge::new("call1", "output1"),
-            ],
+            vec![Edge::new("input1", "call1"), Edge::new("call1", "output1")],
         );
         let compiled = compile_plan(plan);
         let exec = CompiledExecutor::new(&compiled, &reg);
         let inputs = Context::new();
         let result = exec.execute(inputs).expect("should continue despite error");
-        assert_eq!(result.output, Some(Value::Null),
-            "expected Null output from continue_with_null");
+        assert_eq!(
+            result.output,
+            Some(Value::Null),
+            "expected Null output from continue_with_null"
+        );
     }
 
     #[test]
@@ -1544,23 +2364,25 @@ mod tests {
                     .with_arg("type", "return".into())
                     .with_arg("value", "call_result".into()),
             ],
-            vec![
-                Edge::new("call1", "output1"),
-            ],
+            vec![Edge::new("call1", "output1")],
         );
         let compiled = compile_plan(plan);
         let exec = CompiledExecutor::new(&compiled, &reg);
-        let result = exec.execute(Context::new()).expect("should continue with fallback");
+        let result = exec
+            .execute(Context::new())
+            .expect("should continue with fallback");
         // Compiled executor: fallback_value "42" is parsed as JSON → String("42")
-        assert_eq!(result.output, Some(Value::String("42".into())),
-            "expected fallback value '42', got {:?}", result.output);
+        assert_eq!(
+            result.output,
+            Some(Value::String("42".into())),
+            "expected fallback value '42', got {:?}",
+            result.output
+        );
     }
 
     #[test]
     fn test_compiled_budget_node_count() {
-        let mut nodes = vec![
-            Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
-        ];
+        let mut nodes = vec![Node::new("input1", Opcode::Input).with_arg("name", "x".into())];
         let mut edges = Vec::new();
         for i in 0..100 {
             let nid = format!("calc{}", i);
@@ -1568,7 +2390,7 @@ mod tests {
             if i == 0 {
                 edges.push(Edge::new("input1", &nid));
             } else {
-                edges.push(Edge::new(&format!("calc{}", i-1), &nid));
+                edges.push(Edge::new(&format!("calc{}", i - 1), &nid));
             }
         }
         let plan = ExecutionPlan {
@@ -1586,15 +2408,20 @@ mod tests {
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(42));
         let result = exec.execute(inputs);
-        assert!(matches!(result, Err(ExecutionError::NodeBudgetExceeded(_, _))),
-            "expected NodeBudgetExceeded, got {:?}", result);
+        assert!(
+            matches!(result, Err(ExecutionError::NodeBudgetExceeded(_, _))),
+            "expected NodeBudgetExceeded, got {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_compiled_on_error_abort_in_parallel() {
         let reg = crate::MockToolRegistry::new();
         reg.add("test.error", |_| Err("branch error".into()));
-        reg.add("test.echo", |args| Ok(args.first().cloned().unwrap_or(Value::Null)));
+        reg.add("test.echo", |args| {
+            Ok(args.first().cloned().unwrap_or(Value::Null))
+        });
 
         let plan = ExecutionPlan::new(
             vec![
@@ -1608,8 +2435,7 @@ mod tests {
                     .with_arg("target", "test.echo".into())
                     .with_arg("echo", "hello".into()),
                 Node::new("merge1", Opcode::Merge),
-                Node::new("output1", Opcode::Act)
-                    .with_arg("type", "return".into()),
+                Node::new("output1", Opcode::Act).with_arg("type", "return".into()),
             ],
             vec![
                 Edge::new("input1", "parallel1"),
@@ -1625,7 +2451,11 @@ mod tests {
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(1));
         let result = exec.execute(inputs);
-        assert!(result.is_err(), "expected error from abort in parallel, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected error from abort in parallel, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1643,8 +2473,7 @@ mod tests {
                 Node::new("calc2", Opcode::Calc)
                     .with_arg("expr", "base".into())
                     .with_arg("output", "bigval2".into()),
-                Node::new("output1", Opcode::Act)
-                    .with_arg("type", "return".into()),
+                Node::new("output1", Opcode::Act).with_arg("type", "return".into()),
             ],
             edges: vec![
                 Edge::new("input1", "calc0"),
@@ -1663,8 +2492,11 @@ mod tests {
         let mut inputs = Context::new();
         inputs.set("base".into(), Value::String("A".repeat(100)));
         let result = exec.execute(inputs);
-        assert!(matches!(result, Err(ExecutionError::MemoryLimitExceeded(_, _))),
-            "expected MemoryLimitExceeded, got {:?}", result);
+        assert!(
+            matches!(result, Err(ExecutionError::MemoryLimitExceeded(_, _))),
+            "expected MemoryLimitExceeded, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1741,10 +2573,7 @@ mod tests {
                     .with_arg("type", "return".into())
                     .with_arg("value", "result".into()),
             ],
-            vec![
-                Edge::new("input1", "calc1"),
-                Edge::new("calc1", "output1"),
-            ],
+            vec![Edge::new("input1", "calc1"), Edge::new("calc1", "output1")],
         );
         let compiled = compile_plan(plan);
         let fb_bytes = compiled.to_fb_bytes().expect("FB serialize");
@@ -1768,7 +2597,7 @@ mod tests {
                 Node::new("decide1", Opcode::Decide)
                     .with_arg("source", "x".into())
                     .with_arg("op", "gt".into())
-                    .with_arg("value", "0".into()),
+                    .with_arg("value", 0i64.into()),
                 Node::new("true_branch", Opcode::Act)
                     .with_arg("type", "return".into())
                     .with_arg("value", "\"ok\"".into()),
@@ -1875,10 +2704,20 @@ mod tests {
         let exec = CompiledExecutor::new(&compiled, &reg);
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(10));
-        let result = exec.execute(inputs).expect("scope isolation should succeed");
+        let result = exec
+            .execute(inputs)
+            .expect("scope isolation should succeed");
         // MERGE her iki branch scope'unu birleştirmeli
-        assert_eq!(result.context.get("a"), Some(&Value::Int(11)), "branch0: x+1=11");
-        assert_eq!(result.context.get("b"), Some(&Value::Int(12)), "branch1: x+2=12");
+        assert_eq!(
+            result.context.get("a"),
+            Some(&Value::Int(11)),
+            "branch0: x+1=11"
+        );
+        assert_eq!(
+            result.context.get("b"),
+            Some(&Value::Int(12)),
+            "branch1: x+2=12"
+        );
     }
 
     #[test]
@@ -1913,12 +2752,17 @@ mod tests {
         let reg = crate::MockToolRegistry::new();
         let exec = CompiledExecutor::new(&compiled, &reg);
         let inputs = Context::new();
-        let result = exec.execute(inputs).expect("scope isolation same var should succeed");
+        let result = exec
+            .execute(inputs)
+            .expect("scope isolation same var should succeed");
         // With Last strategy, the highest branch_id wins (sorted deterministically).
         // branch_id 0 writes 100, branch_id 1 writes 200.
         // Sorted order: [0, 1]. Last = 1 → 200.
-        assert_eq!(result.context.get("result"), Some(&Value::Int(200)),
-            "Last strategy: highest branch_id (1) should win with value 200");
+        assert_eq!(
+            result.context.get("result"),
+            Some(&Value::Int(200)),
+            "Last strategy: highest branch_id (1) should win with value 200"
+        );
     }
 
     #[test]
@@ -1970,13 +2814,18 @@ mod tests {
         let exec = CompiledExecutor::new(&compiled, &reg);
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(42)); // Parent value
-        let result = exec.execute(inputs).expect("no cross contamination should succeed");
+        let result = exec
+            .execute(inputs)
+            .expect("no cross contamination should succeed");
         // After merge, "x" was written by both branch0 (as 999) and branch1 didn't write to "x"
         // (it wrote to "branch1_result"). With Last strategy, branch0 is last → "x" = 999.
         // But the key test: branch1 saw the parent value (42) not branch0's (999).
         // We can verify this by checking what branch1's tool received.
-        assert_eq!(result.context.get("x"), Some(&Value::Int(999)),
-            "branch0 modified x to 999");
+        assert_eq!(
+            result.context.get("x"),
+            Some(&Value::Int(999)),
+            "branch0 modified x to 999"
+        );
     }
 
     #[test]
@@ -2007,8 +2856,11 @@ mod tests {
         inputs.set("base".into(), Value::Int(21));
         let result = exec.execute(inputs).expect("parent read should succeed");
         // Branch0 reads "base" from parent scope → 21 * 2 = 42
-        assert_eq!(result.context.get("doubled"), Some(&Value::Int(42)),
-            "branch should read parent variable 'base'");
+        assert_eq!(
+            result.context.get("doubled"),
+            Some(&Value::Int(42)),
+            "branch should read parent variable 'base'"
+        );
     }
 
     #[test]
@@ -2024,17 +2876,16 @@ mod tests {
                     .with_arg("type", "return".into())
                     .with_arg("value", "result".into()),
             ],
-            vec![
-                Edge::new("input1", "calc1"),
-                Edge::new("calc1", "output1"),
-            ],
+            vec![Edge::new("input1", "calc1"), Edge::new("calc1", "output1")],
         );
         let compiled = compile_plan(plan);
         let registry = mock_tools();
         let executor = CompiledExecutor::new(&compiled, &registry);
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(5));
-        let result = executor.execute(inputs).expect("normal exec should succeed");
+        let result = executor
+            .execute(inputs)
+            .expect("normal exec should succeed");
         assert_eq!(result.output, Some(Value::Int(6)), "5 + 1 = 6");
         assert_eq!(result.node_count, 3);
     }
@@ -2075,26 +2926,38 @@ mod tests {
         let reg = crate::MockToolRegistry::new();
         let exec = CompiledExecutor::new(&compiled, &reg);
         let inputs = Context::new();
-        let result = exec.execute(inputs).expect("merge first strategy should succeed");
+        let result = exec
+            .execute(inputs)
+            .expect("merge first strategy should succeed");
         // Default is Last, so highest branch_id (1) wins → 200
-        assert_eq!(result.context.get("result"), Some(&Value::Int(200)),
-            "default Last: branch_id 1 should win");
+        assert_eq!(
+            result.context.get("result"),
+            Some(&Value::Int(200)),
+            "default Last: branch_id 1 should win"
+        );
     }
 
     #[test]
     fn test_scope_isolation_merge_concat_strategy() {
         // Test concat merge strategy via direct Scope manipulation
         let mut ctx = Context::new();
-        ctx.variables.insert("items".into(), Value::Array(vec![
-            Value::String("global".into()),
-        ]));
+        ctx.variables.insert(
+            "items".into(),
+            Value::Array(vec![Value::String("global".into())]),
+        );
 
         // Simulate PARALLEL with two branches each adding items
         ctx.enter_parallel();
         ctx.set_branch(0);
-        ctx.set("items".into(), Value::Array(vec![Value::String("branch0".into())]));
+        ctx.set(
+            "items".into(),
+            Value::Array(vec![Value::String("branch0".into())]),
+        );
         ctx.set_branch(1);
-        ctx.set("items".into(), Value::Array(vec![Value::String("branch1".into())]));
+        ctx.set(
+            "items".into(),
+            Value::Array(vec![Value::String("branch1".into())]),
+        );
 
         // Set merge_strategy for "items" on each branch
         ctx.set_branch(0);

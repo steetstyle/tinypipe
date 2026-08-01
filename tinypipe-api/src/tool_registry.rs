@@ -4,7 +4,7 @@
 //! tinypipe-vm tarafından tüketilir.
 //! Test'lerde `MockToolRegistry` kullanılır.
 
-use crate::types::{CallTarget, Context, RegistryError, DispatchError, ToolSpec, Value};
+use crate::types::{CallTarget, Context, DispatchError, RegistryError, ToolSpec, Value};
 
 /// Tool dispatch ve schema sorgulama için ana trait.
 pub trait ToolRegistry: Send + Sync {
@@ -50,7 +50,9 @@ mod tests {
     fn test_noop_registry() {
         let reg = NoopRegistry;
         assert!(reg.resolve("foo", "1.0").is_err());
-        assert!(reg.dispatch(&CallTarget::new("foo"), &Context::new()).is_err());
+        assert!(reg
+            .dispatch(&CallTarget::new("foo"), &Context::new())
+            .is_err());
         assert!(reg.execute_subgraph("foo", Context::new()).is_err());
         assert!(reg.latest_schema_hash("foo").is_err());
     }

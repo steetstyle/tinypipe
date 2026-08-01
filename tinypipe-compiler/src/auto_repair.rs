@@ -109,13 +109,20 @@ impl RepairReport {
 
 impl fmt::Display for RepairReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "━━━ Compiler Feedback ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")?;
+        writeln!(
+            f,
+            "━━━ Compiler Feedback ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )?;
 
         if self.attempt > 0 {
             writeln!(f, "  Deneme {}/{}", self.attempt, self.max_attempts)?;
         }
 
-        writeln!(f, "  {} ({}:{}): {}", self.error_type, self.line, self.column, self.message)?;
+        writeln!(
+            f,
+            "  {} ({}:{}): {}",
+            self.error_type, self.line, self.column, self.message
+        )?;
 
         if let Some(ref line) = self.source_line {
             writeln!(f)?;
@@ -134,10 +141,17 @@ impl fmt::Display for RepairReport {
             writeln!(f, "  Lütfen kodu düzeltip tekrar gönderin.")?;
         } else {
             writeln!(f)?;
-            writeln!(f, "  Maksimum deneme sayısına ulaşıldı ({}) — sonraki aşamaya geçiliyor.", self.max_attempts)?;
+            writeln!(
+                f,
+                "  Maksimum deneme sayısına ulaşıldı ({}) — sonraki aşamaya geçiliyor.",
+                self.max_attempts
+            )?;
         }
 
-        writeln!(f, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")?;
+        writeln!(
+            f,
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )?;
         Ok(())
     }
 }
@@ -146,20 +160,29 @@ impl fmt::Display for RepairReport {
 
 /// Build a report from a sanitizer error.
 pub fn from_sanitize_error(line: usize, column: usize, message: &str, code: &str) -> RepairReport {
-    RepairReport::new("SANITIZER HATASI", line, column, message)
-        .with_source_line(code)
+    RepairReport::new("SANITIZER HATASI", line, column, message).with_source_line(code)
 }
 
 /// Build a report from a vec of validation errors.
-pub fn from_validation_errors(errors: &[crate::validator::ValidationError], code: &str) -> RepairReport {
+pub fn from_validation_errors(
+    errors: &[crate::validator::ValidationError],
+    code: &str,
+) -> RepairReport {
     let mut report = RepairReport::new(
         "VALIDASYON HATASI",
-        errors.first().map(|e| usize_from_node_id(&e.node_id)).unwrap_or(1),
+        errors
+            .first()
+            .map(|e| usize_from_node_id(&e.node_id))
+            .unwrap_or(1),
         1,
         &format!("{} doğrulama hatası bulundu", errors.len()),
-    ).with_source_line(code);
+    )
+    .with_source_line(code);
 
-    let error_details: Vec<String> = errors.iter().map(|e| format!("- {}: {}", e.node_id, e.message)).collect();
+    let error_details: Vec<String> = errors
+        .iter()
+        .map(|e| format!("- {}: {}", e.node_id, e.message))
+        .collect();
     report.context = error_details;
 
     report
@@ -168,7 +191,11 @@ pub fn from_validation_errors(errors: &[crate::validator::ValidationError], code
 // Note: uses usize for node_id so it can accept numeric indices at the call site.
 fn usize_from_node_id(node_id: &str) -> usize {
     // Try to extract a line number from node_id (e.g., "node_5" → 5)
-    if let Some(num) = node_id.rsplit('_').next().and_then(|s| s.parse::<usize>().ok()) {
+    if let Some(num) = node_id
+        .rsplit('_')
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
         return num;
     }
     // Try direct parse
@@ -177,22 +204,19 @@ fn usize_from_node_id(node_id: &str) -> usize {
 
 /// Build a report from a transform error (which wraps sanitizer or parser errors).
 pub fn from_transform_error(err: &crate::transform::TransformError, code: &str) -> RepairReport {
-    RepairReport::new("TRANSFORM HATASI", err.line, err.column, &err.message)
-        .with_source_line(code)
+    RepairReport::new("TRANSFORM HATASI", err.line, err.column, &err.message).with_source_line(code)
 }
 
 /// Build a report from a generic parse error string.
 pub fn from_parse_error(error_str: &str, code: &str) -> RepairReport {
     // Try to extract line/column from common rustpython_parser error formats
     let (line, col) = extract_line_col_from_error(error_str);
-    RepairReport::new("PARSE HATASI", line, col, error_str)
-        .with_source_line(code)
+    RepairReport::new("PARSE HATASI", line, col, error_str).with_source_line(code)
 }
 
 /// Build a report from a codegen error.
 pub fn from_codegen_error(error_str: &str, code: &str) -> RepairReport {
-    RepairReport::new("CODEGEN HATASI", 1, 1, error_str)
-        .with_source_line(code)
+    RepairReport::new("CODEGEN HATASI", 1, 1, error_str).with_source_line(code)
 }
 
 /// Build a combined report from a full pipeline failure.
@@ -240,7 +264,9 @@ pub fn check_code(code: &str, attempt: u32, max_attempts: u32) -> Option<RepairR
 
 /// Extract a specific line from source code (1-indexed).
 fn extract_line(code: &str, line: usize) -> Option<String> {
-    code.lines().nth(line.saturating_sub(1)).map(|s| s.to_string())
+    code.lines()
+        .nth(line.saturating_sub(1))
+        .map(|s| s.to_string())
 }
 
 /// Extract line and column numbers from a rustpython_parser error string.
@@ -257,7 +283,9 @@ fn extract_line_col_from_error(s: &str) -> (usize, usize) {
                 // Look for "column Y" after "line X"
                 if let Some(col_pos) = after_line.find("column ") {
                     let after_col = &after_line[col_pos + 7..];
-                    let col_end = after_col.find(&[',', ')', ':', ' '][..]).unwrap_or(after_col.len());
+                    let col_end = after_col
+                        .find(&[',', ')', ':', ' '][..])
+                        .unwrap_or(after_col.len());
                     if let Ok(col) = after_col[..col_end].trim().parse::<usize>() {
                         return (line, col);
                     }
@@ -303,13 +331,21 @@ mod tests {
     fn test_check_code_ok() {
         // Simple valid code: has input parameter, uses it, returns
         let result = check_code("def graph(x: int):\n    return x", 1, 3);
-        assert!(result.is_none(), "valid code should produce no report, got: {:?}", result);
+        assert!(
+            result.is_none(),
+            "valid code should produce no report, got: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_check_code_sanitize_error() {
         // Code that will fail sanitizer: using disallowed async
-        let result = check_code("def graph():\n    import os\n    x = os.system('rm -rf /')", 1, 3);
+        let result = check_code(
+            "def graph():\n    import os\n    x = os.system('rm -rf /')",
+            1,
+            3,
+        );
         assert!(result.is_some(), "malicious code should produce a report");
         if let Some(report) = result {
             // Sanitizer errors include the word "yasak" or "blocked" or similar
@@ -362,6 +398,9 @@ mod tests {
             .with_attempt(3)
             .with_max_attempts(3);
         let out2 = report2.to_string();
-        assert!(out2.contains("3/3") || out2.contains("max"), "should show final attempt: {out2}");
+        assert!(
+            out2.contains("3/3") || out2.contains("max"),
+            "should show final attempt: {out2}"
+        );
     }
 }

@@ -83,9 +83,7 @@ fn constant_folding(plan: ExecutionPlan) -> (ExecutionPlan, usize) {
     // pure-literal expressions).
     for node in &mut nodes {
         if node.op == Opcode::Calc {
-            let expr = node.args.iter()
-                .find(|a| a.key == "expr")
-                .map(|a| &a.value);
+            let expr = node.args.iter().find(|a| a.key == "expr").map(|a| &a.value);
 
             if let Some(ArgValue::String(expr_str)) = expr {
                 // Simple constant detection: if the expression contains
@@ -144,7 +142,10 @@ fn eval_simple_int_expr(expr: &str) -> Option<i64> {
         ('+', Box::new(|a, b| a.checked_add(b))),
         ('-', Box::new(|a, b| a.checked_sub(b))),
         ('*', Box::new(|a, b| a.checked_mul(b))),
-        ('/', Box::new(|a, b| if b != 0 { a.checked_div(b) } else { None })),
+        (
+            '/',
+            Box::new(|a, b| if b != 0 { a.checked_div(b) } else { None }),
+        ),
     ];
     for (op_char, op_fn) in &ops {
         if let Some(pos) = expr.find(*op_char) {
@@ -199,17 +200,22 @@ fn dead_node_elimination(plan: ExecutionPlan) -> (ExecutionPlan, usize) {
 
     // If no nodes were removed, return unchanged
     if removed == 0 {
-        return (ExecutionPlan {
-            version: plan.version,
-            nodes: kept_nodes,
-            edges: plan.edges,
-            metadata: plan.metadata,
-        }, 0);
+        return (
+            ExecutionPlan {
+                version: plan.version,
+                nodes: kept_nodes,
+                edges: plan.edges,
+                metadata: plan.metadata,
+            },
+            0,
+        );
     }
 
     // Rebuild edges, filtering out references to removed nodes
     let kept_ids: HashSet<&str> = kept_nodes.iter().map(|n| n.id.as_str()).collect();
-    let kept_edges: Vec<_> = plan.edges.into_iter()
+    let kept_edges: Vec<_> = plan
+        .edges
+        .into_iter()
         .filter(|e| kept_ids.contains(e.from.as_str()) && kept_ids.contains(e.to.as_str()))
         .collect();
 
@@ -277,30 +283,37 @@ fn calc_fusion(plan: ExecutionPlan) -> (ExecutionPlan, usize) {
                 continue;
             }
 
-            let expr = node.args.iter()
-                .find(|a| a.key == "expr")
-                .map(|a| &a.value);
+            let expr = node.args.iter().find(|a| a.key == "expr").map(|a| &a.value);
 
             let (should_update, new_expr_val) = match expr {
-                Some(ArgValue::String(expr_str)) if !expr_str.is_empty() && !is_constant_expression(expr_str) => {
+                Some(ArgValue::String(expr_str))
+                    if !expr_str.is_empty() && !is_constant_expression(expr_str) =>
+                {
                     let vars = extract_variables(expr_str);
                     let mut inlined = expr_str.clone();
                     let mut local_changed = false;
 
                     for var in &vars {
                         if let Some(&def_node) = var_to_node.get(var) {
-                            if def_node.op != Opcode::Calc { continue; }
-                            let consumer_val = consumer_count.get(def_node.id.as_str()).copied().unwrap_or(0);
+                            if def_node.op != Opcode::Calc {
+                                continue;
+                            }
+                            let consumer_val = consumer_count
+                                .get(def_node.id.as_str())
+                                .copied()
+                                .unwrap_or(0);
                             if consumer_val != 1 {
                                 continue;
                             }
-                            let is_consumer = edges.iter().any(|e|
-                                e.from == def_node.id && e.to == node.id
-                            );
+                            let is_consumer = edges
+                                .iter()
+                                .any(|e| e.from == def_node.id && e.to == node.id);
                             if !is_consumer {
                                 continue;
                             }
-                            let def_expr = def_node.args.iter()
+                            let def_expr = def_node
+                                .args
+                                .iter()
                                 .find(|a| a.key == "expr")
                                 .map(|a| &a.value);
                             if let Some(ArgValue::String(def_str)) = def_expr {
@@ -339,7 +352,8 @@ fn calc_fusion(plan: ExecutionPlan) -> (ExecutionPlan, usize) {
         }
 
         if changed {
-            nodes = new_nodes.into_iter()
+            nodes = new_nodes
+                .into_iter()
                 .filter(|n| !to_remove.contains(&n.id))
                 .collect();
             fused += to_remove.len();
@@ -348,7 +362,8 @@ fn calc_fusion(plan: ExecutionPlan) -> (ExecutionPlan, usize) {
 
     // Filter edges to remove references to fused-away nodes
     let kept_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-    let kept_edges: Vec<_> = edges.into_iter()
+    let kept_edges: Vec<_> = edges
+        .into_iter()
         .filter(|e| kept_ids.contains(e.from.as_str()) && kept_ids.contains(e.to.as_str()))
         .collect();
 
@@ -461,14 +476,16 @@ fn multi_branch_fusion(plan: ExecutionPlan) -> (ExecutionPlan, usize) {
     let mut edge_redirects: Vec<(String, String)> = Vec::new();
 
     // Find all PARALLEL nodes
-    let parallel_ids: Vec<String> = nodes.iter()
+    let parallel_ids: Vec<String> = nodes
+        .iter()
         .filter(|n| n.op == Opcode::Parallel)
         .map(|n| n.id.clone())
         .collect();
 
     for par_id in &parallel_ids {
         // Find children of this PARALLEL
-        let children: Vec<&str> = edges.iter()
+        let children: Vec<&str> = edges
+            .iter()
             .filter(|e| e.from == *par_id)
             .map(|e| e.to.as_str())
             .collect();
@@ -486,7 +503,10 @@ fn multi_branch_fusion(plan: ExecutionPlan) -> (ExecutionPlan, usize) {
                 }
                 sig_parts.sort();
                 let sig = sig_parts.join("|");
-                call_signatures.entry(sig).or_default().push(child_id.to_string());
+                call_signatures
+                    .entry(sig)
+                    .or_default()
+                    .push(child_id.to_string());
             }
         }
 
@@ -505,38 +525,60 @@ fn multi_branch_fusion(plan: ExecutionPlan) -> (ExecutionPlan, usize) {
     }
 
     if merged == 0 {
-        return (plan_from_parts(plan.version, nodes, edges, plan.metadata), 0);
+        return (
+            plan_from_parts(plan.version, nodes, edges, plan.metadata),
+            0,
+        );
     }
 
     // Remove merged nodes
     nodes.retain(|n| !to_remove.contains(&n.id));
 
     // Redirect edges to kept node
-    let kept_edges: Vec<_> = edges.into_iter().map(|e| {
-        let from = redirect_id(&e.from, &edge_redirects);
-        let to = redirect_id(&e.to, &edge_redirects);
-        tinypipe_ir::plan::Edge {
-            from, to,
-            condition: e.condition,
-            mapping: e.mapping,
-            priority: e.priority,
-            label: e.label,
-            kind: e.kind,
-        }
-    }).collect();
+    let kept_edges: Vec<_> = edges
+        .into_iter()
+        .map(|e| {
+            let from = redirect_id(&e.from, &edge_redirects);
+            let to = redirect_id(&e.to, &edge_redirects);
+            tinypipe_ir::plan::Edge {
+                from,
+                to,
+                condition: e.condition,
+                mapping: e.mapping,
+                priority: e.priority,
+                label: e.label,
+                kind: e.kind,
+            }
+        })
+        .collect();
 
-    (plan_from_parts(plan.version, nodes, kept_edges, plan.metadata), merged)
+    (
+        plan_from_parts(plan.version, nodes, kept_edges, plan.metadata),
+        merged,
+    )
 }
 
 fn redirect_id(id: &str, redirects: &[(String, String)]) -> String {
     for (old, new) in redirects {
-        if id == old { return new.clone(); }
+        if id == old {
+            return new.clone();
+        }
     }
     id.to_string()
 }
 
-fn plan_from_parts(version: u16, nodes: Vec<Node>, edges: Vec<tinypipe_ir::plan::Edge>, metadata: tinypipe_ir::plan::Metadata) -> ExecutionPlan {
-    ExecutionPlan { version, nodes, edges, metadata }
+fn plan_from_parts(
+    version: u16,
+    nodes: Vec<Node>,
+    edges: Vec<tinypipe_ir::plan::Edge>,
+    metadata: tinypipe_ir::plan::Metadata,
+) -> ExecutionPlan {
+    ExecutionPlan {
+        version,
+        nodes,
+        edges,
+        metadata,
+    }
 }
 
 /// Format an ArgValue as a string for signature computation.
@@ -552,7 +594,8 @@ fn arg_value_str(val: &ArgValue) -> String {
             format!("[{}]", inner.join(","))
         }
         ArgValue::Object(map) => {
-            let inner: Vec<String> = map.iter()
+            let inner: Vec<String> = map
+                .iter()
                 .map(|(k, v)| format!("{}:{}", k, arg_value_str(v)))
                 .collect();
             let mut sorted = inner;
@@ -575,13 +618,13 @@ mod tests {
                 Node::new("calc1", Opcode::Calc).with_arg("expr", "3 + 5".into()),
                 Node::new("act1", Opcode::Act).with_arg("type", "return".into()),
             ],
-            vec![
-                Edge::new("input1", "calc1"),
-                Edge::new("calc1", "act1"),
-            ],
+            vec![Edge::new("input1", "calc1"), Edge::new("calc1", "act1")],
         );
         let result = optimize_all(plan);
-        assert!(result.optimizations_applied.iter().any(|o| o.starts_with("constant_folding")));
+        assert!(result
+            .optimizations_applied
+            .iter()
+            .any(|o| o.starts_with("constant_folding")));
         // The folded calc should now have expression "8"
         let calc_node = result.plan.nodes.iter().find(|n| n.id == "calc1").unwrap();
         let expr = calc_node.args.iter().find(|a| a.key == "expr").unwrap();
@@ -600,7 +643,10 @@ mod tests {
         );
         let result = optimize_all(plan);
         // No constant folding should be applied
-        assert!(!result.optimizations_applied.iter().any(|o| o.starts_with("constant_folding")));
+        assert!(!result
+            .optimizations_applied
+            .iter()
+            .any(|o| o.starts_with("constant_folding")));
     }
 
     #[test]
@@ -621,7 +667,10 @@ mod tests {
             ],
         );
         let result = optimize_all(plan);
-        assert!(result.optimizations_applied.iter().any(|o| o.starts_with("dead_node_elimination")));
+        assert!(result
+            .optimizations_applied
+            .iter()
+            .any(|o| o.starts_with("dead_node_elimination")));
         // Should have 3 nodes (input1, calc1, act1) — calc2 removed
         assert_eq!(result.plan.nodes.len(), 3);
         assert!(result.plan.nodes.iter().all(|n| n.id != "calc2"));
@@ -650,9 +699,7 @@ mod tests {
     fn test_dead_node_preserves_input() {
         // INPUT nodes should never be removed
         let plan = ExecutionPlan::new(
-            vec![
-                Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
-            ],
+            vec![Node::new("input1", Opcode::Input).with_arg("name", "x".into())],
             vec![],
         );
         let result = optimize_all(plan);
@@ -699,7 +746,12 @@ mod tests {
         // Should have both optimizations
         assert!(result.optimizations_applied.len() >= 2);
         // Constant folding: calc_used expr should be "8"
-        let calc = result.plan.nodes.iter().find(|n| n.id == "calc_used").unwrap();
+        let calc = result
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "calc_used")
+            .unwrap();
         let expr = calc.args.iter().find(|a| a.key == "expr").unwrap();
         assert_eq!(expr.value, ArgValue::String("8".into()));
         // Dead node elimination: calc_dead removed

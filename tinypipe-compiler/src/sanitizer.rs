@@ -7,9 +7,9 @@
 //! This crate does not use `unsafe`. All AST operations are safe Rust via
 //! `rustpython-parser`.
 
-use rustpython_parser as parser;
 use parser::ast::{self, Ranged};
 use parser::source_code::{LineIndex, SourceLocation};
+use rustpython_parser as parser;
 
 /// A sanitization error with source location.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,16 +27,34 @@ impl std::fmt::Display for SanitizationError {
 
 /// Blocked built‑in function names (direct name-call).
 const BLOCKED_BUILTINS: &[&str] = &[
-    "eval", "exec", "__import__", "open", "compile", "globals", "locals",
-    "vars", "dir", "input", "exit", "quit", "breakpoint", "getattr",
-    "setattr", "delattr", "hasattr", "memoryview", "bytearray", "super",
-    "staticmethod", "classmethod", "property",
+    "eval",
+    "exec",
+    "__import__",
+    "open",
+    "compile",
+    "globals",
+    "locals",
+    "vars",
+    "dir",
+    "input",
+    "exit",
+    "quit",
+    "breakpoint",
+    "getattr",
+    "setattr",
+    "delattr",
+    "hasattr",
+    "memoryview",
+    "bytearray",
+    "super",
+    "staticmethod",
+    "classmethod",
+    "property",
 ];
 
 /// Blocked attribute method names (obj.<method>(...)).
 const BLOCKED_METHODS: &[&str] = &[
-    "system", "popen", "Popen", "fork", "execve", "execvp",
-    "execl", "spawn",
+    "system", "popen", "Popen", "fork", "execve", "execvp", "execl", "spawn",
 ];
 
 /// Run the full sanitization pipeline on a piece of Python code.
@@ -109,26 +127,56 @@ impl<'a> SanitizerEngine<'a> {
             // ❌ Blocked statements
             ast::Stmt::Import(s) => {
                 let names: Vec<&str> = s.names.iter().map(|a| a.name.as_str()).collect();
-                self.err(stmt, format_args!("import is forbidden (remove `import {}`)", names.join(", ")));
+                self.err(
+                    stmt,
+                    format_args!("import is forbidden (remove `import {}`)", names.join(", ")),
+                );
             }
             ast::Stmt::ImportFrom(s) => {
                 let module = s.module.as_ref().map(|m| m.as_str()).unwrap_or("");
-                self.err(stmt, format_args!("from‑import is forbidden (remove `from {} import ...`)", module));
+                self.err(
+                    stmt,
+                    format_args!(
+                        "from‑import is forbidden (remove `from {} import ...`)",
+                        module
+                    ),
+                );
             }
             ast::Stmt::ClassDef(s) => {
-                self.err(stmt, format_args!("class definition is forbidden (remove `class {}`)", s.name.as_str()));
+                self.err(
+                    stmt,
+                    format_args!(
+                        "class definition is forbidden (remove `class {}`)",
+                        s.name.as_str()
+                    ),
+                );
             }
             ast::Stmt::While(_) => {
-                self.err(stmt, format_args!("`while` is forbidden (use `for` with a bounded range)"));
+                self.err(
+                    stmt,
+                    format_args!("`while` is forbidden (use `for` with a bounded range)"),
+                );
             }
             ast::Stmt::Try(_) => {
-                self.err(stmt, format_args!("`try`/`except` is forbidden (use the graph's ERROR mechanism)"));
+                self.err(
+                    stmt,
+                    format_args!("`try`/`except` is forbidden (use the graph's ERROR mechanism)"),
+                );
             }
             ast::Stmt::TryStar(_) => {
-                self.err(stmt, format_args!("`try`/`except*` is forbidden (use the graph's ERROR mechanism)"));
+                self.err(
+                    stmt,
+                    format_args!("`try`/`except*` is forbidden (use the graph's ERROR mechanism)"),
+                );
             }
             ast::Stmt::AsyncFunctionDef(s) => {
-                self.err(stmt, format_args!("`async def` is forbidden (remove `async` from `{}`)", s.name.as_str()));
+                self.err(
+                    stmt,
+                    format_args!(
+                        "`async def` is forbidden (remove `async` from `{}`)",
+                        s.name.as_str()
+                    ),
+                );
             }
             ast::Stmt::AsyncFor(_) => {
                 self.err(stmt, format_args!("`async for` is forbidden"));
@@ -137,21 +185,42 @@ impl<'a> SanitizerEngine<'a> {
                 self.err(stmt, format_args!("`async with` is forbidden"));
             }
             ast::Stmt::Global(s) => {
-                self.err(stmt, format_args!("`global` is forbidden (remove `global {}`)",
-                    s.names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")));
+                self.err(
+                    stmt,
+                    format_args!(
+                        "`global` is forbidden (remove `global {}`)",
+                        s.names
+                            .iter()
+                            .map(|n| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
             }
             ast::Stmt::Nonlocal(s) => {
-                self.err(stmt, format_args!("`nonlocal` is forbidden (remove `nonlocal {}`)",
-                    s.names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")));
+                self.err(
+                    stmt,
+                    format_args!(
+                        "`nonlocal` is forbidden (remove `nonlocal {}`)",
+                        s.names
+                            .iter()
+                            .map(|n| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
             }
             ast::Stmt::Match(_) => {
                 // match is allowed — transforms to SWITCH opcode
             }
             ast::Stmt::With(s) => {
-                let is_parallel = s.items.len() == 1
-                    && is_name_call(&s.items[0].context_expr, "parallel");
+                let is_parallel =
+                    s.items.len() == 1 && is_name_call(&s.items[0].context_expr, "parallel");
                 if !is_parallel {
-                    self.err(stmt, format_args!("`with` is forbidden except for `with parallel() as p:`"));
+                    self.err(
+                        stmt,
+                        format_args!("`with` is forbidden except for `with parallel() as p:`"),
+                    );
                 } else {
                     self.parallel_depth += 1;
                     for child in &s.body {
@@ -171,10 +240,18 @@ impl<'a> SanitizerEngine<'a> {
             // ✅ Allowed statements
             ast::Stmt::FunctionDef(s) => {
                 if self.function_depth > 0 {
-                    self.err(stmt, format_args!("nested function definitions are forbidden"));
+                    self.err(
+                        stmt,
+                        format_args!("nested function definitions are forbidden"),
+                    );
                 } else if s.name.as_str() != "graph" {
-                    self.err(stmt, format_args!(
-                        "only one function named `graph` is allowed (found `{}`)", s.name.as_str()));
+                    self.err(
+                        stmt,
+                        format_args!(
+                            "only one function named `graph` is allowed (found `{}`)",
+                            s.name.as_str()
+                        ),
+                    );
                 }
                 if !s.decorator_list.is_empty() {
                     self.err(stmt, format_args!("decorators are forbidden"));
@@ -191,7 +268,10 @@ impl<'a> SanitizerEngine<'a> {
             }
             ast::Stmt::Return(_) => {
                 if self.function_depth == 0 {
-                    self.err(stmt, format_args!("`return` outside a function is forbidden"));
+                    self.err(
+                        stmt,
+                        format_args!("`return` outside a function is forbidden"),
+                    );
                 }
             }
             ast::Stmt::For(_) => {
@@ -241,34 +321,63 @@ impl<'a> SanitizerEngine<'a> {
     fn visit_expr(&mut self, expr: &ast::Expr) {
         match expr {
             ast::Expr::Lambda(_) => {
-                self.err(expr, format_args!("`lambda` is forbidden (use a named function or inline expression)"));
+                self.err(
+                    expr,
+                    format_args!(
+                        "`lambda` is forbidden (use a named function or inline expression)"
+                    ),
+                );
             }
             ast::Expr::NamedExpr(_) => {
                 self.err(expr, format_args!("walrus operator `:=` is forbidden"));
             }
             ast::Expr::Yield(_) => {
-                self.err(expr, format_args!("`yield` is forbidden (graph execution is synchronous)"));
+                self.err(
+                    expr,
+                    format_args!("`yield` is forbidden (graph execution is synchronous)"),
+                );
             }
             ast::Expr::YieldFrom(_) => {
-                self.err(expr, format_args!("`yield from` is forbidden (graph execution is synchronous)"));
+                self.err(
+                    expr,
+                    format_args!("`yield from` is forbidden (graph execution is synchronous)"),
+                );
             }
             ast::Expr::Await(_) => {
-                self.err(expr, format_args!("`await` is forbidden (use synchronous calls)"));
+                self.err(
+                    expr,
+                    format_args!("`await` is forbidden (use synchronous calls)"),
+                );
             }
             ast::Expr::GeneratorExp(_) => {
-                self.err(expr, format_args!("generator expression is forbidden (use a list + for loop)"));
+                self.err(
+                    expr,
+                    format_args!("generator expression is forbidden (use a list + for loop)"),
+                );
             }
             ast::Expr::ListComp(_) => {
-                self.err(expr, format_args!("list comprehension is forbidden (use a `for` loop)"));
+                self.err(
+                    expr,
+                    format_args!("list comprehension is forbidden (use a `for` loop)"),
+                );
             }
             ast::Expr::SetComp(_) => {
-                self.err(expr, format_args!("set comprehension is forbidden (use a `for` loop)"));
+                self.err(
+                    expr,
+                    format_args!("set comprehension is forbidden (use a `for` loop)"),
+                );
             }
             ast::Expr::DictComp(_) => {
-                self.err(expr, format_args!("dict comprehension is forbidden (use a `for` loop)"));
+                self.err(
+                    expr,
+                    format_args!("dict comprehension is forbidden (use a `for` loop)"),
+                );
             }
             ast::Expr::JoinedStr(_) => {
-                self.err(expr, format_args!("f‑string is forbidden (use string concatenation or `.format()`)"));
+                self.err(
+                    expr,
+                    format_args!("f‑string is forbidden (use string concatenation or `.format()`)"),
+                );
             }
             ast::Expr::FormattedValue(_) => {
                 self.err(expr, format_args!("f‑string value formatting is forbidden"));
@@ -335,20 +444,31 @@ impl<'a> SanitizerEngine<'a> {
         };
 
         if BLOCKED_BUILTINS.iter().any(|b| *b == name) {
-            self.err(call.func.as_ref(), format_args!("`{}()` is forbidden for security reasons", name));
+            self.err(
+                call.func.as_ref(),
+                format_args!("`{}()` is forbidden for security reasons", name),
+            );
             return;
         }
 
         if let Some(method) = attribute_method_name(call) {
             if BLOCKED_METHODS.iter().any(|b| *b == method) {
-                self.err(call.func.as_ref(), format_args!(
-                    "`.{}()` method call is forbidden for security reasons", method));
+                self.err(
+                    call.func.as_ref(),
+                    format_args!(
+                        "`.{}()` method call is forbidden for security reasons",
+                        method
+                    ),
+                );
                 return;
             }
         }
 
         if name.starts_with("__") && name.ends_with("__") {
-            self.err(call.func.as_ref(), format_args!("dunder method `{}()` is forbidden", name));
+            self.err(
+                call.func.as_ref(),
+                format_args!("dunder method `{}()` is forbidden", name),
+            );
             return;
         }
 
@@ -363,10 +483,13 @@ impl<'a> SanitizerEngine<'a> {
                 )
             });
             if !first_arg_is_str {
-                self.err(call.func.as_ref(), format_args!(
-                    "`{}()` first argument must be a string literal (e.g. `{}(\"...\", ...)`)",
-                    name, name
-                ));
+                self.err(
+                    call.func.as_ref(),
+                    format_args!(
+                        "`{}()` first argument must be a string literal (e.g. `{}(\"...\", ...)`)",
+                        name, name
+                    ),
+                );
             }
         }
     }
@@ -606,7 +729,10 @@ impl<'a> SanitizerEngine<'a> {
                     self.visit_stmt(child);
                 }
             }
-            ast::Stmt::Global(_) | ast::Stmt::Nonlocal(_) | ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => {}
+            ast::Stmt::Global(_)
+            | ast::Stmt::Nonlocal(_)
+            | ast::Stmt::Import(_)
+            | ast::Stmt::ImportFrom(_) => {}
             ast::Stmt::Match(s) => {
                 self.visit_expr(&s.subject);
                 for case in &s.cases {
@@ -619,7 +745,9 @@ impl<'a> SanitizerEngine<'a> {
                 }
             }
             ast::Stmt::Try(t) => {
-                for child in &t.body { self.visit_stmt(child); }
+                for child in &t.body {
+                    self.visit_stmt(child);
+                }
                 for handler in &t.handlers {
                     // ExceptHandler only has one variant
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
@@ -630,11 +758,17 @@ impl<'a> SanitizerEngine<'a> {
                         self.visit_stmt(child);
                     }
                 }
-                for child in &t.orelse { self.visit_stmt(child); }
-                for child in &t.finalbody { self.visit_stmt(child); }
+                for child in &t.orelse {
+                    self.visit_stmt(child);
+                }
+                for child in &t.finalbody {
+                    self.visit_stmt(child);
+                }
             }
             ast::Stmt::TryStar(t) => {
-                for child in &t.body { self.visit_stmt(child); }
+                for child in &t.body {
+                    self.visit_stmt(child);
+                }
                 for handler in &t.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
                     if let Some(t) = &h.type_ {
@@ -644,8 +778,12 @@ impl<'a> SanitizerEngine<'a> {
                         self.visit_stmt(child);
                     }
                 }
-                for child in &t.orelse { self.visit_stmt(child); }
-                for child in &t.finalbody { self.visit_stmt(child); }
+                for child in &t.orelse {
+                    self.visit_stmt(child);
+                }
+                for child in &t.finalbody {
+                    self.visit_stmt(child);
+                }
             }
             ast::Stmt::TypeAlias(s) => {
                 self.visit_expr(&s.name);
@@ -657,7 +795,9 @@ impl<'a> SanitizerEngine<'a> {
     fn walk_expr_children(&mut self, expr: &ast::Expr) {
         match expr {
             ast::Expr::BoolOp(e) => {
-                for v in &e.values { self.visit_expr(v); }
+                for v in &e.values {
+                    self.visit_expr(v);
+                }
             }
             ast::Expr::NamedExpr(e) => {
                 self.visit_expr(&e.target);
@@ -672,22 +812,38 @@ impl<'a> SanitizerEngine<'a> {
             }
             ast::Expr::Lambda(e) => {
                 for a in &e.args.posonlyargs {
-                    if let Some(ann) = &a.def.annotation { self.visit_expr(ann); }
-                    if let Some(d) = &a.default { self.visit_expr(d); }
+                    if let Some(ann) = &a.def.annotation {
+                        self.visit_expr(ann);
+                    }
+                    if let Some(d) = &a.default {
+                        self.visit_expr(d);
+                    }
                 }
                 for a in &e.args.args {
-                    if let Some(ann) = &a.def.annotation { self.visit_expr(ann); }
-                    if let Some(d) = &a.default { self.visit_expr(d); }
+                    if let Some(ann) = &a.def.annotation {
+                        self.visit_expr(ann);
+                    }
+                    if let Some(d) = &a.default {
+                        self.visit_expr(d);
+                    }
                 }
                 if let Some(v) = &e.args.vararg {
-                    if let Some(ann) = &v.annotation { self.visit_expr(ann); }
+                    if let Some(ann) = &v.annotation {
+                        self.visit_expr(ann);
+                    }
                 }
                 for a in &e.args.kwonlyargs {
-                    if let Some(ann) = &a.def.annotation { self.visit_expr(ann); }
-                    if let Some(d) = &a.default { self.visit_expr(d); }
+                    if let Some(ann) = &a.def.annotation {
+                        self.visit_expr(ann);
+                    }
+                    if let Some(d) = &a.default {
+                        self.visit_expr(d);
+                    }
                 }
                 if let Some(v) = &e.args.kwarg {
-                    if let Some(ann) = &v.annotation { self.visit_expr(ann); }
+                    if let Some(ann) = &v.annotation {
+                        self.visit_expr(ann);
+                    }
                 }
                 self.visit_expr(&e.body);
             }
@@ -698,19 +854,27 @@ impl<'a> SanitizerEngine<'a> {
             }
             ast::Expr::Dict(e) => {
                 for k in &e.keys {
-                    if let Some(key) = k { self.visit_expr(key); }
+                    if let Some(key) = k {
+                        self.visit_expr(key);
+                    }
                 }
-                for v in &e.values { self.visit_expr(v); }
+                for v in &e.values {
+                    self.visit_expr(v);
+                }
             }
             ast::Expr::Set(e) => {
-                for elt in &e.elts { self.visit_expr(elt); }
+                for elt in &e.elts {
+                    self.visit_expr(elt);
+                }
             }
             ast::Expr::ListComp(e) => {
                 self.visit_expr(&e.elt);
                 for gen in &e.generators {
                     self.visit_expr(&gen.iter);
                     self.visit_expr(&gen.target);
-                    for if_ in &gen.ifs { self.visit_expr(if_); }
+                    for if_ in &gen.ifs {
+                        self.visit_expr(if_);
+                    }
                 }
             }
             ast::Expr::SetComp(e) => {
@@ -718,7 +882,9 @@ impl<'a> SanitizerEngine<'a> {
                 for gen in &e.generators {
                     self.visit_expr(&gen.iter);
                     self.visit_expr(&gen.target);
-                    for if_ in &gen.ifs { self.visit_expr(if_); }
+                    for if_ in &gen.ifs {
+                        self.visit_expr(if_);
+                    }
                 }
             }
             ast::Expr::DictComp(e) => {
@@ -727,7 +893,9 @@ impl<'a> SanitizerEngine<'a> {
                 for gen in &e.generators {
                     self.visit_expr(&gen.iter);
                     self.visit_expr(&gen.target);
-                    for if_ in &gen.ifs { self.visit_expr(if_); }
+                    for if_ in &gen.ifs {
+                        self.visit_expr(if_);
+                    }
                 }
             }
             ast::Expr::GeneratorExp(e) => {
@@ -735,43 +903,79 @@ impl<'a> SanitizerEngine<'a> {
                 for gen in &e.generators {
                     self.visit_expr(&gen.iter);
                     self.visit_expr(&gen.target);
-                    for if_ in &gen.ifs { self.visit_expr(if_); }
+                    for if_ in &gen.ifs {
+                        self.visit_expr(if_);
+                    }
                 }
             }
-            ast::Expr::Await(e) => { self.visit_expr(&e.value); }
-            ast::Expr::Yield(e) => {
-                if let Some(v) = &e.value { self.visit_expr(v); }
+            ast::Expr::Await(e) => {
+                self.visit_expr(&e.value);
             }
-            ast::Expr::YieldFrom(e) => { self.visit_expr(&e.value); }
+            ast::Expr::Yield(e) => {
+                if let Some(v) = &e.value {
+                    self.visit_expr(v);
+                }
+            }
+            ast::Expr::YieldFrom(e) => {
+                self.visit_expr(&e.value);
+            }
             ast::Expr::Compare(e) => {
                 self.visit_expr(&e.left);
-                for c in &e.comparators { self.visit_expr(c); }
+                for c in &e.comparators {
+                    self.visit_expr(c);
+                }
             }
             ast::Expr::Call(e) => {
                 self.visit_expr(&e.func);
-                for arg in &e.args { self.visit_expr(arg); }
-                for kw in &e.keywords { self.visit_expr(&kw.value); }
+                for arg in &e.args {
+                    self.visit_expr(arg);
+                }
+                for kw in &e.keywords {
+                    self.visit_expr(&kw.value);
+                }
             }
             ast::Expr::FormattedValue(e) => {
                 self.visit_expr(&e.value);
-                if let Some(spec) = &e.format_spec { self.visit_expr(spec); }
+                if let Some(spec) = &e.format_spec {
+                    self.visit_expr(spec);
+                }
             }
             ast::Expr::JoinedStr(e) => {
-                for v in &e.values { self.visit_expr(v); }
+                for v in &e.values {
+                    self.visit_expr(v);
+                }
             }
             ast::Expr::Constant(_) | ast::Expr::Name(_) => {}
-            ast::Expr::Attribute(e) => { self.visit_expr(&e.value); }
+            ast::Expr::Attribute(e) => {
+                self.visit_expr(&e.value);
+            }
             ast::Expr::Subscript(e) => {
                 self.visit_expr(&e.value);
                 self.visit_expr(&e.slice);
             }
-            ast::Expr::Starred(e) => { self.visit_expr(&e.value); }
-            ast::Expr::List(e) => { for elt in &e.elts { self.visit_expr(elt); } }
-            ast::Expr::Tuple(e) => { for elt in &e.elts { self.visit_expr(elt); } }
+            ast::Expr::Starred(e) => {
+                self.visit_expr(&e.value);
+            }
+            ast::Expr::List(e) => {
+                for elt in &e.elts {
+                    self.visit_expr(elt);
+                }
+            }
+            ast::Expr::Tuple(e) => {
+                for elt in &e.elts {
+                    self.visit_expr(elt);
+                }
+            }
             ast::Expr::Slice(e) => {
-                if let Some(l) = &e.lower { self.visit_expr(l); }
-                if let Some(u) = &e.upper { self.visit_expr(u); }
-                if let Some(s) = &e.step { self.visit_expr(s); }
+                if let Some(l) = &e.lower {
+                    self.visit_expr(l);
+                }
+                if let Some(u) = &e.upper {
+                    self.visit_expr(u);
+                }
+                if let Some(s) = &e.step {
+                    self.visit_expr(s);
+                }
             }
         }
     }
@@ -846,12 +1050,17 @@ mod tests {
 
     #[test]
     fn allow_call_tool() {
-        assert!(sanitize("def graph(x: int):\n    result = call(\"my_tool\", arg=x)\n    return result").is_ok());
+        assert!(sanitize(
+            "def graph(x: int):\n    result = call(\"my_tool\", arg=x)\n    return result"
+        )
+        .is_ok());
     }
 
     #[test]
     fn allow_act() {
-        assert!(sanitize("def graph(x: int):\n    act(\"LOG\", msg=\"hello\")\n    return x").is_ok());
+        assert!(
+            sanitize("def graph(x: int):\n    act(\"LOG\", msg=\"hello\")\n    return x").is_ok()
+        );
     }
 
     #[test]
@@ -1032,26 +1241,41 @@ mod tests {
     #[test]
     fn block_list_comp() {
         let e = sanitize("[x * 2 for x in items]").unwrap_err();
-        assert!(e[0].message.contains("comprehension"), "got: {}", e[0].message);
+        assert!(
+            e[0].message.contains("comprehension"),
+            "got: {}",
+            e[0].message
+        );
     }
 
     #[test]
     fn block_set_comp() {
         let e = sanitize("{x * 2 for x in items}").unwrap_err();
-        assert!(e[0].message.contains("comprehension"), "got: {}", e[0].message);
+        assert!(
+            e[0].message.contains("comprehension"),
+            "got: {}",
+            e[0].message
+        );
     }
 
     #[test]
     fn block_dict_comp() {
         let e = sanitize("{k: v for k, v in items}").unwrap_err();
-        assert!(e[0].message.contains("comprehension"), "got: {}", e[0].message);
+        assert!(
+            e[0].message.contains("comprehension"),
+            "got: {}",
+            e[0].message
+        );
     }
 
     #[test]
     fn block_gen_exp() {
         let e = sanitize("(x for x in items)").unwrap_err();
-        assert!(e[0].message.contains("generator") || e[0].message.contains("comprehension"),
-            "got: {}", e[0].message);
+        assert!(
+            e[0].message.contains("generator") || e[0].message.contains("comprehension"),
+            "got: {}",
+            e[0].message
+        );
     }
 
     #[test]
@@ -1078,16 +1302,26 @@ mod tests {
         // f-strings produce JoinedStr, but the parser might parse as Plain string
         // if there's nothing to format. Use a real f-string with a variable.
         let e2 = sanitize("x = f'value {x}'").unwrap_err();
-        let _msg = if !e.is_empty() { &e[0].message } else { &e2[0].message };
-        assert!(e2[0].message.contains("f‑string") || e2[0].message.contains("f-string"),
-            "got: {}", e2[0].message);
+        let _msg = if !e.is_empty() {
+            &e[0].message
+        } else {
+            &e2[0].message
+        };
+        assert!(
+            e2[0].message.contains("f‑string") || e2[0].message.contains("f-string"),
+            "got: {}",
+            e2[0].message
+        );
     }
 
     #[test]
     fn block_walrus() {
         let e = sanitize("(x := 5)").unwrap_err();
-        assert!(e[0].message.contains("walrus") || e[0].message.contains(":="),
-            "got: {}", e[0].message);
+        assert!(
+            e[0].message.contains("walrus") || e[0].message.contains(":="),
+            "got: {}",
+            e[0].message
+        );
     }
 
     #[test]
@@ -1142,8 +1376,11 @@ mod tests {
     #[test]
     fn block_popen_method() {
         let e = sanitize("subprocess.Popen(['ls'])").unwrap_err();
-        assert!(e[0].message.contains("Popen") || e[0].message.contains("popen"),
-            "got: {}", e[0].message);
+        assert!(
+            e[0].message.contains("Popen") || e[0].message.contains("popen"),
+            "got: {}",
+            e[0].message
+        );
     }
 
     #[test]
@@ -1160,28 +1397,44 @@ mod tests {
     #[test]
     fn block_call_no_string() {
         let e = sanitize("def graph():\n    call(x, arg=1)\n    return 0").unwrap_err();
-        assert!(e.iter().any(|e| e.message.contains("first argument must be a string")),
-            "got: {:?}", e);
+        assert!(
+            e.iter()
+                .any(|e| e.message.contains("first argument must be a string")),
+            "got: {:?}",
+            e
+        );
     }
 
     #[test]
     fn block_act_no_string() {
         let e = sanitize("def graph():\n    act(x, msg=\"hello\")\n    return 0").unwrap_err();
-        assert!(e.iter().any(|e| e.message.contains("first argument must be a string")),
-            "got: {:?}", e);
+        assert!(
+            e.iter()
+                .any(|e| e.message.contains("first argument must be a string")),
+            "got: {:?}",
+            e
+        );
     }
 
     #[test]
     fn block_nested_function() {
         let e = sanitize("def graph():\n    def inner():\n        pass\n    return 0").unwrap_err();
-        assert!(e.iter().any(|e| e.message.contains("nested")), "got: {:?}", e);
+        assert!(
+            e.iter().any(|e| e.message.contains("nested")),
+            "got: {:?}",
+            e
+        );
     }
 
     #[test]
     fn block_wrong_function_name() {
         let e = sanitize("def main():\n    return 0").unwrap_err();
-        assert!(e.iter().any(|e| e.message.contains("function named `graph`")),
-            "got: {:?}", e);
+        assert!(
+            e.iter()
+                .any(|e| e.message.contains("function named `graph`")),
+            "got: {:?}",
+            e
+        );
     }
 
     #[test]
@@ -1230,7 +1483,11 @@ mod tests {
     fn block_decorator() {
         let code = "@some_decorator\ndef graph():\n    return 1";
         let e = sanitize(code).unwrap_err();
-        assert!(e.iter().any(|e| e.message.contains("decorator")), "got: {:?}", e);
+        assert!(
+            e.iter().any(|e| e.message.contains("decorator")),
+            "got: {:?}",
+            e
+        );
     }
 
     // ──────── Scope isolation ──────────────────────────────────────
@@ -1239,25 +1496,29 @@ mod tests {
     fn scope_isolation_simple_parallel() {
         assert!(sanitize(
             "def graph():\n    with parallel() as p:\n        p.act(\"print\", x=1)\n    return 0"
-        ).is_ok());
+        )
+        .is_ok());
     }
 
     #[test]
     fn scope_isolation_parallel_assign_local() {
         // Assignment inside parallel() to a variable NOT used outside is fine
-        assert!(sanitize(
-            "def graph():\n    with parallel() as p:\n        x = 1\n    return 0"
-        ).is_ok());
+        assert!(
+            sanitize("def graph():\n    with parallel() as p:\n        x = 1\n    return 0")
+                .is_ok()
+        );
     }
 
     #[test]
     fn scope_isolation_reject_shared_mutation() {
         // Assign inside parallel() to a variable that was assigned at top level → data race warning
-        let code = "def graph():\n    x = 0\n    with parallel() as p:\n        x = 1\n    return x";
+        let code =
+            "def graph():\n    x = 0\n    with parallel() as p:\n        x = 1\n    return x";
         let e = sanitize(code).unwrap_err();
         assert!(
             e.iter().any(|e| e.message.contains("data race")),
-            "expected data race warning, got: {:?}", e
+            "expected data race warning, got: {:?}",
+            e
         );
     }
 

@@ -7,14 +7,10 @@ use tinypipe_compiler::{backend, transform, validator};
 /// Helper: transform + validate + codegen a Python snippet, returning the codegen output.
 fn compile(code: &str) -> Result<backend::codegen::CodegenOutput, String> {
     // Transform (parse + sanitize + transform)
-    let plan = transform::transform(code).map_err(|e| {
-        format!("transform errors: {:?}", e)
-    })?;
+    let plan = transform::transform(code).map_err(|e| format!("transform errors: {:?}", e))?;
 
     // Validate
-    validator::validate(&plan).map_err(|e| {
-        format!("validation errors: {:?}", e)
-    })?;
+    validator::validate(&plan).map_err(|e| format!("validation errors: {:?}", e))?;
 
     // Codegen (v2: CompiledPlan + bincode binary)
     backend::codegen::codegen(plan).map_err(|e| e.message)
@@ -47,7 +43,8 @@ fn test_e2e_arithmetic_graph() {
 
 #[test]
 fn test_e2e_if_else_graph() {
-    let code = "def graph(x: int):\n    if x > 0:\n        y = 1\n    else:\n        y = 2\n    return y";
+    let code =
+        "def graph(x: int):\n    if x > 0:\n        y = 1\n    else:\n        y = 2\n    return y";
     let output = compile(code).expect("if-else graph should compile");
     assert!(output.execution_order.len() >= 5);
     // Check that compiled plan has correct node count
@@ -73,7 +70,11 @@ fn test_e2e_fb_binary_produced() {
     assert!(!output.fb_binary.is_empty(), "FB binary should be produced");
     // FB binary should be similar in size to bincode (both are compact binary formats)
     let ratio = output.fb_binary.len() as f64 / output.binary.len() as f64;
-    assert!(ratio < 3.0, "FB binary should not be >3x bincode size: {:.2}x", ratio);
+    assert!(
+        ratio < 3.0,
+        "FB binary should not be >3x bincode size: {:.2}x",
+        ratio
+    );
 }
 
 #[test]

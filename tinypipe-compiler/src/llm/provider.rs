@@ -4,8 +4,8 @@
 //! All providers cache the HTTP connection where possible and support
 //! configurable timeouts, retries, and model selection.
 
-use std::time::Duration;
 use super::{LlmBackend, LlmContext, LlmError};
+use std::time::Duration;
 
 // ─── Provider Enum ────────────────────────────────────────────────────
 
@@ -22,42 +22,31 @@ pub enum Provider {
         base_url: Option<String>,
     },
     /// Anthropic API (Claude Opus, Sonnet, Haiku)
-    Anthropic {
-        api_key: String,
-        model: String,
-    },
+    Anthropic { api_key: String, model: String },
     /// Local Ollama instance (Llama, Mistral, Codestral, etc.)
-    Ollama {
-        config: OllamaConfig,
-    },
+    Ollama { config: OllamaConfig },
     /// Mock backend for testing.
-    Mock {
-        responses: Vec<String>,
-    },
+    Mock { responses: Vec<String> },
 }
 
 impl Provider {
     /// Convert the provider enum into a boxed [`LlmBackend`].
     pub fn into_backend(self) -> Box<dyn LlmBackend> {
         match self {
-            Provider::OpenAI { api_key, model, base_url } => {
-                Box::new(OpenAIBackend {
-                    api_key,
-                    model,
-                    base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
-                })
-            }
-            Provider::Anthropic { api_key, model } => {
-                Box::new(AnthropicBackend { api_key, model })
-            }
-            Provider::Ollama { config } => {
-                Box::new(OllamaBackend { config })
-            }
-            Provider::Mock { responses } => {
-                Box::new(MockBackend::new_with_sequence(
-                    responses.into_iter().map(Ok).collect()
-                ))
-            }
+            Provider::OpenAI {
+                api_key,
+                model,
+                base_url,
+            } => Box::new(OpenAIBackend {
+                api_key,
+                model,
+                base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            }),
+            Provider::Anthropic { api_key, model } => Box::new(AnthropicBackend { api_key, model }),
+            Provider::Ollama { config } => Box::new(OllamaBackend { config }),
+            Provider::Mock { responses } => Box::new(MockBackend::new_with_sequence(
+                responses.into_iter().map(Ok).collect(),
+            )),
         }
     }
 }
@@ -102,7 +91,9 @@ pub struct OpenAIBackend {
 
 impl LlmBackend for OpenAIBackend {
     fn generate_code(&self, prompt: &str, context: &LlmContext) -> Result<String, LlmError> {
-        let system_prompt = context.system_prompt.as_deref()
+        let system_prompt = context
+            .system_prompt
+            .as_deref()
             .unwrap_or(super::DEFAULT_SYSTEM_PROMPT);
 
         let body = serde_json::json!({
@@ -130,7 +121,8 @@ impl LlmBackend for OpenAIBackend {
 
         let status = response.status();
         if status == 429 {
-            let retry_after = response.headers()
+            let retry_after = response
+                .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
@@ -166,7 +158,9 @@ pub struct AnthropicBackend {
 
 impl LlmBackend for AnthropicBackend {
     fn generate_code(&self, prompt: &str, context: &LlmContext) -> Result<String, LlmError> {
-        let system_prompt = context.system_prompt.as_deref()
+        let system_prompt = context
+            .system_prompt
+            .as_deref()
             .unwrap_or(super::DEFAULT_SYSTEM_PROMPT);
 
         let body = serde_json::json!({
@@ -224,7 +218,9 @@ pub struct OllamaBackend {
 
 impl LlmBackend for OllamaBackend {
     fn generate_code(&self, prompt: &str, context: &LlmContext) -> Result<String, LlmError> {
-        let system_prompt = context.system_prompt.as_deref()
+        let system_prompt = context
+            .system_prompt
+            .as_deref()
             .unwrap_or(super::DEFAULT_SYSTEM_PROMPT);
 
         let body = serde_json::json!({

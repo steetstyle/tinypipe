@@ -58,7 +58,9 @@ fn test_replay_basic_add() {
     let mut inputs = Context::new();
     inputs.set("x".into(), Value::Int(5));
 
-    let result = exec.execute(inputs).expect("replay basic_add should succeed");
+    let result = exec
+        .execute(inputs)
+        .expect("replay basic_add should succeed");
 
     // x + 1 = 6 (compiled uses i64)
     assert_eq!(result.output, Some(Value::Int(6)));
@@ -88,7 +90,8 @@ fn execute_reference(name: &str, inputs: Context) -> ExecutionResult {
     let compiled = compile_plan(plan);
     let reg = tinypipe_vm::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
-    exec.execute(inputs).expect(&format!("replay '{}' should succeed", name))
+    exec.execute(inputs)
+        .expect(&format!("replay '{}' should succeed", name))
 }
 
 #[test]
@@ -128,10 +131,12 @@ fn test_replay_decide_false_full_exec() {
 fn test_replay_all_pass_validation() {
     for name in &["basic_add", "decide_true"] {
         let plan = load_reference(name);
-        assert!(plan.topological_order().is_ok(),
-            "reference '{}' has a cycle", name);
-        assert!(!plan.nodes.is_empty(),
-            "reference '{}' has no nodes", name);
+        assert!(
+            plan.topological_order().is_ok(),
+            "reference '{}' has a cycle",
+            name
+        );
+        assert!(!plan.nodes.is_empty(), "reference '{}' has no nodes", name);
     }
 }
 

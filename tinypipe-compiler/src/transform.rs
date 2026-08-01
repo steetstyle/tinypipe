@@ -5,13 +5,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustpython_parser as parser;
 use parser::ast::{self, Ranged};
 use parser::source_code::{LineIndex, SourceLocation};
+use rustpython_parser as parser;
 
-use tinypipe_ir::plan::{
-    Arg, ArgValue, Edge, ExecutionPlan, Node as PlanNode, Opcode,
-};
+use tinypipe_ir::plan::{Arg, ArgValue, Edge, ExecutionPlan, Node as PlanNode, Opcode};
 
 /// Errors produced during the transform phase.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,21 +29,33 @@ impl std::fmt::Display for TransformError {
 pub fn transform(code: &str) -> Result<ExecutionPlan, Vec<TransformError>> {
     // 1. Sanitize
     if let Err(errors) = crate::sanitizer::sanitize(code) {
-        return Err(errors.into_iter().map(|e| TransformError {
-            line: e.line, column: e.column, message: e.message,
-        }).collect());
+        return Err(errors
+            .into_iter()
+            .map(|e| TransformError {
+                line: e.line,
+                column: e.column,
+                message: e.message,
+            })
+            .collect());
     }
 
     // 2. Parse
     let module = match parser::parse(code, parser::Mode::Module, "<embedded>") {
         Ok(ast::Mod::Module(m)) => m,
-        Ok(_) => return Err(vec![TransformError {
-            line: 0, column: 0, message: "expected a module".into(),
-        }]),
-        Err(e) => return Err(vec![TransformError {
-            line: 0, column: 0,
-            message: format!("parse error: {}", e.error),
-        }]),
+        Ok(_) => {
+            return Err(vec![TransformError {
+                line: 0,
+                column: 0,
+                message: "expected a module".into(),
+            }])
+        }
+        Err(e) => {
+            return Err(vec![TransformError {
+                line: 0,
+                column: 0,
+                message: format!("parse error: {}", e.error),
+            }])
+        }
     };
 
     // 3. Transform
@@ -172,7 +182,8 @@ impl<'a> TransformEngine<'a> {
             Some(f) => f,
             None => {
                 self.errors.push(TransformError {
-                    line: 0, column: 0,
+                    line: 0,
+                    column: 0,
                     message: "no `graph()` function found".into(),
                 });
                 return Err(std::mem::take(&mut self.errors));
@@ -268,7 +279,10 @@ impl<'a> TransformEngine<'a> {
                 let target_name = match s.target.as_ref() {
                     ast::Expr::Name(n) => n.id.as_str().to_owned(),
                     _ => {
-                        self.error(s.target.as_ref(), "only simple variable names as annotation targets");
+                        self.error(
+                            s.target.as_ref(),
+                            "only simple variable names as annotation targets",
+                        );
                         return Ok((self.gen_id(), self.gen_id()));
                     }
                 };
@@ -279,7 +293,10 @@ impl<'a> TransformEngine<'a> {
                     Ok((val_id.clone(), val_id))
                 } else {
                     // Annotation without value: create an Input node
-                    let id = self.push_node(Opcode::Input, vec![("name", ArgValue::String(target_name.clone()))]);
+                    let id = self.push_node(
+                        Opcode::Input,
+                        vec![("name", ArgValue::String(target_name.clone()))],
+                    );
                     self.var_map.insert(target_name, id.clone());
                     Ok((id.clone(), id))
                 }
@@ -289,23 +306,35 @@ impl<'a> TransformEngine<'a> {
                 let target_name = match s.target.as_ref() {
                     ast::Expr::Name(n) => n.id.as_str().to_owned(),
                     _ => {
-                        self.error(s.target.as_ref(), "only simple variable names for augmented assignment");
+                        self.error(
+                            s.target.as_ref(),
+                            "only simple variable names for augmented assignment",
+                        );
                         return Ok((self.gen_id(), self.gen_id()));
                     }
                 };
 
                 let op_str = aug_op_to_str(&s.op);
-                let target_id = self.resolve_var(&target_name, self.resolve_location(s.target.start()));
+                let target_id =
+                    self.resolve_var(&target_name, self.resolve_location(s.target.start()));
 
                 // Read the RHS
                 let rhs_id = self.transform_expr_to_node(&s.value)?;
 
                 // Create a CALC node: `target op value`
-                let expr_str = format!("{} {} {}", target_name, op_str, format_expr(&s.value, self.code));
-                let calc_id = self.push_node(Opcode::Calc, vec![
-                    ("expr", ArgValue::String(expr_str)),
-                    ("output", ArgValue::String(target_name.clone())),
-                ]);
+                let expr_str = format!(
+                    "{} {} {}",
+                    target_name,
+                    op_str,
+                    format_expr(&s.value, self.code)
+                );
+                let calc_id = self.push_node(
+                    Opcode::Calc,
+                    vec![
+                        ("expr", ArgValue::String(expr_str)),
+                        ("output", ArgValue::String(target_name.clone())),
+                    ],
+                );
                 self.push_edge(&target_id, &calc_id);
                 self.push_edge(&rhs_id, &calc_id);
 
@@ -324,9 +353,7 @@ impl<'a> TransformEngine<'a> {
                 let output_id = if let Some(v) = &s.value {
                     let val_id = self.transform_expr_to_node(v)?;
                     // Create an Act node to represent the output
-                    let id = self.push_node(Opcode::Act, vec![
-                        ("type", "return".into()),
-                    ]);
+                    let id = self.push_node(Opcode::Act, vec![("type", "return".into())]);
                     self.push_edge(&val_id, &id);
                     id
                 } else {
@@ -357,10 +384,13 @@ impl<'a> TransformEngine<'a> {
 
                 // Infer max iterations from the iter expression
                 let max_iter = infer_range_max(&s.iter);
-                let loop_id = self.push_node(Opcode::Loop, vec![
-                    ("target", ArgValue::String(target_name.clone())),
-                    ("max_iterations", max_iter.into()),
-                ]);
+                let loop_id = self.push_node(
+                    Opcode::Loop,
+                    vec![
+                        ("target", ArgValue::String(target_name.clone())),
+                        ("max_iterations", max_iter.into()),
+                    ],
+                );
                 self.push_edge(&iter_id, &loop_id);
 
                 // Register loop variable in var_map BEFORE body transform,
@@ -441,9 +471,13 @@ impl<'a> TransformEngine<'a> {
             ast::Stmt::Assert(s) => {
                 // Assert → DECIDE node; if test is false, go to ERROR
                 let test_id = self.transform_expr_to_node(&s.test)?;
-                let decide_id = self.push_node(Opcode::Decide, vec![
-                    ("condition", ArgValue::String(format!("not ({})", format_expr(&s.test, self.code)))),
-                ]);
+                let decide_id = self.push_node(
+                    Opcode::Decide,
+                    vec![(
+                        "condition",
+                        ArgValue::String(format!("not ({})", format_expr(&s.test, self.code))),
+                    )],
+                );
                 self.push_edge(&test_id, &decide_id);
                 Ok((decide_id.clone(), decide_id))
             }
@@ -459,19 +493,20 @@ impl<'a> TransformEngine<'a> {
 
     // ── Match / case transform ─────────────────────────────────
 
-    fn transform_match(
-        &mut self,
-        s: &ast::StmtMatch,
-    ) -> Result<String, Vec<TransformError>> {
+    fn transform_match(&mut self, s: &ast::StmtMatch) -> Result<String, Vec<TransformError>> {
         // NOTE: This returns just a String (the switch_id), not (first, last).
         // It's called from transform_stmt which wraps the result as (id, id).
         // Transform the subject expression → node that provides the value
         let subject_id = self.transform_expr_to_node(&s.subject)?;
 
         // Create a SWITCH node
-        let switch_id = self.push_node(Opcode::Switch, vec![
-            ("source", ArgValue::String(format_expr(&s.subject, self.code))),
-        ]);
+        let switch_id = self.push_node(
+            Opcode::Switch,
+            vec![(
+                "source",
+                ArgValue::String(format_expr(&s.subject, self.code)),
+            )],
+        );
         self.push_edge(&subject_id, &switch_id);
 
         // Track whether we've seen a wildcard / default case
@@ -496,17 +531,23 @@ impl<'a> TransformEngine<'a> {
                     // e.g. `case x:` → captures into x (treated as default)
                     if has_default {
                         // A second default-like case is ambiguous; still emit but warn
-                        self.error(s, "multiple default cases in match — only first is reachable");
+                        self.error(
+                            s,
+                            "multiple default cases in match — only first is reachable",
+                        );
                     }
                     has_default = true;
                     None // unconditional edge (will be handled as default in executor)
                 }
                 _ => {
                     // Unsupported pattern type (MatchSequence, MatchMapping, MatchClass, etc.)
-                    self.error(s, &format!(
-                        "unsupported pattern type in match case: {:?}",
-                        std::mem::discriminant(&case.pattern)
-                    ));
+                    self.error(
+                        s,
+                        &format!(
+                            "unsupported pattern type in match case: {:?}",
+                            std::mem::discriminant(&case.pattern)
+                        ),
+                    );
                     continue;
                 }
             };
@@ -539,17 +580,18 @@ impl<'a> TransformEngine<'a> {
         self.terminal_nodes.contains(node_id)
     }
 
-    fn transform_if(
-        &mut self,
-        s: &ast::StmtIf,
-    ) -> Result<(String, String), Vec<TransformError>> {
+    fn transform_if(&mut self, s: &ast::StmtIf) -> Result<(String, String), Vec<TransformError>> {
         // Condition
         let cond_id = self.transform_expr_to_node(&s.test)?;
 
         // DECIDE node
-        let decide_id = self.push_node(Opcode::Decide, vec![
-            ("condition", ArgValue::String(format_expr(&s.test, self.code))),
-        ]);
+        let decide_id = self.push_node(
+            Opcode::Decide,
+            vec![(
+                "condition",
+                ArgValue::String(format_expr(&s.test, self.code)),
+            )],
+        );
         self.push_edge(&cond_id, &decide_id);
 
         // Transform body (true branch)
@@ -564,7 +606,9 @@ impl<'a> TransformEngine<'a> {
             body_last = Some(last_id);
         }
         // Variables assigned in the true branch
-        let true_vars: Vec<String> = self.var_map.keys()
+        let true_vars: Vec<String> = self
+            .var_map
+            .keys()
             .filter(|k| !var_map_before_true.contains_key(k.as_str()))
             .cloned()
             .collect();
@@ -584,7 +628,9 @@ impl<'a> TransformEngine<'a> {
             orelse_last = Some(last_id);
         }
         // Variables assigned in the false branch
-        let false_vars: Vec<String> = self.var_map.keys()
+        let false_vars: Vec<String> = self
+            .var_map
+            .keys()
             .filter(|k| !var_map_before_false.contains_key(k.as_str()))
             .cloned()
             .collect();
@@ -593,8 +639,12 @@ impl<'a> TransformEngine<'a> {
         }
 
         // Determine if each branch is terminal (ends with return/error)
-        let body_is_terminal = body_last.as_ref().map_or(false, |id| self.is_return_node(id));
-        let orelse_is_terminal = orelse_last.as_ref().map_or(false, |id| self.is_return_node(id));
+        let body_is_terminal = body_last
+            .as_ref()
+            .map_or(false, |id| self.is_return_node(id));
+        let orelse_is_terminal = orelse_last
+            .as_ref()
+            .map_or(false, |id| self.is_return_node(id));
 
         // If ALL branches exist and ALL are terminal, no MERGE needed.
         // Note: an empty orelse branch (no else clause) does NOT make the if "fully terminal"
@@ -632,7 +682,8 @@ impl<'a> TransformEngine<'a> {
 
         // Update var_map: variables that were assigned in a non-terminal branch
         // now point to the MERGE node
-        let branch_vars: Vec<String> = true_vars.into_iter()
+        let branch_vars: Vec<String> = true_vars
+            .into_iter()
             .chain(false_vars)
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
@@ -708,9 +759,8 @@ impl<'a> TransformEngine<'a> {
                     } else {
                         5 // default 5 seconds
                     };
-                    let wait_id = self.push_node(Opcode::Wait, vec![
-                        ("duration_secs", ArgValue::Int(secs)),
-                    ]);
+                    let wait_id =
+                        self.push_node(Opcode::Wait, vec![("duration_secs", ArgValue::Int(secs))]);
                     // Wire dependencies for variable references in args
                     for arg in &c.args {
                         let arg_id = self.transform_expr_to_node(arg)?;
@@ -728,7 +778,8 @@ impl<'a> TransformEngine<'a> {
                     }
                     let args_joined = args_str.join(", ");
                     let expr_str = format!("{}({})", name, args_joined);
-                    let calc_id = self.push_node(Opcode::Calc, vec![("expr", ArgValue::String(expr_str))]);
+                    let calc_id =
+                        self.push_node(Opcode::Calc, vec![("expr", ArgValue::String(expr_str))]);
                     // Wire dependencies (using saved arg_ids to avoid double-evaluation)
                     for arg_id in &arg_ids {
                         self.push_edge(arg_id, &calc_id);
@@ -737,7 +788,8 @@ impl<'a> TransformEngine<'a> {
                 } else {
                     // Unknown function → CALC node
                     let expr_str = format_expr(expr, self.code);
-                    let calc_id = self.push_node(Opcode::Calc, vec![("expr", ArgValue::String(expr_str))]);
+                    let calc_id =
+                        self.push_node(Opcode::Calc, vec![("expr", ArgValue::String(expr_str))]);
                     // Evaluate sub-expressions
                     for arg in &c.args {
                         let arg_id = self.transform_expr_to_node(arg)?;
@@ -754,7 +806,8 @@ impl<'a> TransformEngine<'a> {
             // ── Simple expressions → CALC node ─────────────────
             _ => {
                 let expr_str = format_expr(expr, self.code);
-                let calc_id = self.push_node(Opcode::Calc, vec![("expr", ArgValue::String(expr_str))]);
+                let calc_id =
+                    self.push_node(Opcode::Calc, vec![("expr", ArgValue::String(expr_str))]);
 
                 // Find variable references and wire dependencies
                 self.wire_expr_dependencies(expr, &calc_id);
@@ -878,11 +931,30 @@ fn is_name_call(expr: &ast::Expr, name: &str) -> bool {
 fn is_allowed_builtin(name: &str) -> bool {
     matches!(
         name,
-        "len" | "range" | "int" | "str" | "float" | "bool"
-            | "list" | "dict" | "tuple" | "set" | "min" | "max"
-            | "sum" | "abs" | "round" | "print" | "isinstance"
-            | "type" | "reversed" | "enumerate" | "zip" | "sorted"
-            | "any" | "all"
+        "len"
+            | "range"
+            | "int"
+            | "str"
+            | "float"
+            | "bool"
+            | "list"
+            | "dict"
+            | "tuple"
+            | "set"
+            | "min"
+            | "max"
+            | "sum"
+            | "abs"
+            | "round"
+            | "print"
+            | "isinstance"
+            | "type"
+            | "reversed"
+            | "enumerate"
+            | "zip"
+            | "sorted"
+            | "any"
+            | "all"
     )
 }
 
@@ -912,11 +984,17 @@ fn format_expr(expr: &ast::Expr, _code: &str) -> String {
         ast::Expr::Constant(c) => format_constant(&c.value),
         ast::Expr::Name(n) => n.id.as_str().to_owned(),
         ast::Expr::Attribute(a) => format!("{}.{}", format_expr(&a.value, _code), a.attr.as_str()),
-        ast::Expr::Subscript(s) => format!("{}[{}]", format_expr(&s.value, _code), format_expr(&s.slice, _code)),
+        ast::Expr::Subscript(s) => format!(
+            "{}[{}]",
+            format_expr(&s.value, _code),
+            format_expr(&s.slice, _code)
+        ),
         ast::Expr::Call(c) => {
             let name = callee_name_str(c).unwrap_or_else(|| "?".into());
             let args: Vec<String> = c.args.iter().map(|a| format_expr(a, _code)).collect();
-            let kwargs: Vec<String> = c.keywords.iter()
+            let kwargs: Vec<String> = c
+                .keywords
+                .iter()
                 .map(|kw| {
                     let k = kw.arg.as_ref().map(|i| i.as_str()).unwrap_or("");
                     format!("{}={}", k, format_expr(&kw.value, _code))
@@ -941,7 +1019,12 @@ fn format_expr(expr: &ast::Expr, _code: &str) -> String {
                 ast::Operator::FloorDiv => "//",
                 ast::Operator::MatMult => "@",
             };
-            format!("{} {} {}", format_expr(&e.left, _code), op_str, format_expr(&e.right, _code))
+            format!(
+                "{} {} {}",
+                format_expr(&e.left, _code),
+                op_str,
+                format_expr(&e.right, _code)
+            )
         }
         ast::Expr::UnaryOp(e) => {
             let op_str = match &e.op {
@@ -1001,9 +1084,15 @@ fn format_expr(expr: &ast::Expr, _code: &str) -> String {
             }
         }
         ast::Expr::Dict(e) => {
-            let pairs: Vec<String> = e.keys.iter().zip(e.values.iter())
+            let pairs: Vec<String> = e
+                .keys
+                .iter()
+                .zip(e.values.iter())
                 .map(|(k, v)| {
-                    let ks = k.as_ref().map(|k| format_expr(k, _code)).unwrap_or_else(|| "".into());
+                    let ks = k
+                        .as_ref()
+                        .map(|k| format_expr(k, _code))
+                        .unwrap_or_else(|| "".into());
                     format!("{}: {}", ks, format_expr(v, _code))
                 })
                 .collect();
@@ -1014,9 +1103,21 @@ fn format_expr(expr: &ast::Expr, _code: &str) -> String {
             format!("{{{}}}", elts.join(", "))
         }
         ast::Expr::Slice(e) => {
-            let lower = e.lower.as_ref().map(|l| format_expr(l, _code)).unwrap_or_else(|| "".into());
-            let upper = e.upper.as_ref().map(|u| format_expr(u, _code)).unwrap_or_else(|| "".into());
-            let step = e.step.as_ref().map(|s| format!(":{}", format_expr(s, _code))).unwrap_or_else(|| "".into());
+            let lower = e
+                .lower
+                .as_ref()
+                .map(|l| format_expr(l, _code))
+                .unwrap_or_else(|| "".into());
+            let upper = e
+                .upper
+                .as_ref()
+                .map(|u| format_expr(u, _code))
+                .unwrap_or_else(|| "".into());
+            let step = e
+                .step
+                .as_ref()
+                .map(|s| format!(":{}", format_expr(s, _code)))
+                .unwrap_or_else(|| "".into());
             format!("{}:{}{}", lower, upper, step)
         }
         ast::Expr::JoinedStr(e) => {
@@ -1024,19 +1125,29 @@ fn format_expr(expr: &ast::Expr, _code: &str) -> String {
             parts.concat()
         }
         ast::Expr::FormattedValue(e) => format_expr(&e.value, _code),
-        ast::Expr::NamedExpr(e) => format!("{} := {}", format_expr(&e.target, _code), format_expr(&e.value, _code)),
+        ast::Expr::NamedExpr(e) => format!(
+            "{} := {}",
+            format_expr(&e.target, _code),
+            format_expr(&e.value, _code)
+        ),
         ast::Expr::Starred(e) => format!("*{}", format_expr(&e.value, _code)),
         // Blocked by sanitizer but handle gracefully
-        ast::Expr::Lambda(_e) => {
-            "<lambda>".into()
-        }
+        ast::Expr::Lambda(_e) => "<lambda>".into(),
         ast::Expr::ListComp(e) => format!("[{} for ...]", format_expr(&e.elt, _code)),
         ast::Expr::SetComp(e) => format!("{{{ } for ...}}", format_expr(&e.elt, _code)),
-        ast::Expr::DictComp(e) => format!("{{{}: {} for ...}}", format_expr(&e.key, _code), format_expr(&e.value, _code)),
+        ast::Expr::DictComp(e) => format!(
+            "{{{}: {} for ...}}",
+            format_expr(&e.key, _code),
+            format_expr(&e.value, _code)
+        ),
         ast::Expr::GeneratorExp(e) => format!("({} for ...)", format_expr(&e.elt, _code)),
         ast::Expr::Await(e) => format!("await {}", format_expr(&e.value, _code)),
         ast::Expr::Yield(e) => {
-            if let Some(v) = &e.value { format!("yield {}", format_expr(v, _code)) } else { "yield".into() }
+            if let Some(v) = &e.value {
+                format!("yield {}", format_expr(v, _code))
+            } else {
+                "yield".into()
+            }
         }
         ast::Expr::YieldFrom(e) => format!("yield from {}", format_expr(&e.value, _code)),
     }
@@ -1066,12 +1177,8 @@ fn expr_to_arg_value(expr: &ast::Expr) -> ArgValue {
     match expr {
         ast::Expr::Constant(c) => const_to_arg_value(&c.value),
         ast::Expr::Name(n) => ArgValue::String(n.id.as_str().to_owned()),
-        ast::Expr::List(l) => {
-            ArgValue::Array(l.elts.iter().map(expr_to_arg_value).collect())
-        }
-        ast::Expr::Tuple(t) => {
-            ArgValue::Array(t.elts.iter().map(expr_to_arg_value).collect())
-        }
+        ast::Expr::List(l) => ArgValue::Array(l.elts.iter().map(expr_to_arg_value).collect()),
+        ast::Expr::Tuple(t) => ArgValue::Array(t.elts.iter().map(expr_to_arg_value).collect()),
         _ => ArgValue::String(format_expr(expr, "")),
     }
 }
@@ -1091,9 +1198,7 @@ fn const_to_arg_value(c: &ast::Constant) -> ArgValue {
             ArgValue::Array(items.iter().map(const_to_arg_value).collect())
         }
         ast::Constant::Bytes(b) => ArgValue::String(format!("b\"{}\"", String::from_utf8_lossy(b))),
-        ast::Constant::Complex { real, imag } => {
-            ArgValue::String(format!("{}+{}j", real, imag))
-        }
+        ast::Constant::Complex { real, imag } => ArgValue::String(format!("{}+{}j", real, imag)),
         ast::Constant::Ellipsis => ArgValue::String("...".into()),
     }
 }
@@ -1107,7 +1212,11 @@ fn infer_range_max(expr: &ast::Expr) -> i64 {
             match c.args.len() {
                 1 => {
                     // range(stop) — try to extract constant
-                    if let ast::Expr::Constant(ast::ExprConstant { value: ast::Constant::Int(i), .. }) = &c.args[0] {
+                    if let ast::Expr::Constant(ast::ExprConstant {
+                        value: ast::Constant::Int(i),
+                        ..
+                    }) = &c.args[0]
+                    {
                         i.to_string().parse().unwrap_or(100)
                     } else {
                         100 // default max
@@ -1131,10 +1240,23 @@ mod tests {
     // Helper: create a basic plan and check it has expected structure
     fn check_plan(code: &str, expected_nodes: usize, expected_edges: usize) -> ExecutionPlan {
         let plan = transform(code).expect("transform should succeed");
-        assert_eq!(plan.nodes.len(), expected_nodes,
-            "expected {expected_nodes} nodes, got {}: {:?}", plan.nodes.len(), plan.nodes.iter().map(|n| &n.id[..]).collect::<Vec<_>>());
-        assert_eq!(plan.edges.len(), expected_edges,
-            "expected {expected_edges} edges, got {}: {:?}", plan.edges.len(), plan.edges.iter().map(|e| format!("{}→{}", e.from, e.to)).collect::<Vec<_>>());
+        assert_eq!(
+            plan.nodes.len(),
+            expected_nodes,
+            "expected {expected_nodes} nodes, got {}: {:?}",
+            plan.nodes.len(),
+            plan.nodes.iter().map(|n| &n.id[..]).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan.edges.len(),
+            expected_edges,
+            "expected {expected_edges} edges, got {}: {:?}",
+            plan.edges.len(),
+            plan.edges
+                .iter()
+                .map(|e| format!("{}→{}", e.from, e.to))
+                .collect::<Vec<_>>()
+        );
         // Verify topological order succeeds
         assert!(plan.topological_order().is_ok(), "plan has a cycle");
         plan
@@ -1187,10 +1309,14 @@ mod tests {
         let code = "def graph(x: int):\n    if x > 0:\n        y = 1\n    else:\n        y = 2\n    return y";
         let plan = transform(code).expect("should succeed");
         // Expect: Input(x), DECIDE, CALC(1), CALC(2), ACT(return)
-        assert!(plan.nodes.iter().any(|n| n.op == Opcode::Decide),
-            "should have DECIDE node");
-        assert!(plan.edges.iter().any(|e| e.condition.is_some()),
-            "should have conditional edges");
+        assert!(
+            plan.nodes.iter().any(|n| n.op == Opcode::Decide),
+            "should have DECIDE node"
+        );
+        assert!(
+            plan.edges.iter().any(|e| e.condition.is_some()),
+            "should have conditional edges"
+        );
         assert!(plan.topological_order().is_ok());
     }
 
@@ -1208,8 +1334,10 @@ mod tests {
     fn transform_for_loop() {
         let code = "def graph(items: list):\n    total = 0\n    for i in range(len(items)):\n        total = total + i\n    return total";
         let plan = transform(code).expect("should succeed");
-        assert!(plan.nodes.iter().any(|n| n.op == Opcode::Loop),
-            "should have LOOP node");
+        assert!(
+            plan.nodes.iter().any(|n| n.op == Opcode::Loop),
+            "should have LOOP node"
+        );
         assert!(plan.topological_order().is_ok());
     }
 
@@ -1223,8 +1351,10 @@ mod tests {
         y = call("tool2")
     return x"#;
         let plan = transform(code).expect("should succeed");
-        assert!(plan.nodes.iter().any(|n| n.op == Opcode::Parallel),
-            "should have PARALLEL node");
+        assert!(
+            plan.nodes.iter().any(|n| n.op == Opcode::Parallel),
+            "should have PARALLEL node"
+        );
         assert!(plan.topological_order().is_ok());
     }
 
@@ -1294,25 +1424,33 @@ mod tests {
     #[test]
     fn transform_if_both_branches_return() {
         // Both branches return — no MERGE node needed
-        let code = "def graph(x: int):\n    if x > 0:\n        return 1\n    else:\n        return 2";
+        let code =
+            "def graph(x: int):\n    if x > 0:\n        return 1\n    else:\n        return 2";
         let plan = transform(code).expect("should succeed");
         // Should have: Input(x), DECIDE, CALC(1), ACT(return,1), CALC(2), ACT(return,2)
         // No MERGE node since both branches terminate
-        assert!(!plan.nodes.iter().any(|n| n.op == Opcode::Merge),
-            "should NOT have MERGE node when both branches return");
-        assert!(plan.nodes.iter().any(|n| n.op == Opcode::Decide),
-            "should have DECIDE node");
+        assert!(
+            !plan.nodes.iter().any(|n| n.op == Opcode::Merge),
+            "should NOT have MERGE node when both branches return"
+        );
+        assert!(
+            plan.nodes.iter().any(|n| n.op == Opcode::Decide),
+            "should have DECIDE node"
+        );
         assert!(plan.topological_order().is_ok());
     }
 
     #[test]
     fn transform_if_one_branch_returns() {
         // One branch returns, the other continues — MERGE should only connect to non-terminal branch
-        let code = "def graph(x: int):\n    if x > 0:\n        return 1\n    y = x + 1\n    return y";
+        let code =
+            "def graph(x: int):\n    if x > 0:\n        return 1\n    y = x + 1\n    return y";
         let plan = transform(code).expect("should succeed");
         // Should have MERGE node (the false branch falls through to continue)
-        assert!(plan.nodes.iter().any(|n| n.op == Opcode::Merge),
-            "should have MERGE node");
+        assert!(
+            plan.nodes.iter().any(|n| n.op == Opcode::Merge),
+            "should have MERGE node"
+        );
         assert!(plan.topological_order().is_ok());
     }
 
@@ -1321,7 +1459,8 @@ mod tests {
         // Code after an if with early return should NOT execute on the return path.
         // The Control edge from MERGE (fall-through) to the next statement ensures
         // that subsequent code only runs when the false branch is taken.
-        let code = "def graph(x: int):\n    if x > 0:\n        return 1\n    y = x + 1\n    return y";
+        let code =
+            "def graph(x: int):\n    if x > 0:\n        return 1\n    y = x + 1\n    return y";
         let plan = transform(code).expect("should succeed");
         // Should have: Input(x), DECIDE, CALC(1), ACT(return1), CALC(x+1), ACT(return y)
         // And a MERGE with fall-through edge from DECIDE(false)
@@ -1336,8 +1475,15 @@ mod tests {
 
         // There should be a Control edge from the MERGE node to CALC(x+1)
         // indicating that the fall-through path must reach MERGE before y=x+1 executes
-        let calc_node_ids: Vec<&str> = plan.nodes.iter()
-            .filter(|n| n.op == Opcode::Calc && n.args.iter().any(|a| a.value == ArgValue::String("x + 1".into())))
+        let calc_node_ids: Vec<&str> = plan
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.op == Opcode::Calc
+                    && n.args
+                        .iter()
+                        .any(|a| a.value == ArgValue::String("x + 1".into()))
+            })
             .map(|n| n.id.as_str())
             .collect();
         assert_eq!(calc_node_ids.len(), 1, "should have CALC(x+1) node");
@@ -1353,8 +1499,15 @@ mod tests {
         let code = "def graph(x: int):\n    if x > 0:\n        return 1\n    return x";
         let plan = transform(code).expect("should succeed");
         // The early return ACT node should exist
-        let return_nodes: Vec<_> = plan.nodes.iter()
-            .filter(|n| n.op == Opcode::Act && n.args.iter().any(|a| a.value == ArgValue::String("return".into())))
+        let return_nodes: Vec<_> = plan
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.op == Opcode::Act
+                    && n.args
+                        .iter()
+                        .any(|a| a.value == ArgValue::String("return".into()))
+            })
             .collect();
         assert_eq!(return_nodes.len(), 2, "should have 2 return nodes");
         assert!(plan.topological_order().is_ok());
@@ -1377,6 +1530,10 @@ mod tests {
         assert!(plan.topological_order().is_ok());
         // Should have: Inputs for a,b,c(?), CALC(1), CALC(2), CALC(a+b), ACT(return)
         // At minimum 4 nodes: n0=CALC(1), n1=CALC(2), n2=CALC(a+b), n3=ACT(return)
-        assert!(plan.nodes.len() >= 4, "expected >=4 nodes, got {}", plan.nodes.len());
+        assert!(
+            plan.nodes.len() >= 4,
+            "expected >=4 nodes, got {}",
+            plan.nodes.len()
+        );
     }
 }

@@ -98,23 +98,32 @@ pub fn codegen_with_schema_hashes(
         .collect();
 
     // Extract subgraph dependencies from CALL targets
-    plan.metadata.subgraph_dependencies = plan.nodes.iter()
+    plan.metadata.subgraph_dependencies = plan
+        .nodes
+        .iter()
         .filter(|n| n.op == tinypipe_ir::plan::Opcode::Call)
-        .filter_map(|n| n.args.iter()
-            .find(|a| a.key == "target")
-            .and_then(|a| match &a.value {
-                tinypipe_ir::plan::ArgValue::String(s) if s.starts_with("subgraph:") => Some(s.clone()),
-                _ => None,
-            })
-        )
+        .filter_map(|n| {
+            n.args
+                .iter()
+                .find(|a| a.key == "target")
+                .and_then(|a| match &a.value {
+                    tinypipe_ir::plan::ArgValue::String(s) if s.starts_with("subgraph:") => {
+                        Some(s.clone())
+                    }
+                    _ => None,
+                })
+        })
         .collect();
 
     // Extract tool dependencies from CALL targets, populating schema_hash
     // from the provided map (empty hash = drift detection disabled).
-    plan.metadata.tool_deps = plan.nodes.iter()
+    plan.metadata.tool_deps = plan
+        .nodes
+        .iter()
         .filter(|n| n.op == tinypipe_ir::plan::Opcode::Call)
         .filter_map(|n| {
-            n.args.iter()
+            n.args
+                .iter()
                 .find(|a| a.key == "target")
                 .and_then(|a| match &a.value {
                     tinypipe_ir::plan::ArgValue::String(s) => {
@@ -129,9 +138,7 @@ pub fn codegen_with_schema_hashes(
                         } else {
                             (name, "^0.0.0")
                         };
-                        let schema_hash = schema_hashes.get(tool_name)
-                            .cloned()
-                            .unwrap_or_default();
+                        let schema_hash = schema_hashes.get(tool_name).cloned().unwrap_or_default();
                         Some(ToolDep {
                             name: tool_name.to_string(),
                             version: version.to_string(),
@@ -167,7 +174,9 @@ pub fn codegen_with_schema_hashes(
 }
 
 /// Legacy codegen: JSON-based (v1). Useful for debugging and testing.
-pub fn codegen_json(plan: ExecutionPlan) -> Result<(tinypipe_ir::plan::ExecutionPlan, String), CodegenError> {
+pub fn codegen_json(
+    plan: ExecutionPlan,
+) -> Result<(tinypipe_ir::plan::ExecutionPlan, String), CodegenError> {
     let mut plan = plan;
 
     let now = SystemTime::now()
@@ -197,10 +206,7 @@ mod tests {
                 Node::new("calc1", Opcode::Calc).with_arg("expr", "x + 1".into()),
                 Node::new("output1", Opcode::Act).with_arg("type", "return".into()),
             ],
-            vec![
-                Edge::new("input1", "calc1"),
-                Edge::new("calc1", "output1"),
-            ],
+            vec![Edge::new("input1", "calc1"), Edge::new("calc1", "output1")],
         )
     }
 
@@ -238,14 +244,8 @@ mod tests {
     #[test]
     fn test_codegen_rejects_cycle() {
         let plan = ExecutionPlan::new(
-            vec![
-                Node::new("a", Opcode::Input),
-                Node::new("b", Opcode::Calc),
-            ],
-            vec![
-                Edge::new("a", "b"),
-                Edge::new("b", "a"),
-            ],
+            vec![Node::new("a", Opcode::Input), Node::new("b", Opcode::Calc)],
+            vec![Edge::new("a", "b"), Edge::new("b", "a")],
         );
         let err = codegen(plan).unwrap_err();
         assert!(err.message.contains("cycle"), "should reject cycle");
@@ -268,23 +268,31 @@ mod tests {
                 Node::new("calc1", Opcode::Calc).with_arg("expr", "3 + 5".into()),
                 Node::new("act1", Opcode::Act).with_arg("type", "return".into()),
             ],
-            vec![
-                Edge::new("input1", "calc1"),
-                Edge::new("calc1", "act1"),
-            ],
+            vec![Edge::new("input1", "calc1"), Edge::new("calc1", "act1")],
         );
         let output = codegen(plan).expect("codegen should succeed");
         // Should have at least constant_folding optimization
         assert!(
-            output.optimizations.iter().any(|o| o.starts_with("constant_folding")),
+            output
+                .optimizations
+                .iter()
+                .any(|o| o.starts_with("constant_folding")),
             "expected constant_folding, got optimizations: {:?}",
             output.optimizations
         );
         // The folded calc should be "8" (JSON-encoded in CompiledArg as "\"8\"")
-        let calc_node = output.compiled.nodes.iter().find(|n| n.id == "calc1").unwrap();
+        let calc_node = output
+            .compiled
+            .nodes
+            .iter()
+            .find(|n| n.id == "calc1")
+            .unwrap();
         let expr = calc_node.args.iter().find(|a| a.key == "expr").unwrap();
-        assert!(expr.value == "\"8\"" || expr.value == "8",
-            "expected expr value to be '8', got '{}'", expr.value);
+        assert!(
+            expr.value == "\"8\"" || expr.value == "8",
+            "expected expr value to be '8', got '{}'",
+            expr.value
+        );
     }
 
     #[test]
@@ -331,10 +339,24 @@ mod tests {
         assert_eq!(output.compiled.metadata.edge_count, 9);
         // Verify all opcodes are in the compiled output
         let ops: Vec<Opcode> = output.compiled.nodes.iter().map(|n| n.op).collect();
-        for op in &[Opcode::Input, Opcode::Calc, Opcode::Call, Opcode::Decide,
-                    Opcode::Switch, Opcode::Loop, Opcode::Parallel,
-                    Opcode::Wait, Opcode::Merge, Opcode::Act, Opcode::Error] {
-            assert!(ops.contains(op), "opcode {:?} should be in compiled output", op);
+        for op in &[
+            Opcode::Input,
+            Opcode::Calc,
+            Opcode::Call,
+            Opcode::Decide,
+            Opcode::Switch,
+            Opcode::Loop,
+            Opcode::Parallel,
+            Opcode::Wait,
+            Opcode::Merge,
+            Opcode::Act,
+            Opcode::Error,
+        ] {
+            assert!(
+                ops.contains(op),
+                "opcode {:?} should be in compiled output",
+                op
+            );
         }
         // Binary serialization roundtrip
         let deserialized = CompiledPlan::from_bytes(&output.binary).expect("binary roundtrip");

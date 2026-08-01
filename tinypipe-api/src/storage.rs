@@ -4,9 +4,7 @@
 //! tinypipe-vm tarafından tüketilir.
 //! Test'lerde mock implementasyon kullanılır.
 
-use crate::types::{
-    Execution, ExecutionStep, GraphId, StorageError, Version,
-};
+use crate::types::{Execution, ExecutionStep, GraphId, StorageError, Version};
 
 /// Graph definition (nodes + edges) — storage'dan dönen tam graph.
 #[derive(Debug, Clone)]
@@ -51,6 +49,13 @@ pub trait GraphStorage: Send + Sync {
     /// Graph'ın execution_plan blob'unu (FlatBuffers IR) yükle.
     fn load_plan(&self, id: &GraphId) -> Result<Vec<u8>, StorageError>;
 
+    /// Graph'ın belirli bir versiyonunun execution_plan blob'unu yükle
+    /// (pause/resume ve scheduler için immutable versiyon okuma).
+    fn load_plan_version(&self, id: &GraphId, version: Version) -> Result<Vec<u8>, StorageError>;
+
+    /// Compiled plan blob'unu hem `graphs` (current) hem `graph_versions` (immutable) satırlarına yazar.
+    fn save_plan(&self, id: &GraphId, version: Version, plan: &[u8]) -> Result<(), StorageError>;
+
     /// Graph definition'ı yükle (metadata + code).
     fn load_graph(&self, id: &GraphId) -> Result<GraphDefinition, StorageError>;
 
@@ -63,8 +68,25 @@ pub trait GraphStorage: Send + Sync {
     /// Execution'ı ID ile yükle.
     fn load_execution(&self, id: &str) -> Result<Execution, StorageError>;
 
+    /// Bir graph'ın execution kayıtlarını listele (en yeni önce).
+    fn list_executions(
+        &self,
+        graph_id: &GraphId,
+        limit: Option<u64>,
+    ) -> Result<Vec<Execution>, StorageError>;
+
+    /// Bir execution'ın step kayıtlarını listele (sıralı).
+    fn list_steps(&self, execution_id: &str) -> Result<Vec<ExecutionStep>, StorageError>;
+
     /// paused durumundaki execution'ları döndür (scheduler için).
     fn list_paused_executions(&self) -> Result<Vec<Execution>, StorageError>;
+
+    /// Execution'ın checkpoint blob'unu (serde_json-serialized `Checkpoint`) kaydet.
+    /// Blob formatı storage'ı ilgilendirmez — opak veridir.
+    fn save_checkpoint(&self, execution_id: &str, blob: &[u8]) -> Result<(), StorageError>;
+
+    /// Execution'ın checkpoint blob'unu yükle (resume için).
+    fn load_checkpoint(&self, execution_id: &str) -> Result<Vec<u8>, StorageError>;
 
     // ==================== Branch Explore (v2.1) ====================
 
@@ -131,6 +153,23 @@ mod tests {
             Err(StorageError::Internal("not implemented".into()))
         }
 
+        fn load_plan_version(
+            &self,
+            _id: &GraphId,
+            _version: Version,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(StorageError::Internal("not implemented".into()))
+        }
+
+        fn save_plan(
+            &self,
+            _id: &GraphId,
+            _version: Version,
+            _plan: &[u8],
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
         fn load_graph(&self, id: &GraphId) -> Result<GraphDefinition, StorageError> {
             Err(StorageError::GraphNotFound(id.clone()))
         }
@@ -147,8 +186,28 @@ mod tests {
             Err(StorageError::ExecutionNotFound(id.into()))
         }
 
+        fn list_executions(
+            &self,
+            _graph_id: &GraphId,
+            _limit: Option<u64>,
+        ) -> Result<Vec<Execution>, StorageError> {
+            Ok(vec![])
+        }
+
+        fn list_steps(&self, _execution_id: &str) -> Result<Vec<ExecutionStep>, StorageError> {
+            Ok(vec![])
+        }
+
         fn list_paused_executions(&self) -> Result<Vec<Execution>, StorageError> {
             Ok(vec![])
+        }
+
+        fn save_checkpoint(&self, _execution_id: &str, _blob: &[u8]) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn load_checkpoint(&self, execution_id: &str) -> Result<Vec<u8>, StorageError> {
+            Err(StorageError::ExecutionNotFound(execution_id.into()))
         }
 
         fn fork_graph(

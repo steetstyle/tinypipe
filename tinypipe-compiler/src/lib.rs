@@ -16,8 +16,8 @@
 //! - `codegen`: ExecutionPlan → CompiledPlan (uint32 index, binary bincode)
 
 pub mod auto_repair;
-pub mod frontend;
 pub mod backend;
+pub mod frontend;
 pub mod sanitizer;
 pub mod transform;
 pub mod type_check;
@@ -34,21 +34,21 @@ pub use backend::optimize;
 ///
 /// Returns the compiled output ready for storage and execution.
 pub fn compile(code: &str) -> Result<CodegenOutput, String> {
-    let plan = transform::transform(code)
-        .map_err(|errors| {
-            errors.iter()
-                .map(|e| format!("{}:{} — {}", e.line, e.column, e.message))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })?;
+    let plan = transform::transform(code).map_err(|errors| {
+        errors
+            .iter()
+            .map(|e| format!("{}:{} — {}", e.line, e.column, e.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
 
-    validator::validate(&plan)
-        .map_err(|errors| {
-            errors.iter()
-                .map(|e| format!("{}: {}", e.node_id, e.message))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })?;
+    validator::validate(&plan).map_err(|errors| {
+        errors
+            .iter()
+            .map(|e| format!("{}: {}", e.node_id, e.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
 
     // Type checking (non-fatal warnings for now)
     let type_errors = type_check::check_types(&plan.nodes);

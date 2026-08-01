@@ -21,10 +21,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use tinypipe_api::types::{
-    CallTarget, Context, DispatchError, RegistryError, ToolSpec, Value,
-};
 use tinypipe_api::tool_registry::ToolRegistry;
+use tinypipe_api::types::{CallTarget, Context, DispatchError, RegistryError, ToolSpec, Value};
 
 type ToolFn = Box<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync>;
 
@@ -43,7 +41,9 @@ pub struct MockToolRegistry {
 
 impl MockToolRegistry {
     pub fn new() -> Self {
-        MockToolRegistry { tools: Mutex::new(HashMap::new()) }
+        MockToolRegistry {
+            tools: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn add<F>(&self, name: &str, exec: F)
@@ -51,30 +51,41 @@ impl MockToolRegistry {
         F: Fn(&[Value]) -> Result<Value, String> + Send + Sync + 'static,
     {
         let mut tools = self.tools.lock().unwrap();
-        tools.insert(name.to_owned(), MockTool {
-            name: name.to_owned(),
-            description: String::new(),
-            input_schema: serde_json::Value::Null,
-            output_schema: serde_json::Value::Null,
-            pure: false,
-            exec: Box::new(exec),
-        });
+        tools.insert(
+            name.to_owned(),
+            MockTool {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema: serde_json::Value::Null,
+                output_schema: serde_json::Value::Null,
+                pure: false,
+                exec: Box::new(exec),
+            },
+        );
     }
 
-    pub fn add_with_schema<F>(&self, name: &str, input_schema: serde_json::Value,
-                                output_schema: serde_json::Value, pure: bool, exec: F)
-    where
+    pub fn add_with_schema<F>(
+        &self,
+        name: &str,
+        input_schema: serde_json::Value,
+        output_schema: serde_json::Value,
+        pure: bool,
+        exec: F,
+    ) where
         F: Fn(&[Value]) -> Result<Value, String> + Send + Sync + 'static,
     {
         let mut tools = self.tools.lock().unwrap();
-        tools.insert(name.to_owned(), MockTool {
-            name: name.to_owned(),
-            description: String::new(),
-            input_schema,
-            output_schema,
-            pure,
-            exec: Box::new(exec),
-        });
+        tools.insert(
+            name.to_owned(),
+            MockTool {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema,
+                output_schema,
+                pure,
+                exec: Box::new(exec),
+            },
+        );
     }
 
     pub fn clear(&self) {
@@ -87,36 +98,43 @@ impl MockToolRegistry {
 }
 
 impl Default for MockToolRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolRegistry for MockToolRegistry {
     fn resolve(&self, name: &str, _version: &str) -> Result<ToolSpec, RegistryError> {
         let tools = self.tools.lock().unwrap();
-        tools.get(name).map(|t| ToolSpec {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            input_schema: t.input_schema.clone(),
-            output_schema: t.output_schema.clone(),
-            pure: t.pure,
-            version: "0.0.0".into(),
-            schema_hash: "mock".into(),
-        }).ok_or_else(|| RegistryError::NotFound(name.into()))
+        tools
+            .get(name)
+            .map(|t| ToolSpec {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+                output_schema: t.output_schema.clone(),
+                pure: t.pure,
+                version: "0.0.0".into(),
+                schema_hash: "mock".into(),
+            })
+            .ok_or_else(|| RegistryError::NotFound(name.into()))
     }
 
     fn dispatch(&self, call: &CallTarget, _context: &Context) -> Result<Value, DispatchError> {
         let tools = self.tools.lock().unwrap();
-        let tool = tools.get(&call.name)
+        let tool = tools
+            .get(&call.name)
             .ok_or_else(|| DispatchError::NotFound(call.name.clone()))?;
-        (tool.exec)(&call.args).map_err(|e| DispatchError::ExecutionFailed(e))
+        (tool.exec)(&call.args).map_err(DispatchError::ExecutionFailed)
     }
 
     fn execute_subgraph(&self, name: &str, _input: Context) -> Result<Context, DispatchError> {
         if name.contains("echo") {
             let tools = self.tools.lock().unwrap();
-            let tool = tools.get("echo")
+            let tool = tools
+                .get("echo")
                 .ok_or_else(|| DispatchError::NotFound("echo".into()))?;
-            let result = (tool.exec)(&[]).map_err(|e| DispatchError::ExecutionFailed(e))?;
+            let result = (tool.exec)(&[]).map_err(DispatchError::ExecutionFailed)?;
             let mut ctx = Context::new();
             ctx.set("output".into(), result);
             Ok(ctx)
@@ -137,14 +155,18 @@ pub fn mock_tools() -> MockToolRegistry {
     let reg = MockToolRegistry::new();
 
     reg.add("math.add", |args| {
-        if args.len() < 2 { return Err("math.add requires 2 args".into()); }
+        if args.len() < 2 {
+            return Err("math.add requires 2 args".into());
+        }
         let a = args[0].as_f64().ok_or("arg0 not a number")?;
         let b = args[1].as_f64().ok_or("arg1 not a number")?;
         Ok(Value::Float(a + b))
     });
 
     reg.add("math.mul", |args| {
-        if args.len() < 2 { return Err("math.mul requires 2 args".into()); }
+        if args.len() < 2 {
+            return Err("math.mul requires 2 args".into());
+        }
         let a = args[0].as_f64().ok_or("arg0 not a number")?;
         let b = args[1].as_f64().ok_or("arg1 not a number")?;
         Ok(Value::Float(a * b))
@@ -156,7 +178,9 @@ pub fn mock_tools() -> MockToolRegistry {
     });
 
     reg.add("echo", |args| {
-        args.first().cloned().ok_or_else(|| "echo requires 1 arg".into())
+        args.first()
+            .cloned()
+            .ok_or_else(|| "echo requires 1 arg".into())
     });
 
     reg.add("test.sleep", |args| {
@@ -165,9 +189,7 @@ pub fn mock_tools() -> MockToolRegistry {
         Ok(Value::Null)
     });
 
-    reg.add("test.error", |_args| {
-        Err("simulated tool error".into())
-    });
+    reg.add("test.error", |_args| Err("simulated tool error".into()));
 
     reg.add("test.large", |args| {
         let n = args[0].as_u64().ok_or("arg0 not a u64")? as usize;

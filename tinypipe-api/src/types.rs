@@ -65,23 +65,33 @@ impl Value {
 }
 
 impl From<i64> for Value {
-    fn from(v: i64) -> Self { Value::Int(v) }
+    fn from(v: i64) -> Self {
+        Value::Int(v)
+    }
 }
 
 impl From<f64> for Value {
-    fn from(v: f64) -> Self { Value::Float(v) }
+    fn from(v: f64) -> Self {
+        Value::Float(v)
+    }
 }
 
 impl From<String> for Value {
-    fn from(v: String) -> Self { Value::String(v) }
+    fn from(v: String) -> Self {
+        Value::String(v)
+    }
 }
 
 impl From<&str> for Value {
-    fn from(v: &str) -> Self { Value::String(v.to_owned()) }
+    fn from(v: &str) -> Self {
+        Value::String(v.to_owned())
+    }
 }
 
 impl From<bool> for Value {
-    fn from(v: bool) -> Self { Value::Bool(v) }
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
+    }
 }
 
 impl<T: Into<Value>> From<Vec<T>> for Value {
@@ -133,7 +143,10 @@ pub struct Scope {
 
 impl Scope {
     pub fn new() -> Self {
-        Scope { variables: HashMap::new(), merge_strategies: HashMap::new() }
+        Scope {
+            variables: HashMap::new(),
+            merge_strategies: HashMap::new(),
+        }
     }
 
     /// Parent scope'dan kopya alarak child scope oluştur.
@@ -160,12 +173,17 @@ impl Scope {
 
     /// Get the effective merge strategy for a key (defaults to Last).
     pub fn get_merge_strategy(&self, key: &str) -> MergeStrategy {
-        self.merge_strategies.get(key).copied().unwrap_or(MergeStrategy::Last)
+        self.merge_strategies
+            .get(key)
+            .copied()
+            .unwrap_or(MergeStrategy::Last)
     }
 }
 
 impl Default for Scope {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─── Context (scope-aware, branch isolation) ─────────────────────
@@ -186,15 +204,12 @@ pub struct Context {
 
     /// Branch scope'ları: branch_id → Scope
     /// PARALLEL çalışırken her branch'in kendi değişkenleri burada saklanır
-    #[serde(skip)]
     branch_scopes: HashMap<u32, Scope>,
 
     /// Parent scope snapshot (PARALLEL girişinde alınır)
-    #[serde(skip)]
     parent_scope: Option<Scope>,
 
     /// Şu anda aktif olan branch (None = global scope)
-    #[serde(skip)]
     active_branch: Option<u32>,
 }
 
@@ -245,8 +260,11 @@ impl Context {
     /// Değişken yazma: active branch varsa scope'a, yoksa global'e yazar.
     pub fn set(&mut self, key: String, value: Value) {
         if let Some(bid) = self.active_branch {
-            self.branch_scopes.entry(bid).or_insert_with(Scope::new)
-                .variables.insert(key, value);
+            self.branch_scopes
+                .entry(bid)
+                .or_insert_with(Scope::new)
+                .variables
+                .insert(key, value);
         } else {
             self.variables.insert(key, value);
         }
@@ -279,7 +297,9 @@ impl Context {
         self.active_branch = Some(branch_id);
         // Empty scope — only variables explicitly set() by the branch appear here.
         // get() falls through to parent_scope → global.variables automatically.
-        self.branch_scopes.entry(branch_id).or_insert_with(Scope::new);
+        self.branch_scopes
+            .entry(branch_id)
+            .or_insert_with(Scope::new);
     }
 
     /// Branch'i devre dışı bırak (aktif branch yok = global scope).
@@ -287,12 +307,27 @@ impl Context {
         self.active_branch = None;
     }
 
+    /// Bir branch scope'unu doğrudan context'e ekler.
+    /// Paralel yürütmede branch thread'leri kendi scope'larını ana context'e
+    /// bu yolla geri verir; MERGE node'u `merge_branches()` ile birleştirir.
+    pub fn insert_branch_scope(&mut self, branch_id: u32, scope: Scope) {
+        self.branch_scopes.insert(branch_id, scope);
+    }
+
+    /// Bir branch scope'unu context'ten çıkarır (paralel thread sonuç toplama).
+    pub fn take_branch_scope(&mut self, branch_id: u32) -> Option<Scope> {
+        self.branch_scopes.remove(&branch_id)
+    }
+
     /// Aktif branch için bir anahtarın merge stratejisini belirle.
     /// MERGE sırasında bu strateji kullanılır.
     pub fn set_merge_strategy(&mut self, key: &str, strategy: MergeStrategy) {
         if let Some(bid) = self.active_branch {
-            self.branch_scopes.entry(bid).or_insert_with(Scope::new)
-                .merge_strategies.insert(key.to_owned(), strategy);
+            self.branch_scopes
+                .entry(bid)
+                .or_insert_with(Scope::new)
+                .merge_strategies
+                .insert(key.to_owned(), strategy);
         }
     }
 
@@ -315,42 +350,50 @@ impl Context {
                         self.variables.entry(key).or_insert(value);
                     }
                     MergeStrategy::Min => {
-                        self.variables.entry(key)
+                        self.variables
+                            .entry(key)
                             .and_modify(|existing| {
                                 if let (Some(a), Some(b)) = (value.as_f64(), existing.as_f64()) {
-                                    if a < b { *existing = value.clone(); }
+                                    if a < b {
+                                        *existing = value.clone();
+                                    }
                                 }
                             })
                             .or_insert(value);
                     }
                     MergeStrategy::Max => {
-                        self.variables.entry(key)
+                        self.variables
+                            .entry(key)
                             .and_modify(|existing| {
                                 if let (Some(a), Some(b)) = (value.as_f64(), existing.as_f64()) {
-                                    if a > b { *existing = value.clone(); }
+                                    if a > b {
+                                        *existing = value.clone();
+                                    }
                                 }
                             })
                             .or_insert(value);
                     }
                     MergeStrategy::Concat => {
-                        self.variables.entry(key)
-                            .and_modify(|existing| {
-                                match (existing.clone(), value.clone()) {
-                                    (Value::String(a), Value::String(b)) => {
-                                        *existing = Value::String(a + &b);
-                                    }
-                                    (Value::Array(a), Value::Array(b)) => {
-                                        let mut merged = a;
-                                        merged.extend(b);
-                                        *existing = Value::Array(merged);
-                                    }
-                                    (_, _) => { *existing = value.clone(); }
+                        self.variables
+                            .entry(key)
+                            .and_modify(|existing| match (existing.clone(), value.clone()) {
+                                (Value::String(a), Value::String(b)) => {
+                                    *existing = Value::String(a + &b);
+                                }
+                                (Value::Array(a), Value::Array(b)) => {
+                                    let mut merged = a;
+                                    merged.extend(b);
+                                    *existing = Value::Array(merged);
+                                }
+                                (_, _) => {
+                                    *existing = value.clone();
                                 }
                             })
                             .or_insert(value);
                     }
                     MergeStrategy::Sum => {
-                        self.variables.entry(key)
+                        self.variables
+                            .entry(key)
                             .and_modify(|existing| {
                                 if let Some(sum) = existing.checked_add(&value) {
                                     *existing = sum;
@@ -359,7 +402,8 @@ impl Context {
                             .or_insert(value);
                     }
                     MergeStrategy::Avg => {
-                        self.variables.entry(key)
+                        self.variables
+                            .entry(key)
                             .and_modify(|existing| {
                                 if let (Some(a), Some(b)) = (existing.as_f64(), value.as_f64()) {
                                     *existing = Value::Float((a + b) / 2.0);
@@ -390,18 +434,25 @@ impl Context {
 
     /// Tahmini byte boyutu (context memory limit kontrolü için)
     pub fn estimated_bytes(&self) -> u64 {
-        let global: u64 = self.variables.iter().map(|(k, v)| {
-            (k.len() + serde_json::to_string(v).unwrap_or_default().len()) as u64
-        }).sum();
-        let scopes: u64 = self.branch_scopes.iter().flat_map(|(_, s)| s.variables.iter()).map(|(k, v)| {
-            (k.len() + serde_json::to_string(v).unwrap_or_default().len()) as u64
-        }).sum();
+        let global: u64 = self
+            .variables
+            .iter()
+            .map(|(k, v)| (k.len() + serde_json::to_string(v).unwrap_or_default().len()) as u64)
+            .sum();
+        let scopes: u64 = self
+            .branch_scopes
+            .iter()
+            .flat_map(|(_, s)| s.variables.iter())
+            .map(|(k, v)| (k.len() + serde_json::to_string(v).unwrap_or_default().len()) as u64)
+            .sum();
         global + scopes
     }
 }
 
 impl Default for Context {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// CALL opcode'unun hedefini tanımlar.
@@ -439,7 +490,9 @@ pub struct ToolSpec {
 pub struct GraphId(pub String);
 
 impl GraphId {
-    pub fn new(id: &str) -> Self { GraphId(id.to_owned()) }
+    pub fn new(id: &str) -> Self {
+        GraphId(id.to_owned())
+    }
 }
 
 impl std::fmt::Display for GraphId {

@@ -33,15 +33,21 @@ pub enum ArgValue {
 }
 
 impl From<&str> for ArgValue {
-    fn from(s: &str) -> Self { ArgValue::String(s.to_owned()) }
+    fn from(s: &str) -> Self {
+        ArgValue::String(s.to_owned())
+    }
 }
 
 impl From<i64> for ArgValue {
-    fn from(v: i64) -> Self { ArgValue::Int(v) }
+    fn from(v: i64) -> Self {
+        ArgValue::Int(v)
+    }
 }
 
 impl From<f64> for ArgValue {
-    fn from(v: f64) -> Self { ArgValue::Float(v) }
+    fn from(v: f64) -> Self {
+        ArgValue::Float(v)
+    }
 }
 
 /// Bir node parametresi (key-value).
@@ -53,7 +59,10 @@ pub struct Arg {
 
 impl Arg {
     pub fn new(key: &str, value: ArgValue) -> Self {
-        Arg { key: key.to_owned(), value }
+        Arg {
+            key: key.to_owned(),
+            value,
+        }
     }
 }
 
@@ -77,16 +86,31 @@ impl Opcode {
     /// Tüm opcode'ları döndür (enum iteration).
     pub fn all() -> &'static [Opcode] {
         &[
-            Opcode::Input, Opcode::Call, Opcode::Calc, Opcode::Decide,
-            Opcode::Switch, Opcode::Act, Opcode::Parallel, Opcode::Loop,
-            Opcode::Wait, Opcode::Merge, Opcode::Error,
+            Opcode::Input,
+            Opcode::Call,
+            Opcode::Calc,
+            Opcode::Decide,
+            Opcode::Switch,
+            Opcode::Act,
+            Opcode::Parallel,
+            Opcode::Loop,
+            Opcode::Wait,
+            Opcode::Merge,
+            Opcode::Error,
         ]
     }
 
     /// Opcode'un saf (pure) olup olmadığı — yan etkisiz hesaplama.
     pub fn is_pure(&self) -> bool {
-        matches!(self, Opcode::Input | Opcode::Calc | Opcode::Decide
-            | Opcode::Switch | Opcode::Wait | Opcode::Merge)
+        matches!(
+            self,
+            Opcode::Input
+                | Opcode::Calc
+                | Opcode::Decide
+                | Opcode::Switch
+                | Opcode::Wait
+                | Opcode::Merge
+        )
     }
 
     /// Opcode'un dallanma yapıp yapmadığı (birden çok çıkış edge'i).
@@ -136,7 +160,13 @@ pub struct Node {
 
 impl Node {
     pub fn new(id: &str, op: Opcode) -> Self {
-        Node { id: id.to_owned(), op, args: Vec::new(), inferred_type: None, branch_id: None }
+        Node {
+            id: id.to_owned(),
+            op,
+            args: Vec::new(),
+            inferred_type: None,
+            branch_id: None,
+        }
     }
 
     pub fn with_arg(mut self, key: &str, value: ArgValue) -> Self {
@@ -281,7 +311,11 @@ impl ExecutionPlan {
         let edge_count = edges.len() as u32;
         ExecutionPlan {
             version: 3,
-            metadata: Metadata { node_count, edge_count, ..Default::default() },
+            metadata: Metadata {
+                node_count,
+                edge_count,
+                ..Default::default()
+            },
             nodes,
             edges,
         }
@@ -304,8 +338,8 @@ impl ExecutionPlan {
 
     /// Topolojik sırayı döndür (Kahn's algorithm).
     pub fn topological_order(&self) -> Result<Vec<&Node>, String> {
-        let mut in_degree: std::collections::HashMap<&str, usize> = self.nodes.iter()
-            .map(|n| (n.id.as_str(), 0)).collect();
+        let mut in_degree: std::collections::HashMap<&str, usize> =
+            self.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
 
         for edge in &self.edges {
             if let Some(deg) = in_degree.get_mut(edge.to.as_str()) {
@@ -313,7 +347,9 @@ impl ExecutionPlan {
             }
         }
 
-        let mut queue: Vec<&Node> = self.nodes.iter()
+        let mut queue: Vec<&Node> = self
+            .nodes
+            .iter()
             .filter(|n| in_degree.get(n.id.as_str()) == Some(&0))
             .collect();
 
@@ -352,10 +388,7 @@ mod tests {
                 Node::new("calc1", Opcode::Calc).with_arg("expr", "x + 1".into()),
                 Node::new("output1", Opcode::Act).with_arg("type", "notify".into()),
             ],
-            vec![
-                Edge::new("input1", "calc1"),
-                Edge::new("calc1", "output1"),
-            ],
+            vec![Edge::new("input1", "calc1"), Edge::new("calc1", "output1")],
         )
     }
 
@@ -404,10 +437,7 @@ mod tests {
     #[test]
     fn test_cycle_detection() {
         let plan = ExecutionPlan::new(
-            vec![
-                Node::new("a", Opcode::Input),
-                Node::new("b", Opcode::Calc),
-            ],
+            vec![Node::new("a", Opcode::Input), Node::new("b", Opcode::Calc)],
             vec![
                 Edge::new("a", "b"),
                 Edge::new("b", "a"), // cycle!

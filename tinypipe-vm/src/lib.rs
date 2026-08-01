@@ -8,7 +8,9 @@
 pub mod compiled_executor;
 pub mod error;
 pub mod mocks;
+pub mod pause;
 
 pub use compiled_executor::CompiledExecutor;
 pub use error::{ExecutionError, ExecutionResult};
 pub use mocks::{mock_tools, MockToolRegistry};
+pub use pause::{Checkpoint, ExecutionOutcome, LoopState, NoopObserver, PausePolicy, StepObserver};

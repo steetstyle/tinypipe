@@ -171,9 +171,40 @@ The compiler pipeline:
 | `rollback <id> <version>` | Restore old code as a new version |
 | `versions <id>` | List all versions |
 | `execute <id> <json>` | Run a graph with input |
+| `execute <id> <json> --pause-after N` | Run, pause after N nodes, save a checkpoint |
+| `resume <execution_id> [--max-nodes N]` | Resume a paused execution from its checkpoint |
+| `scheduler run [--max-nodes N]` | Resume all paused executions (budgeted loop mode with `--max-nodes`) |
+| `plan <id> [version] [--format text\|mermaid\|dot]` | Dump the compiled plan (mermaid/dot graphs renderable in mermaid.live / graphviz) |
 | `list` | List all graphs |
 
 IDs can be either a UUID or the graph name (the CLI resolves it).
+
+## Pause / resume
+
+Long-running graphs (loops, big input sets) can be paused at node granularity and
+resumed later — even from a different process, because the full execution state is
+persisted:
+
+```
+$ tinypipe-cli execute my_loop '{"x": 0}' --pause-after 3
+⏸ Execution paused at 4 nodes (id: <uuid>)
+$ tinypipe-cli resume <uuid>            # run to completion
+$ tinypipe-cli resume <uuid> --max-nodes 2   # or resume in steps
+```
+
+Paused executions are listed by `executions list <id>` and picked up automatically
+by the scheduler, which steps them forward in rounds (`--max-nodes` per round) until
+they complete:
+
+```
+$ tinypipe-cli scheduler run            # finish everything in one round
+$ tinypipe-cli scheduler run --max-nodes 2   # step each execution by 2 nodes/round
+```
+
+Checkpoints are stored as a BLOB on the `executions` row (JSON-encoded `Checkpoint`
+with the full context, loop state, and node bookkeeping). `resume` and the scheduler
+load the plan from the execution's immutable version, so later graph edits do not
+affect in-flight executions.
 
 ## Storage
 
@@ -198,8 +229,10 @@ It checks `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, then falls back to a local Olla
 tinypipe-api/        — shared types (Context, Value, GraphId, Scope)
 tinypipe-compiler/   — sanitizer, transformer, validator, optimizer, codegen
 tinypipe-ir/         — ExecutionPlan + CompiledPlan + FlatBuffers schema
+                       + plan_dump: text/mermaid/dot renderers (CLI'den bağımsız)
 tinypipe-storage/    — SQLite implementation of GraphStorage trait
-tinypipe-vm/         — DAG interpreter + mock tools
+tinypipe-vm/         — DAG interpreter + pause/resume + parallel tool execution
+tinypipe-scheduler/  — resumes paused executions from checkpoints
 tinypipe-cli/        — binary with all commands
 benches/             — baseline benchmarks
 ```
@@ -209,6 +242,7 @@ benches/             — baseline benchmarks
 - The compiler works end-to-end for the restricted subset
 - The VM executes plans correctly (22 μs for a 3-node graph)
 - Versioning, deploy, and rollback all work with full audit trail
+- Pause/resume with persisted checkpoints, scheduler, and threaded PARALLEL blocks
 - Scope isolation and subscript restrictions are enforced
 - What's missing: real tool implementations (only MockToolRegistry exists), network proxy, persistent execution scheduling, tier-2/3 sandboxing (KVM fork, wasm)
 

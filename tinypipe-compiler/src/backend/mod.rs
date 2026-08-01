@@ -18,8 +18,8 @@
 //! bincode::serialize()       ──▶ Vec<u8> (storage'a yazılır)
 //! ```
 
-pub mod optimize;
 pub mod codegen;
+pub mod optimize;
 
 pub use codegen::codegen;
 pub use optimize::optimize_all;

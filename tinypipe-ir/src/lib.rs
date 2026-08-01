@@ -4,8 +4,9 @@
 //! v2: `CompiledPlan` (binary, uint32 index'ler, O(1) random access).
 //! v3: FlatBuffers binary format (zero-copy, canonical .fbs schema).
 
-pub mod plan;
 pub mod compiled;
+pub mod plan;
+pub mod plan_dump;
 
 // Include FlatBuffers generated bindings
 #[allow(clippy::all)]
@@ -15,6 +16,7 @@ mod fb {
     include!(concat!(env!("OUT_DIR"), "/execution_plan_generated.rs"));
 }
 
-pub use plan::{Arg, ArgValue, Edge, ExecutionPlan, Metadata, Node, Opcode, ToolDep, Type};
 pub use compiled::{CompiledArg, CompiledEdge, CompiledMetadata, CompiledNode, CompiledPlan};
 pub use fb::root_as_execution_plan;
+pub use plan::{Arg, ArgValue, Edge, ExecutionPlan, Metadata, Node, Opcode, ToolDep, Type};
+pub use plan_dump::{PlanDumpHeader, PlanFormat};

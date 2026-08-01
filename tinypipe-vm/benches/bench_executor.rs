@@ -29,7 +29,9 @@ struct BenchStats {
 
 fn run_bench<F: FnMut()>(name: &str, mut f: F, iterations: usize) -> BenchStats {
     // Warmup
-    for _ in 0..10 { f(); }
+    for _ in 0..10 {
+        f();
+    }
 
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
@@ -49,7 +51,15 @@ fn run_bench<F: FnMut()>(name: &str, mut f: F, iterations: usize) -> BenchStats 
     let p95 = samples[(count as f64 * 0.95) as usize];
     let p99 = samples[(count as f64 * 0.99) as usize];
 
-    let stats = BenchStats { count, mean, min, max, p50, p95, p99 };
+    let stats = BenchStats {
+        count,
+        mean,
+        min,
+        max,
+        p50,
+        p95,
+        p99,
+    };
 
     println!("  {name:<40}  mean={mean:8.3}µs  p50={p50:8.3}µs  p95={p95:8.3}µs  p99={p99:8.3}µs  min={min:8.3}µs  max={max:8.3}µs");
 
@@ -65,10 +75,7 @@ fn simple_plan() -> ExecutionPlan {
                 .with_arg("type", "return".into())
                 .with_arg("source", "calc1".into()),
         ],
-        vec![
-            Edge::new("input1", "calc1"),
-            Edge::new("calc1", "output1"),
-        ],
+        vec![Edge::new("input1", "calc1"), Edge::new("calc1", "output1")],
     )
 }
 
@@ -76,8 +83,7 @@ fn decide_plan() -> ExecutionPlan {
     ExecutionPlan::new(
         vec![
             Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
-            Node::new("decide1", Opcode::Decide)
-                .with_arg("condition", "x > 0".into()),
+            Node::new("decide1", Opcode::Decide).with_arg("condition", "x > 0".into()),
             Node::new("true_branch", Opcode::Act)
                 .with_arg("type", "return".into())
                 .with_arg("source", "input1".into()),
@@ -94,9 +100,7 @@ fn decide_plan() -> ExecutionPlan {
 }
 
 fn chain_plan(node_count: usize) -> ExecutionPlan {
-    let mut nodes = vec![
-        Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
-    ];
+    let mut nodes = vec![Node::new("input1", Opcode::Input).with_arg("name", "x".into())];
     let mut edges = Vec::new();
     for i in 0..node_count {
         let nid = format!("calc{}", i);
@@ -104,14 +108,19 @@ fn chain_plan(node_count: usize) -> ExecutionPlan {
         if i == 0 {
             edges.push(Edge::new("input1", &nid));
         } else {
-            edges.push(Edge::new(&format!("calc{}", i-1), &nid));
+            edges.push(Edge::new(&format!("calc{}", i - 1), &nid));
         }
     }
     let out_id = "output1";
-    nodes.push(Node::new(out_id, Opcode::Act)
-        .with_arg("type", "return".into())
-        .with_arg("source", ArgValue::String(format!("calc{}", node_count-1))));
-    edges.push(Edge::new(&format!("calc{}", node_count-1), out_id));
+    nodes.push(
+        Node::new(out_id, Opcode::Act)
+            .with_arg("type", "return".into())
+            .with_arg(
+                "source",
+                ArgValue::String(format!("calc{}", node_count - 1)),
+            ),
+    );
+    edges.push(Edge::new(&format!("calc{}", node_count - 1), out_id));
     ExecutionPlan::new(nodes, edges)
 }
 
@@ -124,30 +133,46 @@ fn main() {
     let exec = CompiledExecutor::new(&plan, &reg);
     let mut inputs = Context::new();
     inputs.set("x".into(), Value::Int(42));
-    run_bench("simple plan (3 nodes)", || {
-        let _result = exec.execute(inputs.clone()).unwrap();
-    }, 1000);
+    run_bench(
+        "simple plan (3 nodes)",
+        || {
+            let _result = exec.execute(inputs.clone()).unwrap();
+        },
+        1000,
+    );
 
     // 2. Decide plan (4 nodes, conditional branch)
     let plan = compile(decide_plan());
     let exec = CompiledExecutor::new(&plan, &reg);
-    run_bench("decide plan (4 nodes)", || {
-        let _result = exec.execute(inputs.clone()).unwrap();
-    }, 1000);
+    run_bench(
+        "decide plan (4 nodes)",
+        || {
+            let _result = exec.execute(inputs.clone()).unwrap();
+        },
+        1000,
+    );
 
     // 3. Chain of 10 CALC nodes
     let plan = compile(chain_plan(10));
     let exec = CompiledExecutor::new(&plan, &reg);
-    run_bench("chain 10 nodes", || {
-        let _result = exec.execute(inputs.clone()).unwrap();
-    }, 500);
+    run_bench(
+        "chain 10 nodes",
+        || {
+            let _result = exec.execute(inputs.clone()).unwrap();
+        },
+        500,
+    );
 
     // 4. Chain of 100 CALC nodes
     let plan = compile(chain_plan(100));
     let exec = CompiledExecutor::new(&plan, &reg);
-    run_bench("chain 100 nodes", || {
-        let _result = exec.execute(inputs.clone()).unwrap();
-    }, 100);
+    run_bench(
+        "chain 100 nodes",
+        || {
+            let _result = exec.execute(inputs.clone()).unwrap();
+        },
+        100,
+    );
 
     println!();
 }

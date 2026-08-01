@@ -9,12 +9,7 @@ fn main() {
 
     // Run flatc to generate Rust bindings
     let status = std::process::Command::new("flatc")
-        .args(&[
-            "--rust",
-            "-o",
-            &out_dir,
-            schema_path.to_str().unwrap(),
-        ])
+        .args(&["--rust", "-o", &out_dir, schema_path.to_str().unwrap()])
         .status()
         .expect("failed to run flatc — is flatbuffers-compiler installed?");
 

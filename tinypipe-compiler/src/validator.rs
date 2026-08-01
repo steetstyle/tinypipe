@@ -28,13 +28,13 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
     let index: HashMap<&str, &Node> = plan.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     // Build adjacency for reachability
-    let outgoing: HashMap<&str, Vec<&Edge>> = plan.edges.iter()
-        .fold(HashMap::new(), |mut acc, e| {
+    let outgoing: HashMap<&str, Vec<&Edge>> =
+        plan.edges.iter().fold(HashMap::new(), |mut acc, e| {
             acc.entry(e.from.as_str()).or_default().push(e);
             acc
         });
-    let incoming: HashMap<&str, Vec<&Edge>> = plan.edges.iter()
-        .fold(HashMap::new(), |mut acc, e| {
+    let incoming: HashMap<&str, Vec<&Edge>> =
+        plan.edges.iter().fold(HashMap::new(), |mut acc, e| {
             acc.entry(e.to.as_str()).or_default().push(e);
             acc
         });
@@ -81,13 +81,17 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
 
     // 4. Cycle detection (topological order)
     //    Back-edges to LOOP nodes are allowed (loop body → loop)
-    let loop_ids: HashSet<&str> = plan.nodes.iter()
+    let loop_ids: HashSet<&str> = plan
+        .nodes
+        .iter()
         .filter(|n| n.op == Opcode::Loop)
         .map(|n| n.id.as_str())
         .collect();
 
     // Build a cycle‑safe edge list: skip edges whose target is a LOOP node
-    let acyclic_edges: Vec<&Edge> = plan.edges.iter()
+    let acyclic_edges: Vec<&Edge> = plan
+        .edges
+        .iter()
         .filter(|e| !loop_ids.contains(e.to.as_str()))
         .collect();
 
@@ -98,7 +102,8 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
                     node_id: "<plan>".into(),
                     message: format!(
                         "topological order returned {} nodes but plan has {}",
-                        order.len(), plan.nodes.len()
+                        order.len(),
+                        plan.nodes.len()
                     ),
                 });
             }
@@ -112,7 +117,9 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
     }
 
     // 5. Reachability from INPUT nodes or nodes with no dependencies
-    let input_ids: Vec<&str> = plan.nodes.iter()
+    let input_ids: Vec<&str> = plan
+        .nodes
+        .iter()
         .filter(|n| n.op == Opcode::Input)
         .map(|n| n.id.as_str())
         .collect();
@@ -125,14 +132,17 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
     }
 
     // BFS from all INPUT nodes AND nodes with no incoming edges (constants, etc.)
-    let zero_indeg: Vec<&str> = plan.nodes.iter()
+    let zero_indeg: Vec<&str> = plan
+        .nodes
+        .iter()
         .filter(|n| !incoming.contains_key(n.id.as_str()))
         .map(|n| n.id.as_str())
         .collect();
 
     let reachable: HashSet<&str> = {
         let mut visited = HashSet::new();
-        let mut queue: VecDeque<&str> = input_ids.iter().chain(zero_indeg.iter()).copied().collect();
+        let mut queue: VecDeque<&str> =
+            input_ids.iter().chain(zero_indeg.iter()).copied().collect();
         while let Some(id) = queue.pop_front() {
             if !visited.insert(id) {
                 continue;
@@ -157,7 +167,9 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
 
     // 6. Terminal check: every path must eventually reach a terminal node
     // Terminal nodes: ACT (with type "return" or any side-effect type), ERROR
-    let terminal_ids: HashSet<&str> = plan.nodes.iter()
+    let terminal_ids: HashSet<&str> = plan
+        .nodes
+        .iter()
         .filter(|n| is_terminal_opcode(n.op))
         .map(|n| n.id.as_str())
         .collect();
@@ -171,7 +183,9 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
 
     // Identify LOOP node IDs — nodes that reach a LOOP can reach a terminal
     // through the LOOP's body (which must itself reach a terminal).
-    let loop_ids: HashSet<&str> = plan.nodes.iter()
+    let loop_ids: HashSet<&str> = plan
+        .nodes
+        .iter()
         .filter(|n| n.op == Opcode::Loop)
         .map(|n| n.id.as_str())
         .collect();
@@ -182,7 +196,8 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
         let mut bodies = HashSet::new();
         for loop_id in &loop_ids {
             if let Some(edges) = outgoing.get(loop_id) {
-                let body_starts: Vec<&str> = edges.iter()
+                let body_starts: Vec<&str> = edges
+                    .iter()
                     .filter(|e| e.condition.is_none() && e.kind == EdgeKind::Data)
                     .map(|e| e.to.as_str())
                     .collect();
@@ -195,7 +210,8 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
     };
 
     // Extended terminal set: actual terminals + LOOP nodes (which route to body → terminal)
-    let extended_terminals: HashSet<&str> = terminal_ids.iter()
+    let extended_terminals: HashSet<&str> = terminal_ids
+        .iter()
         .chain(loop_ids.iter())
         .copied()
         .collect();
@@ -210,7 +226,11 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
             continue; // LOOP body nodes terminate via loop exit
         }
         // Dead code: node has no outgoing edges — harmless
-        if outgoing.get(node.id.as_str()).map(|e| e.is_empty()).unwrap_or(true) {
+        if outgoing
+            .get(node.id.as_str())
+            .map(|e| e.is_empty())
+            .unwrap_or(true)
+        {
             continue;
         }
         if !can_reach_any(node.id.as_str(), &outgoing, &extended_terminals) {
@@ -228,7 +248,10 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
 
     // 8. Edge condition checks
     for node in &plan.nodes {
-        let out_edges = outgoing.get(node.id.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+        let out_edges = outgoing
+            .get(node.id.as_str())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         match node.op {
             Opcode::Decide | Opcode::Switch => {
                 // Branch nodes must have exactly 2 outgoing edges with conditions
@@ -241,8 +264,12 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
                         ),
                     });
                 }
-                let has_true = out_edges.iter().any(|e| e.condition.as_deref() == Some("true"));
-                let has_false = out_edges.iter().any(|e| e.condition.as_deref() == Some("false"));
+                let has_true = out_edges
+                    .iter()
+                    .any(|e| e.condition.as_deref() == Some("true"));
+                let has_false = out_edges
+                    .iter()
+                    .any(|e| e.condition.as_deref() == Some("false"));
                 if !has_true {
                     errors.push(ValidationError {
                         node_id: node.id.clone(),
@@ -286,7 +313,10 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
                     if e.condition.is_some() {
                         errors.push(ValidationError {
                             node_id: node.id.clone(),
-                            message: format!("PARALLEL edge to `{}` should not have a condition", e.to),
+                            message: format!(
+                                "PARALLEL edge to `{}` should not have a condition",
+                                e.to
+                            ),
                         });
                     }
                 }
@@ -296,7 +326,10 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
                 // - At most 1 DATA outgoing edge (no conditions on data edges)
                 // - INPUT nodes are EXEMPT (values can be read by many consumers)
                 // - CONTROL edges are allowed alongside a data edge (sequential flow)
-                let data_edges: Vec<_> = out_edges.iter().filter(|e| e.kind == EdgeKind::Data).collect();
+                let data_edges: Vec<_> = out_edges
+                    .iter()
+                    .filter(|e| e.kind == EdgeKind::Data)
+                    .collect();
                 if data_edges.len() > 1 && node.op != Opcode::Input {
                     errors.push(ValidationError {
                         node_id: node.id.clone(),
@@ -351,18 +384,20 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
         let mut subgraph_targets: Vec<String> = Vec::new();
         for node in &plan.nodes {
             if node.op == Opcode::Call {
-                if let Some(target) = node.args.iter()
-                    .find(|a| a.key == "target")
-                    .and_then(|a| match &a.value {
-                        tinypipe_ir::plan::ArgValue::String(s) => {
-                            if s.starts_with("subgraph:") {
-                                Some(s.clone())
-                            } else {
-                                None
+                if let Some(target) =
+                    node.args
+                        .iter()
+                        .find(|a| a.key == "target")
+                        .and_then(|a| match &a.value {
+                            tinypipe_ir::plan::ArgValue::String(s) => {
+                                if s.starts_with("subgraph:") {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
                             }
-                        }
-                        _ => None,
-                    })
+                            _ => None,
+                        })
                 {
                     subgraph_targets.push(target.clone());
 
@@ -463,8 +498,8 @@ fn topological_order<'a>(
     plan: &'a ExecutionPlan,
     edges: &[&Edge],
 ) -> Result<Vec<&'a Node>, String> {
-    let mut in_degree: HashMap<&str, usize> = plan.nodes.iter()
-        .map(|n| (n.id.as_str(), 0)).collect();
+    let mut in_degree: HashMap<&str, usize> =
+        plan.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
 
     for edge in edges {
         if let Some(deg) = in_degree.get_mut(edge.to.as_str()) {
@@ -472,7 +507,9 @@ fn topological_order<'a>(
         }
     }
 
-    let mut queue: Vec<&Node> = plan.nodes.iter()
+    let mut queue: Vec<&Node> = plan
+        .nodes
+        .iter()
         .filter(|n| in_degree.get(n.id.as_str()) == Some(&0))
         .collect();
 
@@ -481,11 +518,10 @@ fn topological_order<'a>(
     // Build an index for fast lookup
     let index: HashMap<&str, &Node> = plan.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     // Build outgoing adjacency from the filtered edge list
-    let outgoing: HashMap<&str, Vec<&&Edge>> = edges.iter()
-        .fold(HashMap::new(), |mut acc, e| {
-            acc.entry(e.from.as_str()).or_default().push(e);
-            acc
-        });
+    let outgoing: HashMap<&str, Vec<&&Edge>> = edges.iter().fold(HashMap::new(), |mut acc, e| {
+        acc.entry(e.from.as_str()).or_default().push(e);
+        acc
+    });
 
     while let Some(node) = queue.pop() {
         result.push(node);
@@ -572,14 +608,17 @@ fn validate_node_args(node: &Node, errors: &mut Vec<ValidationError>) {
 pub fn verify_cfg_flattening(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
 
-    let outgoing: HashMap<&str, Vec<&Edge>> = plan.edges.iter()
-        .fold(HashMap::new(), |mut acc, e| {
+    let outgoing: HashMap<&str, Vec<&Edge>> =
+        plan.edges.iter().fold(HashMap::new(), |mut acc, e| {
             acc.entry(e.from.as_str()).or_default().push(e);
             acc
         });
 
     for node in &plan.nodes {
-        let out_edges = outgoing.get(node.id.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+        let out_edges = outgoing
+            .get(node.id.as_str())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
 
         match node.op {
             Opcode::Decide | Opcode::Switch => {
@@ -587,7 +626,10 @@ pub fn verify_cfg_flattening(plan: &ExecutionPlan) -> Result<(), Vec<ValidationE
                 if out_edges.len() != 2 {
                     errors.push(ValidationError {
                         node_id: node.id.clone(),
-                        message: format!("CFG: DECIDE/SWITCH must have 2 outgoing edges, got {}", out_edges.len()),
+                        message: format!(
+                            "CFG: DECIDE/SWITCH must have 2 outgoing edges, got {}",
+                            out_edges.len()
+                        ),
                     });
                 }
             }
@@ -604,7 +646,10 @@ pub fn verify_cfg_flattening(plan: &ExecutionPlan) -> Result<(), Vec<ValidationE
                 if out_edges.len() < 2 {
                     errors.push(ValidationError {
                         node_id: node.id.clone(),
-                        message: format!("CFG: PARALLEL should have ≥2 outgoing edges, got {}", out_edges.len()),
+                        message: format!(
+                            "CFG: PARALLEL should have ≥2 outgoing edges, got {}",
+                            out_edges.len()
+                        ),
                     });
                 }
             }
@@ -612,14 +657,21 @@ pub fn verify_cfg_flattening(plan: &ExecutionPlan) -> Result<(), Vec<ValidationE
                 if out_edges.len() > 1 {
                     errors.push(ValidationError {
                         node_id: node.id.clone(),
-                        message: format!("CFG: non-branch node has {} outgoing edges", out_edges.len()),
+                        message: format!(
+                            "CFG: non-branch node has {} outgoing edges",
+                            out_edges.len()
+                        ),
                     });
                 }
             }
         }
     }
 
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────
@@ -647,12 +699,13 @@ mod tests {
                 make_node_with("n1", Opcode::Calc, &[("expr", "x + 1")]),
                 make_node_with("n2", Opcode::Act, &[("type", "return")]),
             ],
-            vec![
-                Edge::new("n0", "n1"),
-                Edge::new("n1", "n2"),
-            ],
+            vec![Edge::new("n0", "n1"), Edge::new("n1", "n2")],
         );
-        assert!(validate(&plan).is_ok(), "valid plan should pass: {:?}", validate(&plan));
+        assert!(
+            validate(&plan).is_ok(),
+            "valid plan should pass: {:?}",
+            validate(&plan)
+        );
     }
 
     #[test]
@@ -670,7 +723,11 @@ mod tests {
                 Edge::with_condition("n1", "n3", "false"),
             ],
         );
-        assert!(validate(&plan).is_ok(), "valid decide plan: {:?}", validate(&plan));
+        assert!(
+            validate(&plan).is_ok(),
+            "valid decide plan: {:?}",
+            validate(&plan)
+        );
     }
 
     #[test]
@@ -689,7 +746,11 @@ mod tests {
                 Edge::new("n1", "n3"),
             ],
         );
-        assert!(validate(&plan).is_ok(), "valid loop plan: {:?}", validate(&plan));
+        assert!(
+            validate(&plan).is_ok(),
+            "valid loop plan: {:?}",
+            validate(&plan)
+        );
     }
 
     #[test]
@@ -710,7 +771,11 @@ mod tests {
                 Edge::new("n3", "n4"),
             ],
         );
-        assert!(validate(&plan).is_ok(), "valid parallel plan: {:?}", validate(&plan));
+        assert!(
+            validate(&plan).is_ok(),
+            "valid parallel plan: {:?}",
+            validate(&plan)
+        );
     }
 
     #[test]
@@ -730,7 +795,11 @@ mod tests {
                 Edge::new("n3", "n4"),
             ],
         );
-        assert!(validate(&plan).is_ok(), "valid error plan: {:?}", validate(&plan));
+        assert!(
+            validate(&plan).is_ok(),
+            "valid error plan: {:?}",
+            validate(&plan)
+        );
     }
 
     // ── Invalid plans ────────────────────────────────────────────
@@ -745,8 +814,11 @@ mod tests {
             vec![],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("duplicate")),
-            "should detect duplicate, got: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("duplicate")),
+            "should detect duplicate, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -761,8 +833,11 @@ mod tests {
             ],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("unknown target")),
-            "should detect bad ref, got: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("unknown target")),
+            "should detect bad ref, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -778,8 +853,11 @@ mod tests {
             ],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("cycle")),
-            "should detect cycle, got: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("cycle")),
+            "should detect cycle, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -792,8 +870,11 @@ mod tests {
             vec![Edge::new("n0", "n1")],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("no INPUT")),
-            "should detect no INPUT, got: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("no INPUT")),
+            "should detect no INPUT, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -815,8 +896,12 @@ mod tests {
         // n3 has an outgoing edge? no — it's dead code with no outgoing edges.
         // The validator skips dead-code nodes (no outgoing edges) as harmless.
         // Instead, n1 correctly gets flagged for 2 data outgoing edges as a non-branch node.
-        assert!(err.iter().any(|e| e.message.contains("data outgoing edges")),
-            "should report multi-data-edge on n1, got: {:?}", err);
+        assert!(
+            err.iter()
+                .any(|e| e.message.contains("data outgoing edges")),
+            "should report multi-data-edge on n1, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -830,8 +915,11 @@ mod tests {
             vec![Edge::new("n0", "n1")],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("no terminal")),
-            "should detect no terminal, got: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("no terminal")),
+            "should detect no terminal, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -848,13 +936,17 @@ mod tests {
                 Edge::new("n0", "n1"),
                 Edge::new("n1", "n2"),
                 Edge::control("n1", "n3"), // control edge: n3 has outgoing edge (n3→n4) but still can't reach terminal
-                Edge::new("n3", "n4"), // n4 is dead code (no outgoing edges)
+                Edge::new("n3", "n4"),     // n4 is dead code (no outgoing edges)
             ],
         );
         let err = validate(&plan).unwrap_err();
         // n3 should be reported as not reaching a terminal (n4 is dead code, not a terminal)
-        assert!(err.iter().any(|e| e.node_id == "n3" && e.message.contains("cannot reach any terminal")),
-            "should report n3 as non-terminal, got: {:?}", err);
+        assert!(
+            err.iter()
+                .any(|e| e.node_id == "n3" && e.message.contains("cannot reach any terminal")),
+            "should report n3 as non-terminal, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -873,8 +965,11 @@ mod tests {
             ],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("missing `true`")),
-            "should detect missing true condition, got: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("missing `true`")),
+            "should detect missing true condition, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -892,8 +987,11 @@ mod tests {
             ],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("exactly 2")),
-            "should detect wrong edge count, got: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("exactly 2")),
+            "should detect wrong edge count, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -906,8 +1004,12 @@ mod tests {
             vec![Edge::new("n0", "n1")],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("missing required") && e.message.contains("name")),
-            "should detect missing name, got: {:?}", err);
+        assert!(
+            err.iter()
+                .any(|e| e.message.contains("missing required") && e.message.contains("name")),
+            "should detect missing name, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -926,8 +1028,11 @@ mod tests {
             ],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("non-branch node")),
-            "should detect excess edges, got: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("non-branch node")),
+            "should detect excess edges, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -940,8 +1045,12 @@ mod tests {
             vec![Edge::new("n0", "n1")],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("missing required") && e.message.contains("message")),
-            "should detect missing message, got: {:?}", err);
+        assert!(
+            err.iter()
+                .any(|e| e.message.contains("missing required") && e.message.contains("message")),
+            "should detect missing message, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -958,8 +1067,12 @@ mod tests {
             ],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("should not have a condition")),
-            "should detect condition on non-branch, got: {:?}", err);
+        assert!(
+            err.iter()
+                .any(|e| e.message.contains("should not have a condition")),
+            "should detect condition on non-branch, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -973,16 +1086,23 @@ mod tests {
             vec![Edge::new("n0", "n1"), Edge::new("n1", "n2")],
         );
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.node_id == "n1" && e.message.contains("missing required")),
-            "should detect missing args, got: {:?}", err);
+        assert!(
+            err.iter()
+                .any(|e| e.node_id == "n1" && e.message.contains("missing required")),
+            "should detect missing args, got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn detect_empty_plan() {
         let plan = ExecutionPlan::new(vec![], vec![]);
         let err = validate(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("zero nodes")),
-            "should detect empty plan, got: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("zero nodes")),
+            "should detect empty plan, got: {:?}",
+            err
+        );
     }
 
     // ── CFG Flattening verification ──────────────────────────────
@@ -1020,8 +1140,11 @@ mod tests {
             ],
         );
         let err = verify_cfg_flattening(&plan).unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("must have 2")),
-            "CFG: {:?}", err);
+        assert!(
+            err.iter().any(|e| e.message.contains("must have 2")),
+            "CFG: {:?}",
+            err
+        );
     }
 
     // ── End-to-end: transform + validate ─────────────────────────
@@ -1030,14 +1153,22 @@ mod tests {
     fn e2e_valid_graph() {
         let code = "def graph(x: int, y: int):\n    z = x + y\n    return z";
         let plan = crate::transform::transform(code).expect("transform should succeed");
-        assert!(validate(&plan).is_ok(), "valid graph should pass validation: {:?}", validate(&plan));
+        assert!(
+            validate(&plan).is_ok(),
+            "valid graph should pass validation: {:?}",
+            validate(&plan)
+        );
     }
 
     #[test]
     fn e2e_if_else_graph() {
         let code = "def graph(x: int):\n    if x > 0:\n        y = 1\n    else:\n        y = 2\n    return y";
         let plan = crate::transform::transform(code).expect("transform should succeed");
-        assert!(validate(&plan).is_ok(), "if-else graph: {:?}", validate(&plan));
+        assert!(
+            validate(&plan).is_ok(),
+            "if-else graph: {:?}",
+            validate(&plan)
+        );
     }
 
     #[test]
@@ -1053,7 +1184,10 @@ mod tests {
             eprintln!("  {} — {:?} — args: {:?}", n.id, n.op, n.args);
         }
         for e in &plan.edges {
-            eprintln!("  {} → {} (cond={:?}, kind={:?})", e.from, e.to, e.condition, e.kind);
+            eprintln!(
+                "  {} → {} (cond={:?}, kind={:?})",
+                e.from, e.to, e.condition, e.kind
+            );
         }
         let val = validate(&plan);
         eprintln!("Validation: {:?}", val);
