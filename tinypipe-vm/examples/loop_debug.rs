@@ -27,7 +27,7 @@ fn main() {
         ],
     );
     let compiled = CompiledPlan::from_execution_plan(&plan, vec![]);
-    let reg = tinypipe_vm::mock_tools();
+    let reg = tinypipe_tools::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
     let mut c = Context::new();
     c.set("x".into(), Value::Int(0));

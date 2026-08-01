@@ -1,0 +1,9 @@
+[package]
+name = "tinypipe-env"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Environment abstraction: layered providers (OS, .env file, static), module scoping, template resolution"
+
+[dependencies]
+thiserror.workspace = true

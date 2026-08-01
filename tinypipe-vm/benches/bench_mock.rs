@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use tinypipe_api::tool_registry::ToolRegistry;
 use tinypipe_api::types::{CallTarget, Context, Value};
-use tinypipe_vm::mock_tools;
+use tinypipe_tools::mock_tools;
 
 #[allow(dead_code)]
 struct BenchStats {
@@ -89,7 +89,7 @@ fn main() {
     run_bench(
         "dispatch 'math.add'",
         || {
-            let _result = reg.dispatch(&ct, &ctx).unwrap();
+            let _result = reg.dispatch(&ct, &ctx, &tinypipe_env::Env::empty()).unwrap();
         },
         10_000,
     );
@@ -100,7 +100,7 @@ fn main() {
     run_bench(
         "dispatch 'echo'",
         || {
-            let _result = reg.dispatch(&echo_ct, &ctx).unwrap();
+            let _result = reg.dispatch(&echo_ct, &ctx, &tinypipe_env::Env::empty()).unwrap();
         },
         10_000,
     );
@@ -110,7 +110,7 @@ fn main() {
     run_bench(
         "dispatch 'test.error' (error path)",
         || {
-            let _result = reg.dispatch(&err_ct, &ctx);
+            let _result = reg.dispatch(&err_ct, &ctx, &tinypipe_env::Env::empty());
         },
         10_000,
     );

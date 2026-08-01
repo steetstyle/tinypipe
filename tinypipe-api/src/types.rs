@@ -48,6 +48,13 @@ impl Value {
         }
     }
 
+    pub fn as_array(&self) -> Option<&[Value]> {
+        match self {
+            Value::Array(items) => Some(items.as_slice()),
+            _ => None,
+        }
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }

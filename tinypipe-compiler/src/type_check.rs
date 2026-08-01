@@ -171,7 +171,7 @@ fn validate_decide(
 }
 
 /// Validate a SWITCH node's case values.
-fn validate_switch(node: &Node) -> Result<(), String> {
+fn validate_switch(_node: &Node) -> Result<(), String> {
     // SWITCH source type should be compatible with case conditions
     // For now, just basic checks
     Ok(())

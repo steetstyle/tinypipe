@@ -49,6 +49,8 @@ enum NodeOutcome {
 pub struct CompiledExecutor<'a> {
     plan: &'a CompiledPlan,
     registry: &'a dyn ToolRegistry,
+    /// Çözülmüş ortam görünümü (tool'lara her dispatch'te iletilir).
+    env: std::sync::Arc<tinypipe_env::Env>,
     recursion_depth: AtomicU32,
     max_recursion_depth: u32,
     /// Pre-computed count of incoming Control edges per node index.
@@ -56,8 +58,18 @@ pub struct CompiledExecutor<'a> {
 }
 
 impl<'a> CompiledExecutor<'a> {
-    /// Create a new executor for the given compiled plan.
+    /// Create a new executor for the given compiled plan (boş env ile).
     pub fn new(plan: &'a CompiledPlan, registry: &'a dyn ToolRegistry) -> Self {
+        Self::with_env(plan, registry, std::sync::Arc::new(tinypipe_env::Env::empty()))
+    }
+
+    /// Create a new executor with an explicit environment view.
+    /// `env`: tool'ların `env.get` vb. ile okuyacağı ortam (scope'lu olabilir).
+    pub fn with_env(
+        plan: &'a CompiledPlan,
+        registry: &'a dyn ToolRegistry,
+        env: std::sync::Arc<tinypipe_env::Env>,
+    ) -> Self {
         let n = plan.nodes.len();
         let mut control_pred_count = vec![0u32; n];
         for edge in &plan.edges {
@@ -71,10 +83,16 @@ impl<'a> CompiledExecutor<'a> {
         CompiledExecutor {
             plan,
             registry,
+            env,
             recursion_depth: AtomicU32::new(0),
             max_recursion_depth: plan.metadata.max_recursion_depth,
             control_pred_count,
         }
+    }
+
+    /// Executor'ın ortam görünümü.
+    pub fn env(&self) -> &tinypipe_env::Env {
+        &self.env
     }
 
     /// Execute the compiled plan with the given input context.
@@ -444,13 +462,27 @@ impl<'a> CompiledExecutor<'a> {
 
         // Skip if not enabled by edge propagation
         if !enabled.contains(&node.index) {
+            tracing::trace!(
+                node = node.index,
+                op = ?node.op,
+                loop_skipped = loop_skipped.contains(&node.index),
+                "node not enabled — skipped"
+            );
             return Ok(NodeOutcome::Ok);
         }
+
+        tracing::trace!(node = node.index, op = ?node.op, "node executing");
 
         // Check control-flow dependencies: all control predecessors must have completed.
         let idx = node.index as usize;
         let n = self.plan.nodes.len();
         if idx < n && control_satisfied[idx].get() < self.control_pred_count[idx] {
+            tracing::trace!(
+                node = node.index,
+                got = control_satisfied[idx].get(),
+                need = self.control_pred_count[idx],
+                "control predecessor(s) pending — deferred"
+            );
             // Control predecessors not yet complete — defer execution.
             // This ensures sequential ordering: e.g., a statement after an if/else
             // with an early-return branch only executes when the fall-through path
@@ -487,7 +519,7 @@ impl<'a> CompiledExecutor<'a> {
                     .args
                     .iter()
                     .find(|a| a.key == "name")
-                    .map(|a| a.value.trim_matches('"'))
+                    .map(|a| trim_quotes(&a.value))
                     .unwrap_or(&node.id);
                 let default = node.args.iter().find(|a| a.key == "default");
                 if let Some(val) = ctx.get(name) {
@@ -510,14 +542,14 @@ impl<'a> CompiledExecutor<'a> {
                 let result = eval_expression(expr, ctx, node_outputs)?;
                 node_outputs.insert(node.index, result.clone());
                 // Output arg writes result to context for downstream nodes
-                if let Some(output_name) = node
+                if let Some(output_var) = node
                     .args
                     .iter()
                     .find(|a| a.key == "output")
-                    .map(|a| a.value.trim_matches('"'))
+                    .map(|a| trim_quotes(&a.value))
                 {
-                    if !output_name.is_empty() {
-                        ctx.set(output_name.to_owned(), result);
+                    if !output_var.is_empty() {
+                        ctx.set(output_var.to_owned(), result);
                     }
                 }
                 self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
@@ -528,18 +560,18 @@ impl<'a> CompiledExecutor<'a> {
                     .args
                     .iter()
                     .find(|a| a.key == "target")
-                    .map(|a| a.value.trim_matches('"'))
+                    .map(|a| trim_quotes(&a.value))
                     .unwrap_or("unknown");
-                let output_name = node
+                let output_var = node
                     .args
                     .iter()
-                    .find(|a| a.key == "output_name")
-                    .map(|a| a.value.trim_matches('"'));
+                    .find(|a| a.key == "output")
+                    .map(|a| trim_quotes(&a.value));
 
                 let mut params = HashMap::new();
                 for arg in &node.args {
                     if arg.key == "target"
-                        || arg.key == "output_name"
+                        || arg.key == "output"
                         || arg.key == "on_error"
                         || arg.key == "fallback_value"
                     {
@@ -552,23 +584,35 @@ impl<'a> CompiledExecutor<'a> {
                 // ── Subgraph dispatch (v2) ─────────────────────────────
                 if target.starts_with("subgraph:") {
                     let subgraph_name = target.trim_start_matches("subgraph:");
+                    // Explicit kwargs child input'a override olarak gider
+                    // (çağıranın ctx'inden daha öncelikli).
+                    let mut sub_input = ctx.clone();
+                    for (k, v) in &params {
+                        sub_input.set(k.clone(), v.clone());
+                    }
                     if self.recursion_depth.load(Ordering::SeqCst) >= self.max_recursion_depth {
                         return Err(ExecutionError::RecursionLimitExceeded(subgraph_name.into()));
                     }
                     self.recursion_depth.fetch_add(1, Ordering::SeqCst);
                     let subgraph_result = self
                         .registry
-                        .execute_subgraph(subgraph_name, ctx.clone())
+                        .execute_subgraph(subgraph_name, sub_input, &self.env)
                         .map_err(|e| {
                             ExecutionError::CallFailed(subgraph_name.into(), e.to_string())
                         });
                     self.recursion_depth.fetch_sub(1, Ordering::SeqCst);
-                    let subgraph_ctx = subgraph_result?;
+                    let subgraph_result = subgraph_result?;
+                    let subgraph_ctx = subgraph_result.context;
+                    let subgraph_output = subgraph_result.output;
                     // Merge subgraph context into current context
                     for (k, v) in subgraph_ctx.variables {
                         ctx.set(k, v);
                     }
-                    node_outputs.insert(node.index, Value::Null);
+                    // Subgraph return value becomes the call expression's value
+                    if let Some(name) = output_var {
+                        ctx.set(name.to_string(), subgraph_output.clone());
+                    }
+                    node_outputs.insert(node.index, subgraph_output);
                     self.propagate_edges(node, ctx, node_outputs, enabled, control_satisfied)?;
                     return Ok(NodeOutcome::Ok);
                 }
@@ -603,9 +647,9 @@ impl<'a> CompiledExecutor<'a> {
                     }
                 }
 
-                match self.registry.dispatch(&call_target, ctx) {
+                match self.registry.dispatch(&call_target, ctx, &self.env) {
                     Ok(val) => {
-                        if let Some(name) = output_name {
+                        if let Some(name) = output_var {
                             ctx.set(name.to_string(), val.clone());
                         }
                         node_outputs.insert(node.index, val);
@@ -615,7 +659,7 @@ impl<'a> CompiledExecutor<'a> {
                             .args
                             .iter()
                             .find(|a| a.key == "on_error")
-                            .map(|a| a.value.trim_matches('"'))
+                            .map(|a| trim_quotes(&a.value))
                             .unwrap_or("abort");
                         let err_val = match on_error {
                             "continue_with_null" => Value::Null,
@@ -634,7 +678,7 @@ impl<'a> CompiledExecutor<'a> {
                                 ));
                             }
                         };
-                        if let Some(name) = output_name {
+                        if let Some(name) = output_var {
                             ctx.set(name.to_string(), err_val.clone());
                         }
                         node_outputs.insert(node.index, err_val);
@@ -655,7 +699,7 @@ impl<'a> CompiledExecutor<'a> {
                     .args
                     .iter()
                     .find(|a| a.key == "op")
-                    .map(|a| a.value.trim_matches('"').to_string())
+                    .map(|a| trim_quotes(&a.value).to_string())
                     .unwrap_or_default();
                 let cmp_val = node
                     .args
@@ -671,7 +715,7 @@ impl<'a> CompiledExecutor<'a> {
                     .args
                     .iter()
                     .find(|a| a.key == "condition")
-                    .map(|a| a.value.trim_matches('"'))
+                    .map(|a| trim_quotes(&a.value))
                 {
                     eval_expression(cond, ctx, node_outputs)
                         .map(|v| is_truthy(&v))
@@ -688,7 +732,7 @@ impl<'a> CompiledExecutor<'a> {
                     .args
                     .iter()
                     .find(|a| a.key == "type" || a.key == "action_type")
-                    .map(|a| a.value.trim_matches('"').to_string())
+                    .map(|a| trim_quotes(&a.value).to_string())
                     .unwrap_or_default();
                 let act_output = Value::String(format!("[ACT:{}]", action_type));
                 node_outputs.insert(node.index, act_output);
@@ -984,6 +1028,7 @@ impl<'a> CompiledExecutor<'a> {
             }
 
             Opcode::Loop => {
+                tracing::trace!(node = node.index, "loop dispatch");
                 return self.run_loop(
                     node,
                     ctx,
@@ -1038,7 +1083,7 @@ impl<'a> CompiledExecutor<'a> {
                     .args
                     .iter()
                     .find(|a| a.key == "message")
-                    .map(|a| a.value.trim_matches('"').to_string())
+                    .map(|a| trim_quotes(&a.value).to_string())
                     .unwrap_or_else(|| "execution error".into());
                 return Err(ExecutionError::Custom(msg));
             }
@@ -1079,27 +1124,39 @@ impl<'a> CompiledExecutor<'a> {
             .args
             .iter()
             .find(|a| a.key == "target")
-            .map(|a| a.value.trim_matches('"').to_string());
+            .map(|a| trim_quotes(&a.value).to_string());
 
-        // Find body node indices — nodes reachable from LOOP via edges without condition
-        let mut body_indices: Vec<u32> = Vec::new();
+        tracing::trace!(
+            node = node.index,
+            target = ?target_name,
+            max_iterations = max_iter,
+            cursor = ?loop_cursor,
+            "loop start"
+        );
+
+        // Compiler konvansiyonu: LOOP'un çoklu DATA edge'i body entry'leridir (loop
+        // değişkenini okuyan her body node'una bir DATA edge) ve devam tek CONTROL
+        // edge'idir. Body set: DATA anchor'larından ulaşılabilenler − CONTROL
+        // devamından ulaşılabilenler.
+        let mut continuation_anchors: Vec<u32> = Vec::new();
+        let mut data_anchors: Vec<u32> = Vec::new();
         for edge in &self.plan.edges {
             if edge.from_index == node.index && edge.condition.is_none() {
-                body_indices.push(edge.to_index);
+                match edge.kind {
+                    EdgeKind::Control => continuation_anchors.push(edge.to_index),
+                    _ => data_anchors.push(edge.to_index),
+                }
             }
         }
 
-        if !body_indices.is_empty() {
-            // Collect body nodes reachable from the FIRST unconditional body edge.
-            // The LOOP node also emits an unconditional continuation edge (to the
-            // next statement after the loop) — including it here would swallow the
-            // continuation into the body set and it would never run in the main pass.
-            let mut body_set: HashSet<u32> = self.collect_reachable_indices(&[body_indices[0]]);
-            if body_indices.len() > 1 {
-                // Continuation hedeflerinden ulaşılabilenler body'den çıkarılır
-                // (compiler plan'larında `return x` body'den reachable olabilir).
+        if !data_anchors.is_empty() {
+            let mut body_set: HashSet<u32> = HashSet::new();
+            for to in &data_anchors {
+                body_set.extend(self.collect_reachable_indices(&[*to]));
+            }
+            if !continuation_anchors.is_empty() {
                 let mut continuation: HashSet<u32> = HashSet::new();
-                for to in &body_indices[1..] {
+                for to in &continuation_anchors {
                     continuation.extend(self.collect_reachable_indices(&[*to]));
                 }
                 body_set = body_set.difference(&continuation).copied().collect();
@@ -1124,6 +1181,12 @@ impl<'a> CompiledExecutor<'a> {
                 if let Some(ref name) = target_name {
                     ctx.set(name.clone(), Value::Int(iteration as i64));
                 }
+                tracing::trace!(
+                    node = node.index,
+                    iteration,
+                    body_nodes = body_vec.len(),
+                    "loop iteration"
+                );
                 // Check for break condition via DECIDE node in body
                 let mut should_break = false;
 
@@ -1159,14 +1222,14 @@ impl<'a> CompiledExecutor<'a> {
                             let result = eval_expression(expr, ctx, node_outputs)?;
                             node_outputs.insert(body_node.index, result.clone());
                             // Output arg writes result to context (loop body persists state)
-                            if let Some(output_name) = body_node
+                            if let Some(output_var) = body_node
                                 .args
                                 .iter()
                                 .find(|a| a.key == "output")
-                                .map(|a| a.value.trim_matches('"'))
+                                .map(|a| trim_quotes(&a.value))
                             {
-                                if !output_name.is_empty() {
-                                    ctx.set(output_name.to_owned(), result);
+                                if !output_var.is_empty() {
+                                    ctx.set(output_var.to_owned(), result);
                                 }
                             }
                         }
@@ -1175,21 +1238,57 @@ impl<'a> CompiledExecutor<'a> {
                                 .args
                                 .iter()
                                 .find(|a| a.key == "target")
-                                .map(|a| a.value.trim_matches('"'))
+                                .map(|a| trim_quotes(&a.value))
                                 .unwrap_or("unknown");
-                            let output_name = body_node
+                            let output_var = body_node
                                 .args
                                 .iter()
-                                .find(|a| a.key == "output_name")
-                                .map(|a| a.value.trim_matches('"'));
+                                .find(|a| a.key == "output")
+                                .map(|a| trim_quotes(&a.value));
 
                             let mut params = HashMap::new();
                             for arg in &body_node.args {
-                                if arg.key == "target" || arg.key == "output_name" {
+                                if arg.key == "target" || arg.key == "output" {
                                     continue;
                                 }
                                 let val = resolve_arg_value(&arg.value, ctx, node_outputs);
                                 params.insert(arg.key.clone(), val);
+                            }
+
+                            // ── Subgraph dispatch (loop body) ───────────────
+                            if target.starts_with("subgraph:") {
+                                let subgraph_name = target.trim_start_matches("subgraph:");
+                                let mut sub_input = ctx.clone();
+                                for (k, v) in &params {
+                                    sub_input.set(k.clone(), v.clone());
+                                }
+                                if self.recursion_depth.load(Ordering::SeqCst)
+                                    >= self.max_recursion_depth
+                                {
+                                    return Err(ExecutionError::RecursionLimitExceeded(
+                                        subgraph_name.into(),
+                                    ));
+                                }
+                                self.recursion_depth.fetch_add(1, Ordering::SeqCst);
+                                let subgraph_result = self
+                                    .registry
+                                    .execute_subgraph(subgraph_name, sub_input, &self.env)
+                                    .map_err(|e| {
+                                        ExecutionError::CallFailed(
+                                            subgraph_name.into(),
+                                            e.to_string(),
+                                        )
+                                    });
+                                self.recursion_depth.fetch_sub(1, Ordering::SeqCst);
+                                let subgraph_result = subgraph_result?;
+                                for (k, v) in subgraph_result.context.variables {
+                                    ctx.set(k, v);
+                                }
+                                if let Some(name) = output_var {
+                                    ctx.set(name.to_string(), subgraph_result.output.clone());
+                                }
+                                node_outputs.insert(body_node.index, subgraph_result.output);
+                                continue;
                             }
 
                             let ct = tinypipe_api::types::CallTarget {
@@ -1198,9 +1297,9 @@ impl<'a> CompiledExecutor<'a> {
                                 kwargs: params,
                             };
 
-                            match self.registry.dispatch(&ct, ctx) {
+                            match self.registry.dispatch(&ct, ctx, &self.env) {
                                 Ok(val) => {
-                                    if let Some(name) = output_name {
+                                    if let Some(name) = output_var {
                                         ctx.set(name.to_string(), val.clone());
                                     }
                                     node_outputs.insert(body_node.index, val);
@@ -1224,7 +1323,7 @@ impl<'a> CompiledExecutor<'a> {
                                 .args
                                 .iter()
                                 .find(|a| a.key == "op")
-                                .map(|a| a.value.trim_matches('"').to_string())
+                                .map(|a| trim_quotes(&a.value).to_string())
                                 .unwrap_or_default();
                             let cmp_val = body_node
                                 .args
@@ -1247,7 +1346,7 @@ impl<'a> CompiledExecutor<'a> {
                                 .args
                                 .iter()
                                 .find(|a| a.key == "name")
-                                .map(|a| a.value.trim_matches('"'))
+                                .map(|a| trim_quotes(&a.value))
                                 .unwrap_or(&body_node.id);
                             if let Some(val) = ctx.get(name) {
                                 node_outputs.insert(body_node.index, val.clone());
@@ -1258,7 +1357,7 @@ impl<'a> CompiledExecutor<'a> {
                                 .args
                                 .iter()
                                 .find(|a| a.key == "type" || a.key == "action_type")
-                                .map(|a| a.value.trim_matches('"').to_string())
+                                .map(|a| trim_quotes(&a.value).to_string())
                                 .unwrap_or_default();
                             if action_type == "return" {
                                 // Early return from loop
@@ -1388,12 +1487,15 @@ impl<'a> CompiledExecutor<'a> {
             }
 
             if edge.kind == EdgeKind::Control {
-                // Control edges: increment the target's control_satisfied counter.
-                // The target also needs its data edges satisfied before it can execute.
+                // Control edges: increment the target's control_satisfied counter
+                // AND enable it. The target also needs its data edges satisfied
+                // before it can execute — a node whose ONLY incoming edges are
+                // control (e.g. a constant assignment `total = 0`) must still run.
                 let to = edge.to_index as usize;
                 if to < control_satisfied.len() {
                     control_satisfied[to].set(control_satisfied[to].get() + 1);
                 }
+                enabled.insert(edge.to_index);
                 continue;
             }
 
@@ -1429,24 +1531,22 @@ impl<'a> CompiledExecutor<'a> {
             }
             // Find unconditional outgoing edges from this LOOP (body entry points)
             let mut body_starts: Vec<u32> = Vec::new();
+            let mut control_starts: Vec<u32> = Vec::new();
             for edge in &self.plan.edges {
                 if edge.from_index == node.index && edge.condition.is_none() {
-                    body_starts.push(edge.to_index);
+                    match edge.kind {
+                        EdgeKind::Control => control_starts.push(edge.to_index),
+                        _ => body_starts.push(edge.to_index),
+                    }
                 }
             }
-            if body_starts.is_empty() {
-                continue;
+            let mut body_set: HashSet<u32> = HashSet::new();
+            for to in &body_starts {
+                body_set.extend(self.collect_reachable_indices(&[*to]));
             }
-            // Sadece İLK unconditional edge'den ulaşılabilenler body set'idir;
-            // devam edge'i (loop'tan sonraki statement) body'e karışmamalı.
-            let mut body_set: HashSet<u32> = self.collect_reachable_indices(&body_starts[..1]);
-            if body_starts.len() > 1 {
-                // Continuation hedefleri (ilk hariç tüm unconditional edge'ler):
-                // bunlardan ulaşılabilen node'lar loop'tan SONRA çalışır.
-                // Compiler plan'larında continuation node'u body'den reachable
-                // olabilir (örn. `return x`), bu yüzden body'den çıkarılmalı.
+            if !control_starts.is_empty() {
                 let mut continuation: HashSet<u32> = HashSet::new();
-                for to in &body_starts[1..] {
+                for to in &control_starts {
                     continuation.extend(self.collect_reachable_indices(&[*to]));
                 }
                 body_set = body_set.difference(&continuation).copied().collect();
@@ -1514,12 +1614,32 @@ impl<'a> CompiledExecutor<'a> {
 // ─── Expression evaluation helpers ───────────────────────────────────
 
 /// Simple expression evaluator for CALC nodes and edge conditions.
-fn eval_expression(
+pub fn eval_expression(
     expr: &str,
     ctx: &Context,
     outputs: &HashMap<u32, Value>,
 ) -> Result<Value, ExecutionError> {
-    let expr = expr.trim().trim_matches('"');
+    let trimmed = expr.trim();
+    // JSON-quoted (eski FB formatı: `"\"x + 1\""`) veya plain-quoted (`"GET"`) olabilir.
+    let decoded: String;
+    let was_quoted = if let Ok(s) = serde_json::from_str::<String>(trimmed) {
+        decoded = s;
+        true
+    } else if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+        && !is_concat_expr(trimmed)
+    {
+        decoded = trimmed[1..trimmed.len() - 1].to_string();
+        true
+    } else {
+        decoded = trimmed.to_string();
+        false
+    };
+    let expr = decoded.as_str();
+    if expr.is_empty() {
+        return Ok(Value::Null);
+    }
     if expr.is_empty() {
         return Ok(Value::Null);
     }
@@ -1558,11 +1678,31 @@ fn eval_expression(
         return Ok(Value::Null);
     }
 
-    // String literal
-    if expr.starts_with('"') && expr.ends_with('"')
-        || expr.starts_with('\'') && expr.ends_with('\'')
-    {
-        return Ok(Value::String(expr[1..expr.len() - 1].to_owned()));
+    // Dict literal: {key: value, ...} — e.g. return {"users": user_count}
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if inner.trim().is_empty() {
+            return Ok(Value::Object(HashMap::new()));
+        }
+        let mut map = HashMap::new();
+        for pair in split_top_level_commas(inner) {
+            let Some((k, v)) = pair.split_once(':') else {
+                return Err(ExecutionError::EvalError(format!(
+                    "cannot evaluate: {}",
+                    expr
+                )));
+            };
+            let key = trim_quotes(k.trim());
+            if key.is_empty() {
+                return Err(ExecutionError::EvalError(format!(
+                    "cannot evaluate: {}",
+                    expr
+                )));
+            }
+            let value = eval_expression(v.trim(), ctx, outputs)?;
+            map.insert(key.to_string(), value);
+        }
+        return Ok(Value::Object(map));
     }
 
     // Not operator
@@ -1657,13 +1797,62 @@ fn eval_expression(
         }
     }
 
+    // String concatenation (f-string destek): "a" + "b", "postId=" + i.
+    if let Some(pos) = expr.find('+') {
+        if pos > 0 && pos < expr.len() - 1 {
+            let left = expr[..pos].trim();
+            let right = expr[pos + 1..].trim();
+            if let (Ok(a), Ok(b)) = (eval_expression(left, ctx, outputs), eval_expression(right, ctx, outputs)) {
+                let a_str = concat_part(&a);
+                let b_str = concat_part(&b);
+                if a_str.is_some() || b_str.is_some() {
+                    return Ok(Value::String(format!(
+                        "{}{}",
+                        a_str.unwrap_or_default(),
+                        b_str.unwrap_or_default()
+                    )));
+                }
+            }
+        }
+    }
+
+    // Attribute access: obj.field → Object'ten alan okuma (r.body gibi).
+    // Float parse önce yapıldığı için 3.14 buraya düşmez.
+    if let Some(dot) = expr.rfind('.') {
+        if dot > 0 && dot < expr.len() - 1 {
+            let base = &expr[..dot];
+            let field = &expr[dot + 1..];
+            if let Ok(base_val) = eval_expression(base, ctx, outputs) {
+                match base_val {
+                    Value::Object(m) => {
+                        if let Some(v) = m.get(field) {
+                            return Ok(v.clone());
+                        }
+                    }
+                    Value::Array(items) => {
+                        if let Ok(idx) = field.parse::<usize>() {
+                            if let Some(v) = items.get(idx) {
+                                return Ok(v.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if was_quoted {
+        // Quoted string literal — ifade olarak değerlendirilemedi, string olarak dön.
+        return Ok(Value::String(expr.to_string()));
+    }
     Err(ExecutionError::EvalError(format!(
         "cannot evaluate: {}",
         expr
     )))
 }
 
-fn resolve_numeric(key: &str, ctx: &Context, _outputs: &HashMap<u32, Value>) -> Option<i64> {
+fn resolve_numeric(key: &str, ctx: &Context, outputs: &HashMap<u32, Value>) -> Option<i64> {
     // Try direct parse
     if let Ok(n) = key.parse::<i64>() {
         return Some(n);
@@ -1675,19 +1864,36 @@ fn resolve_numeric(key: &str, ctx: &Context, _outputs: &HashMap<u32, Value>) -> 
             return Some(f as i64);
         }
     }
+    // Attribute/subscript expressions: "c.count" — evaluate like eval_expression
+    if key.contains('.') || key.contains('[') {
+        if let Ok(val) = eval_expression(key, ctx, outputs) {
+            if let Some(f) = val.as_f64() {
+                return Some(f as i64);
+            }
+        }
+    }
     None
 }
 
-fn resolve_arg_value(value_str: &str, ctx: &Context, _outputs: &HashMap<u32, Value>) -> Value {
+/// Çift tırnakları ve JSON-escape'li tırnakları (`\"`) sıyırır.
+/// Eski FB formatı `"\"http_request\""` → `http_request`, yeni format `"http_request"` → `http_request`.
+fn trim_quotes(value: &str) -> &str {
+    value.trim_matches(|c| c == '"' || c == '\\')
+}
+
+pub fn resolve_arg_value(value_str: &str, ctx: &Context, outputs: &HashMap<u32, Value>) -> Value {
     let s = value_str.trim();
     // Strip JSON string quotes for context lookup
-    let clean = s
-        .strip_prefix('"')
-        .and_then(|t| t.strip_suffix('"'))
-        .unwrap_or(s);
+    let clean = trim_quotes(s);
     // Try context first (e.g. source="x" → ctx.get("x"))
     if let Some(val) = ctx.get(clean) {
         return val.clone();
+    }
+    // f-string concat: "https://x/" + id → expression evaluation
+    if is_concat_expr(s) {
+        if let Ok(val) = eval_expression(s, ctx, outputs) {
+            return val;
+        }
     }
     if s.starts_with('"') && s.ends_with('"') {
         Value::String(clean.to_string())
@@ -1703,9 +1909,78 @@ fn resolve_arg_value(value_str: &str, ctx: &Context, _outputs: &HashMap<u32, Val
         Value::Null
     } else if let Some(val) = ctx.get(s) {
         val.clone()
+    } else if let Ok(val) = eval_expression(s, ctx, outputs) {
+        // Attr erişimi gibi basit ifadeler (users_resp.body) değerlendirilir
+        val
     } else {
+        // Plan-içi tırnaksız token'lar (target=call, tool adları vb.) bu yoldan
+        // geçerek literal string'e döner — bu normaldir. Ama tanımsız bir
+        // değişken adı (users_resp.bady) da buraya düşer; debug log'u yazım
+        // hatası ayıklamasında işe yarar.
+        tracing::debug!(
+            arg = s,
+            "resolve_arg_value: token resolved as literal string (no ctx/eval match)"
+        );
         Value::String(s.to_string())
     }
+}
+
+/// Bir değeri string concat için uygun biçimde döndürür (null değilse).
+fn concat_part(v: &Value) -> Option<String> {
+    match v {
+        Value::Null => None,
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Int(i) => Some(i.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        Value::String(s) => Some(s.clone()),
+        Value::Array(_) => None,
+        Value::Object(_) => None,
+    }
+}
+
+/// `"..." + ...` veya `'...' + ...` şeklinde f-string concat ifadesi mi?
+pub fn is_concat_expr(s: &str) -> bool {
+    s.contains("\" +") || s.contains("' +")
+}
+
+/// Bir string'i quote'ları ve iç içe parantezleri sayarak üst seviye virgüllerden böler
+/// (dict literal değerlerinde `"SELECT a, b FROM t"` gibi string içi virgüller korunur).
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut current = String::new();
+    for c in s.chars() {
+        if let Some(q) = quote {
+            current.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                current.push(c);
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current);
+    }
+    parts
 }
 
 fn format_value(v: &Value) -> String {
@@ -1860,10 +2135,10 @@ pub(crate) fn compare_values(a: &Value, b: &Value, cmp: fn(f64, f64) -> bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::mock_tools;
     use tinypipe_api::types::MergeStrategy;
     use tinypipe_ir::compiled::CompiledPlan;
     use tinypipe_ir::plan::{Edge, ExecutionPlan, Node, Opcode};
+    use tinypipe_tools::mock_tools;
 
     fn compile_plan(plan: ExecutionPlan) -> CompiledPlan {
         CompiledPlan::from_execution_plan(&plan, vec![])
@@ -1993,6 +2268,64 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_execute_subgraph_output_and_merge() {
+        // call("subgraph:echo", ...) → çocuk grafiğin return değeri call ifadesinin
+        // değeri olur (output_var), çocuk ctx'i de çağıran ctx'e merge edilir.
+        let plan = ExecutionPlan::new(
+            vec![
+                Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
+                Node::new("call1", Opcode::Call)
+                    .with_arg("type", "call".into())
+                    .with_arg("target", "subgraph:echo".into())
+                    .with_arg("output", "res".into()),
+                Node::new("output1", Opcode::Act)
+                    .with_arg("type", "return".into())
+                    .with_arg("value", "res".into()),
+            ],
+            vec![
+                Edge::new("input1", "call1"),
+                Edge::new("call1", "output1"),
+            ],
+        );
+        let compiled = compile_plan(plan);
+        let registry = mock_tools();
+        let executor = CompiledExecutor::new(&compiled, &registry);
+        let mut inputs = Context::new();
+        inputs.set("x".into(), Value::Int(5));
+        let result = executor.execute(inputs).expect("execution should succeed");
+        assert_eq!(result.output, Some(Value::String("echo!".into())));
+        // Subgraph ctx merge: çocuğun "output" değişkeni çağıran ctx'e geçti
+        assert_eq!(
+            result.context.variables.get("output"),
+            Some(&Value::String("echo!".into()))
+        );
+    }
+
+    #[test]
+    fn test_compiled_execute_subgraph_recursion_limit() {
+        // max_recursion_depth=0 → subgraph çağrısı derhal RecursionLimitExceeded
+        let mut plan = ExecutionPlan::new(
+            vec![
+                Node::new("call1", Opcode::Call)
+                    .with_arg("type", "call".into())
+                    .with_arg("target", "subgraph:echo".into()),
+                Node::new("output1", Opcode::Act)
+                    .with_arg("type", "return".into())
+                    .with_arg("value", "\"done\"".into()),
+            ],
+            vec![Edge::new("call1", "output1")],
+        );
+        plan.metadata.max_recursion_depth = 0;
+        let compiled = compile_plan(plan);
+        let registry = mock_tools();
+        let executor = CompiledExecutor::new(&compiled, &registry);
+        let err = executor
+            .execute(Context::new())
+            .expect_err("recursion limit must trip");
+        assert!(err.to_string().contains("recursion"));
+    }
+
+    #[test]
     fn test_compiled_execute_decide_true_branch() {
         let plan = ExecutionPlan::new(
             vec![
@@ -2079,9 +2412,113 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_expression_string_literal() {
+        // string literal'ler Calc node'larında değerlendirilebilmelidir
+        // (tırnak sıyırma ölü kod olmamalı — "cannot evaluate" regresyonu).
+        let ctx = Context::new();
+        let outputs = HashMap::new();
+        let v = eval_expression("\"GET\"", &ctx, &outputs).unwrap();
+        assert_eq!(v, Value::String("GET".into()));
+        let v = eval_expression("'POST'", &ctx, &outputs).unwrap();
+        assert_eq!(v, Value::String("POST".into()));
+    }
+
+    #[test]
+    fn test_eval_expression_dict_literal() {
+        // return {"users": user_count, ...} — dict literal'ler değerlendirilebilmelidir.
+        let mut ctx = Context::new();
+        ctx.set("users".into(), Value::Int(10));
+        ctx.set("done".into(), Value::Int(11));
+        let outputs = HashMap::new();
+        let v = eval_expression(
+            "{\"users\": users, \"posts\": 3, \"done\": done}",
+            &ctx,
+            &outputs,
+        )
+        .unwrap();
+        let Value::Object(map) = v else {
+            panic!("dict literal must evaluate to Object");
+        };
+        assert_eq!(map.get("users"), Some(&Value::Int(10)));
+        assert_eq!(map.get("posts"), Some(&Value::Int(3)));
+        assert_eq!(map.get("done"), Some(&Value::Int(11)));
+
+        // String içinde virgül bulunan değerler üst seviye bölme ile bozulmamalı
+        let v = eval_expression(
+            "{\"q\": \"SELECT a, b FROM t\", \"n\": 5}",
+            &ctx,
+            &outputs,
+        )
+        .unwrap();
+        let Value::Object(map) = v else {
+            panic!("dict literal must evaluate to Object");
+        };
+        assert_eq!(
+            map.get("q"),
+            Some(&Value::String("SELECT a, b FROM t".into()))
+        );
+        assert_eq!(map.get("n"), Some(&Value::Int(5)));
+
+        // Boş dict
+        let v = eval_expression("{}", &ctx, &outputs).unwrap();
+        assert_eq!(v, Value::Object(HashMap::new()));
+    }
+
+    #[test]
+    fn test_eval_expression_numeric_with_attr() {
+        // `total + c.count` gibi attribute içeren toplamalar numerik olmalı
+        // (concat'e düşmemeli — resolve_numeric attr ifadelerini çözer).
+        let mut ctx = Context::new();
+        ctx.set("total".into(), Value::Int(0));
+        let mut c = HashMap::new();
+        c.insert("count".to_string(), Value::Int(5));
+        ctx.set("c".into(), Value::Object(c));
+        let outputs = HashMap::new();
+        let v = eval_expression("total + c.count", &ctx, &outputs).unwrap();
+        assert_eq!(v, Value::Int(5));
+        let v = eval_expression("total + c.count + 2", &ctx, &outputs).unwrap();
+        assert_eq!(v, Value::Int(7));
+    }
+
+    #[test]
+    fn test_eval_expression_string_concat() {
+        // f-string'lerin ürettiği `"..." + expr` ifadeleri değerlendirilebilmelidir.
+        let ctx = Context::new();
+        let outputs = HashMap::new();
+        let v = eval_expression("\"a\" + \"b\"", &ctx, &outputs).unwrap();
+        assert_eq!(v, Value::String("ab".into()));
+        let v = eval_expression("\"postId=\" + 3", &ctx, &outputs).unwrap();
+        assert_eq!(v, Value::String("postId=3".into()));
+        let v = eval_expression("\"x=\" + 7 + \"y\"", &ctx, &outputs).unwrap();
+        assert_eq!(v, Value::String("x=7y".into()));
+    }
+
+    #[test]
+    fn test_resolve_arg_value_concat_expression() {
+        // Call node arg'ında f-string: `url = "https://x/" + i` (i ctx'te).
+        let mut ctx = Context::new();
+        ctx.set("i".into(), Value::Int(3));
+        let outputs = HashMap::new();
+        let v = resolve_arg_value("\"https://x/comments?postId=\" + i", &ctx, &outputs);
+        assert_eq!(v, Value::String("https://x/comments?postId=3".into()));
+    }
+
+    #[test]
+    fn test_resolve_arg_value_attribute_expression() {
+        // Call node arg'ında attr erişimi: `json = users_resp.body` (ctx'te object).
+        let mut m = HashMap::new();
+        m.insert("body".into(), Value::String("{\"a\": 1}".into()));
+        let mut ctx = Context::new();
+        ctx.set("users_resp".into(), Value::Object(m));
+        let outputs = HashMap::new();
+        let v = resolve_arg_value("users_resp.body", &ctx, &outputs);
+        assert_eq!(v, Value::String("{\"a\": 1}".into()));
+    }
+
+    #[test]
     fn test_compiled_execute_call_tool() {
-        let reg = crate::MockToolRegistry::new();
-        reg.add("test.echo", |args| {
+        let reg = tinypipe_tools::MockToolRegistry::new();
+        reg.add("test.echo", |args, _kwargs, _env| {
             Ok(args.first().cloned().unwrap_or(Value::Null))
         });
 
@@ -2091,7 +2528,7 @@ mod tests {
                 Node::new("call1", Opcode::Call)
                     .with_arg("type", "call".into())
                     .with_arg("target", "test.echo".into())
-                    .with_arg("output_name", "call_result".into()),
+                    .with_arg("output", "call_result".into()),
                 Node::new("output1", Opcode::Act)
                     .with_arg("type", "return".into())
                     .with_arg("value", "call_result".into()),
@@ -2290,8 +2727,8 @@ mod tests {
 
     #[test]
     fn test_compiled_on_error_abort() {
-        let reg = crate::MockToolRegistry::new();
-        reg.add("test.error", |_| Err("always fails".into()));
+        let reg = tinypipe_tools::MockToolRegistry::new();
+        reg.add("test.error", |_, _, _env| Err("always fails".into()));
 
         let plan = ExecutionPlan::new(
             vec![
@@ -2319,8 +2756,8 @@ mod tests {
 
     #[test]
     fn test_compiled_on_error_continue_with_null() {
-        let reg = crate::MockToolRegistry::new();
-        reg.add("test.error", |_| Err("always fails".into()));
+        let reg = tinypipe_tools::MockToolRegistry::new();
+        reg.add("test.error", |_, _, _env| Err("always fails".into()));
 
         let plan = ExecutionPlan::new(
             vec![
@@ -2329,7 +2766,7 @@ mod tests {
                     .with_arg("type", "call".into())
                     .with_arg("target", "test.error".into())
                     .with_arg("on_error", "continue_with_null".into())
-                    .with_arg("output_name", "call_result".into()),
+                    .with_arg("output", "call_result".into()),
                 Node::new("output1", Opcode::Act)
                     .with_arg("type", "return".into())
                     .with_arg("value", "call_result".into()),
@@ -2349,8 +2786,8 @@ mod tests {
 
     #[test]
     fn test_compiled_on_error_continue_with_fallback() {
-        let reg = crate::MockToolRegistry::new();
-        reg.add("test.error", |_| Err("always fails".into()));
+        let reg = tinypipe_tools::MockToolRegistry::new();
+        reg.add("test.error", |_, _, _env| Err("always fails".into()));
 
         let plan = ExecutionPlan::new(
             vec![
@@ -2359,7 +2796,7 @@ mod tests {
                     .with_arg("target", "test.error".into())
                     .with_arg("on_error", "continue_with_fallback".into())
                     .with_arg("fallback_value", "42".into())
-                    .with_arg("output_name", "call_result".into()),
+                    .with_arg("output", "call_result".into()),
                 Node::new("output1", Opcode::Act)
                     .with_arg("type", "return".into())
                     .with_arg("value", "call_result".into()),
@@ -2371,10 +2808,11 @@ mod tests {
         let result = exec
             .execute(Context::new())
             .expect("should continue with fallback");
-        // Compiled executor: fallback_value "42" is parsed as JSON → String("42")
+        // Compiled executor: fallback_value "42" (raw string) is parsed as JSON → Int(42).
+        // Transform çıktısında string literal'lar tırnaklı gelir ("\"42\"" → String("42")).
         assert_eq!(
             result.output,
-            Some(Value::String("42".into())),
+            Some(Value::Int(42)),
             "expected fallback value '42', got {:?}",
             result.output
         );
@@ -2417,9 +2855,9 @@ mod tests {
 
     #[test]
     fn test_compiled_on_error_abort_in_parallel() {
-        let reg = crate::MockToolRegistry::new();
-        reg.add("test.error", |_| Err("branch error".into()));
-        reg.add("test.echo", |args| {
+        let reg = tinypipe_tools::MockToolRegistry::new();
+        reg.add("test.error", |_, _, _env| Err("branch error".into()));
+        reg.add("test.echo", |args, _kwargs, _env| {
             Ok(args.first().cloned().unwrap_or(Value::Null))
         });
 
@@ -2700,7 +3138,7 @@ mod tests {
             ],
         );
         let compiled = compile_plan(plan);
-        let reg = crate::MockToolRegistry::new();
+        let reg = tinypipe_tools::MockToolRegistry::new();
         let exec = CompiledExecutor::new(&compiled, &reg);
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(10));
@@ -2749,7 +3187,7 @@ mod tests {
             ],
         );
         let compiled = compile_plan(plan);
-        let reg = crate::MockToolRegistry::new();
+        let reg = tinypipe_tools::MockToolRegistry::new();
         let exec = CompiledExecutor::new(&compiled, &reg);
         let inputs = Context::new();
         let result = exec
@@ -2769,8 +3207,8 @@ mod tests {
     fn test_scope_isolation_no_cross_contamination() {
         // Branch0 writes to "x", Branch1 reads "x" — should see parent's value (from input1),
         // NOT branch0's value. Cross-branch contamination yok.
-        let reg = crate::MockToolRegistry::new();
-        reg.add("test.read_var", |args| {
+        let reg = tinypipe_tools::MockToolRegistry::new();
+        reg.add("test.read_var", |args, _kwargs, _env| {
             // Return the value of the variable passed as first arg
             Ok(args.first().cloned().unwrap_or(Value::Null))
         });
@@ -2787,7 +3225,7 @@ mod tests {
                 // Branch1: "x" değerini oku — parent'taki orijinal değeri görmeli
                 Node::new("branch1_call", Opcode::Call)
                     .with_arg("target", "test.read_var".into())
-                    .with_arg("output_name", "branch1_result".into())
+                    .with_arg("output", "branch1_result".into())
                     .with_arg("expression", "x".into())
                     .with_branch(1),
                 Node::new("merge1", Opcode::Merge),
@@ -2850,7 +3288,7 @@ mod tests {
             ],
         );
         let compiled = compile_plan(plan);
-        let reg = crate::MockToolRegistry::new();
+        let reg = tinypipe_tools::MockToolRegistry::new();
         let exec = CompiledExecutor::new(&compiled, &reg);
         let mut inputs = Context::new();
         inputs.set("base".into(), Value::Int(21));
@@ -2923,7 +3361,7 @@ mod tests {
             ],
         );
         let compiled = compile_plan(plan);
-        let reg = crate::MockToolRegistry::new();
+        let reg = tinypipe_tools::MockToolRegistry::new();
         let exec = CompiledExecutor::new(&compiled, &reg);
         let inputs = Context::new();
         let result = exec
@@ -2986,8 +3424,8 @@ mod tests {
     #[test]
     fn test_scope_isolation_parallel_error_still_propagates() {
         // Error in parallel branch should still abort execution.
-        let reg = crate::MockToolRegistry::new();
-        reg.add("test.error", |_| Err("branch error".into()));
+        let reg = tinypipe_tools::MockToolRegistry::new();
+        reg.add("test.error", |_, _, _env| Err("branch error".into()));
 
         let plan = ExecutionPlan::new(
             vec![

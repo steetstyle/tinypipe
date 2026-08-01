@@ -35,8 +35,8 @@ use tinypipe_api::types::{Execution, ExecutionStatus, ExecutionStep};
 use tinypipe_api::types::{GraphId, Version};
 use tinypipe_compiler::{auto_repair, compile};
 use tinypipe_storage::SqliteStorage;
+use tinypipe_tools::{default_tools, SubgraphToolRegistry};
 use tinypipe_vm::CompiledExecutor;
-use tinypipe_vm::MockToolRegistry;
 
 // LLM integration (requires `llm` feature)
 #[cfg(feature = "llm")]
@@ -44,7 +44,20 @@ use tinypipe_compiler::llm::provider::{OllamaConfig, Provider};
 #[cfg(feature = "llm")]
 use tinypipe_compiler::llm::LlmContext;
 
+/// Logging: `RUST_LOG` değerine göre seviye seçer (varsayılan: info).
+/// Örn: `RUST_LOG=trace tinypipe-cli execute ...` ile VM node-trace'leri görünür.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn main() {
+    init_tracing();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: tinypipe-cli <command> [args...]");
@@ -104,10 +117,14 @@ fn main() {
         }
         "execute" => {
             if args.len() < 3 {
-                eprintln!("Usage: tinypipe-cli execute <id> [json_input] [--pause-after N]");
+                eprintln!("Usage: tinypipe-cli execute <id> [json_input] [--pause-after N] [--no-env-check]");
                 std::process::exit(1);
             }
-            let input_json = args.get(3).map(|s| s.as_str()).unwrap_or("{}");
+            let input_json = args
+                .get(3)
+                .filter(|s| !s.starts_with("--"))
+                .map(|s| s.as_str())
+                .unwrap_or("{}");
             let mut pause_after = None;
             if let Some(pos) = args.iter().position(|a| a == "--pause-after") {
                 pause_after = args.get(pos + 1).and_then(|v| v.parse::<u32>().ok());
@@ -116,11 +133,13 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            cmd_execute(&args[2], input_json, pause_after);
+            let skip_env_check = args.iter().any(|a| a == "--no-env-check");
+            let env = parse_env_args(&args[3..]);
+            cmd_execute(&args[2], input_json, pause_after, env, skip_env_check);
         }
         "resume" => {
             if args.len() < 3 {
-                eprintln!("Usage: tinypipe-cli resume <execution_id> [--max-nodes N]");
+                eprintln!("Usage: tinypipe-cli resume <execution_id> [--max-nodes N] [--no-env-check]");
                 std::process::exit(1);
             }
             let mut max_nodes = None;
@@ -131,7 +150,9 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            cmd_resume(&args[2], max_nodes);
+            let skip_env_check = args.iter().any(|a| a == "--no-env-check");
+            let env = parse_env_args(&args[3..]);
+            cmd_resume(&args[2], max_nodes, env, skip_env_check);
         }
         "scheduler" => {
             if args.len() < 3 || args[2] != "run" {
@@ -146,7 +167,8 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            cmd_scheduler_run(max_nodes);
+            let env = parse_env_args(&args[3..]);
+            cmd_scheduler_run(max_nodes, env);
         }
         "list" => {
             cmd_list();
@@ -557,7 +579,75 @@ fn cmd_update(id: &str, code: &str) {
 
 /// `tinypipe-cli execute <id> [json_input] [--pause-after N]` — load and execute a graph.
 /// `--pause-after N` verilirse N node sonra durur ve checkpoint kaydeder (resume edilebilir).
-fn cmd_execute(id: &str, input_json: &str, pause_after: Option<u32>) {
+
+/// `--env K=V` ve `--env-file <path>` flag'lerini toplar.
+/// Öncelik (ilk kazanan): CLI override'ları → dosya → OS env.
+fn parse_env_args(args: &[String]) -> tinypipe_env::Env {
+    let mut overrides: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut file = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--env" {
+            if let Some(pair) = args.get(i + 1) {
+                if let Some((k, v)) = pair.split_once('=') {
+                    overrides.insert(k.to_string(), v.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            eprintln!("Error: --env requires KEY=VALUE");
+            std::process::exit(1);
+        }
+        if args[i] == "--env-file" {
+            if let Some(path) = args.get(i + 1) {
+                file = Some(path.clone());
+                i += 2;
+                continue;
+            }
+            eprintln!("Error: --env-file requires a path");
+            std::process::exit(1);
+        }
+        i += 1;
+    }
+    let mut providers: Vec<std::sync::Arc<dyn tinypipe_env::EnvProvider>> = Vec::new();
+    if !overrides.is_empty() {
+        providers.push(std::sync::Arc::new(tinypipe_env::static_provider::StaticEnvProvider::new(overrides)));
+    }
+    if let Some(path) = file {
+        providers.push(std::sync::Arc::new(tinypipe_env::dotenv::DotEnvFileProvider::new(path)));
+    }
+    providers.push(std::sync::Arc::new(tinypipe_env::os::OsEnvProvider));
+    tinypipe_env::Env::new(providers)
+}
+
+/// Execution'dan ÖNCE env bağımlılık kontrolü: kök grafik + transitive
+/// subgraph'ların zorunlu değişkenleri ortamda yoksa listeler ve exit(1).
+/// `--no-env-check` ile atlanabilir (dinamik key kullanan grafikler için).
+fn run_env_check<S: tinypipe_api::storage::GraphStorage>(
+    registry: &tinypipe_tools::SubgraphToolRegistry<S>,
+    id: &str,
+    env: &tinypipe_env::Env,
+) {
+    let reports = match registry.validate_env(id, env) {
+        Ok(reports) => reports,
+        Err(e) => {
+            eprintln!("Env check failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if reports.is_empty() {
+        return;
+    }
+    eprintln!("✗ Missing environment variables:");
+    for report in &reports {
+        for key in &report.missing {
+            eprintln!("  {}.{}", report.graph_path, key);
+        }
+    }
+    std::process::exit(1);
+}
+
+fn cmd_execute(id: &str, input_json: &str, pause_after: Option<u32>, env: tinypipe_env::Env, skip_env_check: bool) {
     let storage = open_storage();
     let graph_id = resolve_graph_id(&storage, id);
     let graph_def = match storage.load_graph(&graph_id) {
@@ -612,8 +702,19 @@ fn cmd_execute(id: &str, input_json: &str, pause_after: Option<u32>) {
         .save_execution(&execution)
         .expect("Failed to save execution");
 
-    let registry = MockToolRegistry::new();
-    let executor = CompiledExecutor::new(&plan, &registry);
+    let registry = std::sync::Arc::new(SubgraphToolRegistry::with_tools(
+        storage,
+        default_tools(),
+    ))
+    .init();
+    if !skip_env_check {
+        run_env_check(registry.as_ref(), id, &env);
+    }
+    let executor = CompiledExecutor::with_env(
+        &plan,
+        registry.as_ref() as &dyn tinypipe_api::tool_registry::ToolRegistry,
+        std::sync::Arc::new(env),
+    );
     let start = std::time::Instant::now();
 
     let policy = tinypipe_vm::PausePolicy {
@@ -628,10 +729,11 @@ fn cmd_execute(id: &str, input_json: &str, pause_after: Option<u32>) {
             execution.duration_us = Some(result.duration_us);
             execution.completed_at = Some(now_micros());
             execution.context = Some(result.context.clone());
-            storage
+            registry
+                .storage()
                 .save_execution(&execution)
                 .expect("Failed to update execution");
-            record_steps(&storage, &execution_id, &plan, &result);
+            record_steps(registry.storage(), &execution_id, &plan, &result);
 
             println!("✓ Execution completed (id: {})", execution_id);
             println!("  Duration: {} μs", result.duration_us);
@@ -663,11 +765,13 @@ fn cmd_execute(id: &str, input_json: &str, pause_after: Option<u32>) {
             execution.completed_at = None;
             execution.duration_us = Some(checkpoint.elapsed_us);
             execution.context = Some(checkpoint.context.clone());
-            storage
+            registry
+                .storage()
                 .save_execution(&execution)
                 .expect("Failed to save paused execution");
             let blob = serde_json::to_vec(&checkpoint).expect("Failed to serialize checkpoint");
-            storage
+            registry
+                .storage()
                 .save_checkpoint(&execution_id, &blob)
                 .expect("Failed to save checkpoint");
             println!(
@@ -682,7 +786,8 @@ fn cmd_execute(id: &str, input_json: &str, pause_after: Option<u32>) {
             execution.error = Some(e.to_string());
             execution.completed_at = Some(now_micros());
             execution.duration_us = Some(elapsed.as_micros() as u64);
-            storage
+            registry
+                .storage()
                 .save_execution(&execution)
                 .expect("Failed to update execution");
             eprintln!(
@@ -696,7 +801,7 @@ fn cmd_execute(id: &str, input_json: &str, pause_after: Option<u32>) {
 }
 
 /// `tinypipe-cli resume <execution_id> [--max-nodes N]` — paused execution'ı checkpoint'ten sürdür.
-fn cmd_resume(execution_id: &str, max_nodes: Option<u32>) {
+fn cmd_resume(execution_id: &str, max_nodes: Option<u32>, env: tinypipe_env::Env, skip_env_check: bool) {
     let storage = open_storage();
 
     let mut exec = match storage.load_execution(execution_id) {
@@ -749,8 +854,19 @@ fn cmd_resume(execution_id: &str, max_nodes: Option<u32>) {
         }
     };
 
-    let registry = MockToolRegistry::new();
-    let executor = CompiledExecutor::new(&plan, &registry);
+    let registry = std::sync::Arc::new(SubgraphToolRegistry::with_tools(
+        storage,
+        default_tools(),
+    ))
+    .init();
+    if !skip_env_check {
+        run_env_check(registry.as_ref(), &exec.graph_id.0, &env);
+    }
+    let executor = CompiledExecutor::with_env(
+        &plan,
+        registry.as_ref() as &dyn tinypipe_api::tool_registry::ToolRegistry,
+        std::sync::Arc::new(env),
+    );
     let policy = tinypipe_vm::PausePolicy {
         max_nodes,
         ..Default::default()
@@ -763,10 +879,11 @@ fn cmd_resume(execution_id: &str, max_nodes: Option<u32>) {
             exec.duration_us = Some(result.duration_us);
             exec.completed_at = Some(now_micros());
             exec.context = Some(result.context.clone());
-            storage
+            registry
+                .storage()
                 .save_execution(&exec)
                 .expect("Failed to update execution");
-            record_steps(&storage, execution_id, &plan, &result);
+            record_steps(registry.storage(), execution_id, &plan, &result);
 
             println!("✓ Execution completed (id: {})", execution_id);
             println!("  Total duration: {} μs", result.duration_us);
@@ -783,11 +900,13 @@ fn cmd_resume(execution_id: &str, max_nodes: Option<u32>) {
             exec.status = ExecutionStatus::Paused;
             exec.duration_us = Some(cp.elapsed_us);
             exec.context = Some(cp.context.clone());
-            storage
+            registry
+                .storage()
                 .save_execution(&exec)
                 .expect("Failed to save paused execution");
             let blob = serde_json::to_vec(&cp).expect("Failed to serialize checkpoint");
-            storage
+            registry
+                .storage()
                 .save_checkpoint(execution_id, &blob)
                 .expect("Failed to save checkpoint");
             println!(
@@ -800,7 +919,8 @@ fn cmd_resume(execution_id: &str, max_nodes: Option<u32>) {
             exec.status = ExecutionStatus::Failed;
             exec.error = Some(e.to_string());
             exec.completed_at = Some(now_micros());
-            storage
+            registry
+                .storage()
                 .save_execution(&exec)
                 .expect("Failed to update execution");
             eprintln!("✗ Resume failed (id: {}): {e}", execution_id);
@@ -812,9 +932,9 @@ fn cmd_resume(execution_id: &str, max_nodes: Option<u32>) {
 /// `tinypipe-cli scheduler run [--max-nodes N]` — paused execution'ları sürdür.
 /// `--max-nodes` verilirse her execution her turda N node ilerler (loop modu);
 /// verilmezse tek turda tamamlanır.
-fn cmd_scheduler_run(max_nodes: Option<u32>) {
+fn cmd_scheduler_run(max_nodes: Option<u32>, env: tinypipe_env::Env) {
     let storage = open_storage();
-    let scheduler = tinypipe_scheduler::Scheduler::new(storage);
+    let scheduler = tinypipe_scheduler::Scheduler::with_env(storage, std::sync::Arc::new(env));
     let summary = match max_nodes {
         Some(n) => scheduler.run_loop(Some(n), 1000),
         None => scheduler.run_once(None),

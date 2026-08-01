@@ -7,7 +7,7 @@ use tinypipe_api::types::{Context, Value};
 use tinypipe_ir::compiled::CompiledPlan;
 use tinypipe_ir::plan::{Edge, ExecutionPlan, Node, Opcode};
 use tinypipe_vm::{
-    Checkpoint, CompiledExecutor, ExecutionOutcome, NoopObserver, PausePolicy, StepObserver,
+    CompiledExecutor, ExecutionOutcome, NoopObserver, PausePolicy, StepObserver,
 };
 
 fn compile_plan(plan: ExecutionPlan) -> CompiledPlan {
@@ -50,7 +50,7 @@ fn inputs(x: i64) -> Context {
 #[test]
 fn test_pause_resume_linear_equiv() {
     let compiled = compile_plan(linear_plan());
-    let reg = tinypipe_vm::mock_tools();
+    let reg = tinypipe_tools::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
 
     let full = exec.execute(inputs(5)).expect("full should succeed");
@@ -81,7 +81,7 @@ fn test_pause_resume_linear_equiv() {
 #[test]
 fn test_pause_resume_multiple_segments() {
     let compiled = compile_plan(linear_plan());
-    let reg = tinypipe_vm::mock_tools();
+    let reg = tinypipe_tools::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
 
     let full = exec.execute(inputs(7)).unwrap();
@@ -132,7 +132,7 @@ fn test_pause_resume_multiple_segments() {
 #[test]
 fn test_pause_at_node_id() {
     let compiled = compile_plan(linear_plan());
-    let reg = tinypipe_vm::mock_tools();
+    let reg = tinypipe_tools::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
 
     let full = exec.execute(inputs(3)).unwrap();
@@ -176,7 +176,7 @@ fn loop_plan() -> ExecutionPlan {
             Edge::new("input_x", "loop1"),
             Edge::new("loop1", "body_calc"),
             Edge::new("body_calc", "body_decide"),
-            Edge::new("loop1", "output"),
+            Edge::control("loop1", "output"),
         ],
     )
 }
@@ -184,7 +184,7 @@ fn loop_plan() -> ExecutionPlan {
 #[test]
 fn test_pause_resume_mid_loop() {
     let compiled = compile_plan(loop_plan());
-    let reg = tinypipe_vm::mock_tools();
+    let reg = tinypipe_tools::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
 
     let full = exec.execute(inputs(0)).unwrap();
@@ -218,7 +218,7 @@ fn test_pause_resume_mid_loop() {
 #[test]
 fn test_pause_resume_loop_state_exact() {
     let compiled = compile_plan(loop_plan());
-    let reg = tinypipe_vm::mock_tools();
+    let reg = tinypipe_tools::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
 
     let full = exec.execute(inputs(2)).unwrap();
@@ -266,7 +266,7 @@ impl StepObserver for RecordingObserver {
 #[test]
 fn test_observer_records_all_nodes() {
     let compiled = compile_plan(linear_plan());
-    let reg = tinypipe_vm::mock_tools();
+    let reg = tinypipe_tools::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
 
     let mut obs = RecordingObserver::default();

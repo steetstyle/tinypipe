@@ -53,7 +53,7 @@ fn compile_plan(plan: ExecutionPlan) -> CompiledPlan {
 fn test_replay_basic_add() {
     let plan = load_reference("basic_add");
     let compiled = compile_plan(plan);
-    let reg = tinypipe_vm::mock_tools();
+    let reg = tinypipe_tools::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
     let mut inputs = Context::new();
     inputs.set("x".into(), Value::Int(5));
@@ -88,7 +88,7 @@ fn test_replay_topological_order() {
 fn execute_reference(name: &str, inputs: Context) -> ExecutionResult {
     let plan = load_reference(name);
     let compiled = compile_plan(plan);
-    let reg = tinypipe_vm::mock_tools();
+    let reg = tinypipe_tools::mock_tools();
     let exec = CompiledExecutor::new(&compiled, &reg);
     exec.execute(inputs)
         .expect(&format!("replay '{}' should succeed", name))

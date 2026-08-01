@@ -54,9 +54,16 @@ impl PlanFormat {
     }
 }
 
-/// Arg değerini ekran için sadeleştir: JSON string tırnaklarını kaldır.
+/// Arg değerini ekran için sadeleştir: tırnakları ve eski formatın
+/// JSON-escape'li tırnaklarını (`\"`) kaldır.
 fn arg_value(raw: &str) -> String {
-    raw.trim_matches('"').to_string()
+    raw.trim_matches(|c| c == '"' || c == '\\').to_string()
+}
+
+/// Mermaid label'larında sorun çıkarabilecek karakterleri encode et
+/// (`#` yorum başlatır, tırnak label sınırıyla çakışır).
+fn mermaid_escape(s: &str) -> String {
+    s.replace('#', "&#35;").replace('"', "'")
 }
 
 /// Node etiketi: `op: kısa özet` (mermaid/dot için).
@@ -126,7 +133,7 @@ fn dump_text(plan: &CompiledPlan, header: &PlanDumpHeader) -> String {
     for n in &plan.nodes {
         out.push_str(&format!("  [{}] {:?} op={:?}\n", n.index, n.id, n.op));
         for a in &n.args {
-            out.push_str(&format!("      {} = {}\n", a.key, a.value));
+            out.push_str(&format!("      {} = {}\n", a.key, arg_value(&a.value)));
         }
         if let Some(bid) = n.branch_id {
             out.push_str(&format!("      (branch_id: {})\n", bid));
@@ -164,14 +171,16 @@ fn dump_mermaid(plan: &CompiledPlan) -> String {
     let mut out = String::new();
     out.push_str("```mermaid\nflowchart LR\n");
     for n in &plan.nodes {
-        let label = node_label(n).replace('"', "'");
+        let label = mermaid_escape(&node_label(n));
         out.push_str(&format!("    N{}[\"{}\"]\n", n.index, label));
     }
     for e in &plan.edges {
         match edge_label(e) {
             Some(l) => out.push_str(&format!(
                 "    N{} -->|{}| N{}\n",
-                e.from_index, l, e.to_index
+                e.from_index,
+                mermaid_escape(&l),
+                e.to_index
             )),
             None => out.push_str(&format!("    N{} --> N{}\n", e.from_index, e.to_index)),
         }
@@ -310,7 +319,9 @@ mod tests {
         assert!(out.contains("FlatBuffers (42 bytes)"));
         assert!(out.contains("Nodes (3):"));
         assert!(out.contains("[1] \"n1\" op=Decide"));
-        assert!(out.contains("source = \"x\""));
+        assert!(out.contains("source = x"));
+        assert!(out.contains("op = lt"));
+        assert!(out.contains("value = 5"));
         assert!(out.contains("Edges (3):"));
         assert!(out.contains("1 -> 2 [data cond=true]"));
         assert!(out.contains("1 -> 2 [control]"));
@@ -328,6 +339,26 @@ mod tests {
         assert!(out.contains("N0 --> N1"));
         assert!(out.contains("N1 -->|true| N2"));
         assert!(out.contains("N1 -->|control| N2"));
+    }
+
+    #[test]
+    fn test_dump_mermaid_escapes_special_chars() {
+        // `#` mermaid'de yorum başlatır — encode edilmeli.
+        let mut plan = sample_plan();
+        plan.nodes[1].args[1].value = "big #5".into();
+        let out = PlanFormat::Mermaid.render(&plan, &header());
+        assert!(out.contains("Decide x big &#35;5"));
+        assert!(!out.contains("Decide x big #5"));
+    }
+
+    #[test]
+    fn test_dump_text_strips_legacy_escaped_quotes() {
+        // Eski FB formatı `"\"x\""` — arg_value her iki formu da sadeleştirmeli.
+        let mut plan = sample_plan();
+        plan.nodes[0].args[0].value = "\"\\\"x\\\"\"".into();
+        let out = PlanFormat::Text.render(&plan, &header());
+        assert!(out.contains("name = x"));
+        assert!(!out.contains("\\\""));
     }
 
     #[test]

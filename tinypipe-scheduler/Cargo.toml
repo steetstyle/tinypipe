@@ -7,8 +7,10 @@ description = "Resumes paused tinypipe executions (checkpoint-based scheduler)"
 
 [dependencies]
 tinypipe-api = { path = "../tinypipe-api" }
+tinypipe-env = { path = "../tinypipe-env" }
 tinypipe-ir = { path = "../tinypipe-ir" }
 tinypipe-vm = { path = "../tinypipe-vm" }
+tinypipe-tools = { path = "../tinypipe-tools" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -1,0 +1,25 @@
+[package]
+name = "tinypipe-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tool registry and built-in tools (http_request, postgres) — heavy deps live here"
+
+[dependencies]
+tinypipe-api = { path = "../tinypipe-api" }
+tinypipe-env = { path = "../tinypipe-env" }
+tinypipe-compiler = { path = "../tinypipe-compiler" }
+tinypipe-ir = { path = "../tinypipe-ir" }
+tinypipe-vm = { path = "../tinypipe-vm" }
+serde.workspace = true
+serde_json.workspace = true
+ureq = { workspace = true }
+postgres = { workspace = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+tinypipe-storage = { path = "../tinypipe-storage" }
+
+[[bench]]
+name = "bench_subgraph"
+harness = false

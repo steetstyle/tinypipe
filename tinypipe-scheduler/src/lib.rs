@@ -44,17 +44,27 @@ pub struct SchedulerSummary {
 
 /// Checkpoint tabanlı scheduler.
 pub struct Scheduler<S: GraphStorage> {
-    storage: S,
+    storage: std::sync::Arc<S>,
+    env: std::sync::Arc<tinypipe_env::Env>,
 }
 
 impl<S: GraphStorage> Scheduler<S> {
     pub fn new(storage: S) -> Self {
-        Self { storage }
+        Self::with_env(storage, std::sync::Arc::new(tinypipe_env::Env::empty()))
+    }
+
+    /// Ortam görünümüyle scheduler kurar (resume edilen execution'ların
+    /// `env.*` tool'ları bu ortamı görür).
+    pub fn with_env(storage: S, env: std::sync::Arc<tinypipe_env::Env>) -> Self {
+        Self {
+            storage: std::sync::Arc::new(storage),
+            env,
+        }
     }
 
     /// Storage'a erişim (testler ve CLI raporlama için).
     pub fn storage(&self) -> &S {
-        &self.storage
+        self.storage.as_ref()
     }
 
     /// Tüm paused execution'ları birer segment ilerletir.
@@ -142,9 +152,40 @@ impl<S: GraphStorage> Scheduler<S> {
         let plan = CompiledPlan::from_fb_bytes(&plan_bytes)
             .map_err(|e| SchedulerError::PlanDecode(e.to_string()))?;
 
-        // 3. Resume et
-        let registry = tinypipe_vm::mock_tools();
-        let executor = CompiledExecutor::new(&plan, &registry);
+        // 3. Env doğrulaması — resume'dan ÖNCE tüm (transitive) bağımlılıklar
+        //    ortamda yoksa bu execution atlanır ve hata raporlanır.
+        let registry = std::sync::Arc::new(tinypipe_tools::SubgraphToolRegistry::with_tools(
+            self.storage.clone(),
+            tinypipe_tools::default_tools(),
+        ))
+        .init();
+        match registry.validate_env(&exec.graph_id.0, &self.env) {
+            Ok(reports) if !reports.is_empty() => {
+                let detail: Vec<String> = reports
+                    .iter()
+                    .flat_map(|r| {
+                        r.missing
+                            .iter()
+                            .map(|k| format!("{}.{}", r.graph_path, k))
+                    })
+                    .collect();
+                return Err(SchedulerError::Execution(format!(
+                    "env check failed, missing: {}",
+                    detail.join(", ")
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(SchedulerError::Execution(format!("env check failed: {e}")));
+            }
+        }
+
+        // 4. Resume et — subgraph çağrıları için gerçek registry (storage paylaşımlı)
+        let executor = CompiledExecutor::with_env(
+            &plan,
+            registry.as_ref() as &dyn tinypipe_api::tool_registry::ToolRegistry,
+            self.env.clone(),
+        );
         let result = executor
             .resume(&checkpoint, policy, None)
             .map_err(|e| SchedulerError::Execution(e.to_string()))?;
@@ -214,7 +255,7 @@ mod tests {
                 Edge::new("input_x", "loop1"),
                 Edge::new("loop1", "body_calc"),
                 Edge::new("body_calc", "body_decide"),
-                Edge::new("loop1", "output"),
+                Edge::control("loop1", "output"),
             ],
         )
     }
@@ -253,7 +294,7 @@ mod tests {
         store.save_execution(&exec).unwrap();
 
         // İlk segmenti çalıştırıp pause checkpoint'ini kaydet
-        let reg = tinypipe_vm::mock_tools();
+        let reg = tinypipe_tools::mock_tools();
         let executor = CompiledExecutor::new(&compiled, &reg);
         let policy = PausePolicy {
             max_nodes: Some(max_nodes),
@@ -305,10 +346,6 @@ mod tests {
             summary.still_paused
         );
         // still_paused kümülatiftir; önemli olan son durumun Completed olması
-        let exec = store.load_execution("exec-2").unwrap();
-        assert!(matches!(exec.status, ExecutionStatus::Completed));
-        assert_eq!(exec.output, Some(Value::Int(5)));
-
         let exec = store.load_execution("exec-2").unwrap();
         assert!(matches!(exec.status, ExecutionStatus::Completed));
         assert_eq!(exec.output, Some(Value::Int(5)));

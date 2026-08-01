@@ -171,6 +171,13 @@ impl SqliteStorage {
             }
         }
 
+        // name→id çözümleme için indeks (subgraph dispatch hot path)
+        if let Err(e) = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_graphs_name ON graphs(name);",
+        ) {
+            tracing::warn!("name index creation failed: {}", e);
+        }
+
         Ok(())
     }
 
@@ -505,6 +512,41 @@ impl GraphStorage for SqliteStorage {
             Ok(Some(plan)) => Ok(plan),
             Ok(None) => Err(StorageError::PlanMissing(id.clone())),
             Err(_) => Err(StorageError::GraphNotFound(id.clone())),
+        }
+    }
+
+    fn list_all_graphs(
+        &self,
+        _limit: Option<u64>,
+        _offset: Option<u64>,
+    ) -> Result<Vec<GraphDefinition>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at FROM graphs ORDER BY created_at DESC")
+            .map_err(|e| StorageError::Internal(format!("prepare list_all_graphs: {}", e)))?;
+        let rows = stmt
+            .query_map([], row_to_graph)
+            .map_err(|e| StorageError::Internal(format!("query list_all_graphs: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StorageError::Internal(format!("row list_all_graphs: {e}")))
+    }
+
+    fn find_graph_by_name(&self, name: &str) -> Result<GraphDefinition, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at FROM graphs WHERE name = ?1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .map_err(|e| StorageError::Internal(format!("prepare find_graph_by_name: {}", e)))?;
+        let mut rows = stmt
+            .query_map(params![name], row_to_graph)
+            .map_err(|e| StorageError::Internal(format!("query find_graph_by_name: {e}")))?;
+        match rows.next() {
+            Some(Ok(graph)) => Ok(graph),
+            Some(Err(e)) => Err(StorageError::Internal(format!(
+                "row find_graph_by_name: {e}"
+            ))),
+            None => Err(StorageError::GraphNotFound(GraphId::new(name))),
         }
     }
 
@@ -923,6 +965,25 @@ mod tests {
     }
 
     #[test]
+    fn test_find_graph_by_name_returns_newest_match() {
+        let store = setup();
+        let first = store
+            .create_graph("dup", "def graph():\n    return 1")
+            .unwrap();
+        let second = store
+            .create_graph("dup", "def graph():\n    return 2")
+            .unwrap();
+        assert_ne!(first, second);
+        let g = store.find_graph_by_name("dup").unwrap();
+        assert_eq!(g.id, second);
+        assert_eq!(g.version, Version(1));
+
+        // Olmayan isim → GraphNotFound
+        let err = store.find_graph_by_name("yok").unwrap_err();
+        assert!(matches!(err, StorageError::GraphNotFound(_)));
+    }
+
+    #[test]
     fn test_update_graph_creates_new_version() {
         let store = setup();
         let id = store.create_graph("test", "def graph(): pass").unwrap();
@@ -1298,4 +1359,24 @@ mod tests {
         let err = store.load_plan_version(&id, Version(1)).unwrap_err();
         assert!(matches!(err, StorageError::VersionNotFound(_, _)));
     }
+}
+
+/// `graphs` satırını `GraphDefinition`'a çevirir (list_all_graphs + find_graph_by_name).
+fn row_to_graph(row: &rusqlite::Row) -> rusqlite::Result<GraphDefinition> {
+    let active_ver: Option<i64> = row.get(5)?;
+    Ok(GraphDefinition {
+        id: GraphId::new(&row.get::<_, String>(0)?),
+        name: row.get::<_, String>(1)?,
+        version: Version(row.get::<_, i64>(2)? as u64),
+        status: row.get::<_, String>(3)?,
+        code: row.get::<_, String>(4)?,
+        execution_plan: None,
+        active: active_ver.is_some(),
+        active_version: active_ver.map(|v| Version(v as u64)),
+        parent_id: row.get::<_, Option<String>>(6)?.map(|s| GraphId::new(&s)),
+        fork_node: row.get::<_, Option<String>>(7)?,
+        fork_label: row.get::<_, Option<String>>(8)?,
+        created_at: row.get::<_, String>(9)?,
+        updated_at: row.get::<_, String>(10)?,
+    })
 }

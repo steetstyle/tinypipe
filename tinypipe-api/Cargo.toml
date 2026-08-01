@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tinypipe-env = { path = "../tinypipe-env" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

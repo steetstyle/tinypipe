@@ -301,7 +301,7 @@ pub fn compile_from_natural_language(
 
         // Validate
         if let Err(errors) = crate::validator::validate(&plan) {
-            let report = auto_repair::from_validation_errors(&errors, code_str);
+            let report = auto_repair::from_validation_errors(&errors, &plan, code_str);
             last_error = Some(report.to_string());
             continue;
         }

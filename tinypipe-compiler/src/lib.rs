@@ -45,7 +45,15 @@ pub fn compile(code: &str) -> Result<CodegenOutput, String> {
     validator::validate(&plan).map_err(|errors| {
         errors
             .iter()
-            .map(|e| format!("{}: {}", e.node_id, e.message))
+            .map(|e| {
+                let detail = plan
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == e.node_id)
+                    .map(validator::describe_node)
+                    .unwrap_or_default();
+                format!("{}: {} {}", e.node_id, e.message, detail)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     })?;

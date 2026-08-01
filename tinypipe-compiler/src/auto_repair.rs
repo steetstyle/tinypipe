@@ -27,7 +27,7 @@
 //!             match tinypipe_compiler::validator::validate(&plan) {
 //!                 Ok(()) => None, // success
 //!                 Err(errors) => {
-//!                     let report = auto_repair::from_validation_errors(&errors, code);
+//!                     let report = auto_repair::from_validation_errors(&errors, &plan, code);
 //!                     Some(report.to_string())
 //!                 }
 //!             }
@@ -164,8 +164,14 @@ pub fn from_sanitize_error(line: usize, column: usize, message: &str, code: &str
 }
 
 /// Build a report from a vec of validation errors.
+///
+/// `plan` hata mesajlarını zenginleştirmek için kullanılır: her `node_id`'ye
+/// karşılık gelen node'un op + ana argüman özeti eklenir (örn. `n54 [CALC expr=...]`),
+/// böylece kullanıcının hangi node'un hatalı olduğunu anlamak için ayrı bir
+/// plan dump'ı çalıştırması gerekmez.
 pub fn from_validation_errors(
     errors: &[crate::validator::ValidationError],
+    plan: &tinypipe_ir::plan::ExecutionPlan,
     code: &str,
 ) -> RepairReport {
     let mut report = RepairReport::new(
@@ -181,7 +187,15 @@ pub fn from_validation_errors(
 
     let error_details: Vec<String> = errors
         .iter()
-        .map(|e| format!("- {}: {}", e.node_id, e.message))
+        .map(|e| {
+            let detail = plan
+                .nodes
+                .iter()
+                .find(|n| n.id == e.node_id)
+                .map(crate::validator::describe_node)
+                .unwrap_or_default();
+            format!("- {}: {} {}", e.node_id, e.message, detail)
+        })
         .collect();
     report.context = error_details;
 
@@ -231,7 +245,7 @@ pub fn check_code(code: &str, attempt: u32, max_attempts: u32) -> Option<RepairR
             match crate::validator::validate(&plan) {
                 Ok(()) => None, // Success
                 Err(errors) => {
-                    let mut report = from_validation_errors(&errors, code);
+                    let mut report = from_validation_errors(&errors, &plan, code);
                     report.attempt = attempt;
                     report.max_attempts = max_attempts;
                     Some(report)
@@ -358,6 +372,35 @@ mod tests {
         // Code that passes sanitizer/transform but fails validator (no return)
         let result = check_code("def graph():\n    pass", 1, 3);
         assert!(result.is_some(), "invalid code should produce a report");
+    }
+
+    #[test]
+    fn test_validation_feedback_includes_node_detail() {
+        // Hata mesajı yalnızca node_id taşır; feedback o node'un özetini de
+        // içermeli ki kullanıcı ayrı bir plan dump'ı çalıştırmak zorunda kalmasın.
+        let plan = tinypipe_ir::plan::ExecutionPlan::new(
+            vec![
+                tinypipe_ir::plan::Node::new("n0", tinypipe_ir::plan::Opcode::Input)
+                    .with_arg("name", "x".into()),
+                tinypipe_ir::plan::Node::new("n54", tinypipe_ir::plan::Opcode::Calc)
+                    .with_arg("expr", "y + 1".into()),
+            ],
+            vec![tinypipe_ir::plan::Edge::new("n0", "n54")],
+        );
+        // Terminal node eksik → validator "terminal" hatası üretir
+        let errors = crate::validator::validate(&plan).unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.node_id == "n54" || e.node_id == "n0"),
+            "expected a validation error"
+        );
+        let report = from_validation_errors(&errors, &plan, "def graph(x: int):\n    y = x\n");
+        let rendered = report.to_string();
+        // Hatalı node'un özeti (op + ana argüman) feedback'te görünmeli
+        assert!(
+            rendered.contains("n0") && rendered.contains("INPUT") && rendered.contains("name=x"),
+            "feedback should describe the failing node, got:\n{}",
+            rendered
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use tinypipe_ir::plan::{Edge, EdgeKind, ExecutionPlan, Node, Opcode};
+use tinypipe_ir::plan::{ArgValue, Edge, EdgeKind, ExecutionPlan, Node, Opcode};
 
 /// A validation error with context.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +17,62 @@ pub struct ValidationError {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "node {}: {}", self.node_id, self.message)
+    }
+}
+
+/// Node'un hata feedback'inde gösterilecek kısa özeti: `CALC expr="x + 1"`.
+/// Validasyon hataları yalnızca node_id (örn. `n54`) taşır — hata raporu
+/// kullanıcının o node'un ne olduğunu bilmeden ayıklama yapmaması için
+/// op + ana argümanları da basar.
+pub fn describe_node(node: &Node) -> String {
+    use Opcode::*;
+    let op = node.op.display_name();
+    // Her opcode için en bilgilendirici ilk birkaç argüman
+    let interesting: &[&str] = match node.op {
+        Input => &["name"],
+        Calc => &["expr", "output"],
+        Call => &["target", "url"],
+        Decide => &["source", "op", "value"],
+        Switch => &["source"],
+        Act => &["type", "value"],
+        Parallel => &[],
+        Loop => &["target", "max_iterations"],
+        Wait => &["duration_ms"],
+        Merge => &["condition"],
+        Error => &["message"],
+    };
+    let parts: Vec<String> = interesting
+        .iter()
+        .filter_map(|key| node.args.iter().find(|a| a.key == *key))
+        .map(|a| format!("{}={}", a.key, fmt_arg_value(&a.value)))
+        .collect();
+    if parts.is_empty() {
+        format!("[{}]", op)
+    } else {
+        format!("[{} {}]", op, parts.join(" "))
+    }
+}
+
+/// ArgValue'un kompakt string gösterimi (feedback satırları için).
+fn fmt_arg_value(v: &ArgValue) -> String {
+    match v {
+        ArgValue::String(s) => s.clone(),
+        ArgValue::Int(i) => i.to_string(),
+        ArgValue::Float(f) => f.to_string(),
+        ArgValue::Bool(b) => b.to_string(),
+        ArgValue::Null => "null".into(),
+        ArgValue::Array(a) => {
+            let items: Vec<String> = a.iter().map(fmt_arg_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        ArgValue::Object(o) => {
+            let mut items: Vec<String> = o
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, fmt_arg_value(v)))
+                .collect();
+            items.sort();
+            format!("{{{}}}", items.join(", "))
+        }
     }
 }
 
@@ -117,19 +173,9 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
     }
 
     // 5. Reachability from INPUT nodes or nodes with no dependencies
-    let input_ids: Vec<&str> = plan
-        .nodes
-        .iter()
-        .filter(|n| n.op == Opcode::Input)
-        .map(|n| n.id.as_str())
-        .collect();
-
-    if input_ids.is_empty() {
-        errors.push(ValidationError {
-            node_id: "<plan>".into(),
-            message: "plan has no INPUT nodes".into(),
-        });
-    }
+    // (Graphs without INPUT nodes are legal — e.g. subgraphs that fetch
+    // external data or produce constants; reachability below still covers them
+    // via zero-indegree roots.)
 
     // BFS from all INPUT nodes AND nodes with no incoming edges (constants, etc.)
     let zero_indeg: Vec<&str> = plan
@@ -141,8 +187,7 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
 
     let reachable: HashSet<&str> = {
         let mut visited = HashSet::new();
-        let mut queue: VecDeque<&str> =
-            input_ids.iter().chain(zero_indeg.iter()).copied().collect();
+        let mut queue: VecDeque<&str> = zero_indeg.iter().copied().collect();
         while let Some(id) = queue.pop_front() {
             if !visited.insert(id) {
                 continue;
@@ -210,9 +255,12 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
     };
 
     // Extended terminal set: actual terminals + LOOP nodes (which route to body → terminal)
+    // + LOOP body nodes (feeder nodes that only feed a LOOP body terminate through the
+    // loop's execution — e.g. constant CALCs consumed by a body statement).
     let extended_terminals: HashSet<&str> = terminal_ids
         .iter()
         .chain(loop_ids.iter())
+        .chain(loop_body_ids.iter())
         .copied()
         .collect();
 
@@ -323,22 +371,15 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
             }
             _ => {
                 // Non-branch, non-loop, non-parallel:
-                // - At most 1 DATA outgoing edge (no conditions on data edges)
-                // - INPUT nodes are EXEMPT (values can be read by many consumers)
-                // - CONTROL edges are allowed alongside a data edge (sequential flow)
+                // - Data edges carry no conditions; a value may feed many consumers
+                //   (fan-out to multiple tools is normal dataflow — VM executes
+                //   consumers in topological order and each reads the producer's
+                //   value from context).
+                // - CONTROL edges are allowed alongside data edges (sequential flow)
                 let data_edges: Vec<_> = out_edges
                     .iter()
                     .filter(|e| e.kind == EdgeKind::Data)
                     .collect();
-                if data_edges.len() > 1 && node.op != Opcode::Input {
-                    errors.push(ValidationError {
-                        node_id: node.id.clone(),
-                        message: format!(
-                            "non-branch node has {} data outgoing edges (max 1)",
-                            data_edges.len()
-                        ),
-                    });
-                }
                 for e in &data_edges {
                     if e.condition.is_some() {
                         errors.push(ValidationError {
@@ -862,6 +903,8 @@ mod tests {
 
     #[test]
     fn detect_no_input() {
+        // INPUT'suz plan'lar artık geçerli (subgraph'lar sabit üretir veya dış
+        // veri çeker) — uçtan uca erişilebilir olduğu sürece hata yok.
         let plan = ExecutionPlan::new(
             vec![
                 make_node_with("n0", Opcode::Calc, &[("expr", "1")]),
@@ -869,11 +912,9 @@ mod tests {
             ],
             vec![Edge::new("n0", "n1")],
         );
-        let err = validate(&plan).unwrap_err();
         assert!(
-            err.iter().any(|e| e.message.contains("no INPUT")),
-            "should detect no INPUT, got: {:?}",
-            err
+            validate(&plan).is_ok(),
+            "input-less but reachable plan should validate"
         );
     }
 
@@ -892,16 +933,34 @@ mod tests {
                 Edge::new("n1", "n3"), // n3 is reachable but dead
             ],
         );
-        let err = validate(&plan).unwrap_err();
-        // n3 has an outgoing edge? no — it's dead code with no outgoing edges.
-        // The validator skips dead-code nodes (no outgoing edges) as harmless.
-        // Instead, n1 correctly gets flagged for 2 data outgoing edges as a non-branch node.
+        // A value feeding multiple consumers (fan-out) is valid dataflow — the VM
+        // runs consumers in topological order and each reads the value from context.
         assert!(
-            err.iter()
-                .any(|e| e.message.contains("data outgoing edges")),
-            "should report multi-data-edge on n1, got: {:?}",
-            err
+            validate(&plan).is_ok(),
+            "multi-consumer fan-out should be accepted: {:?}",
+            validate(&plan)
         );
+    }
+
+    #[test]
+    fn detect_fanout_allowed() {
+        // One producer, two consumers: valid dataflow (e.g. a parsed array read
+        // by both array.len and array.count_where).
+        let plan = ExecutionPlan::new(
+            vec![
+                make_node_with("n0", Opcode::Input, &[("name", "x")]),
+                make_node_with("n1", Opcode::Calc, &[("expr", "x")]),
+                make_node_with("n2", Opcode::Act, &[("type", "return")]),
+                make_node_with("n3", Opcode::Act, &[("type", "return")]),
+            ],
+            vec![
+                Edge::new("n0", "n1"),
+                Edge::new("n1", "n2"),
+                Edge::new("n1", "n3"),
+            ],
+        );
+        let res = validate(&plan);
+        assert!(res.is_ok(), "fanout should be valid, got: {:?}", res);
     }
 
     #[test]
@@ -1023,16 +1082,12 @@ mod tests {
             ],
             vec![
                 Edge::new("n0", "n1"),
-                Edge::new("n1", "n2"), // calc has 2 outgoing edges
+                Edge::new("n1", "n2"), // calc feeds two consumers
                 Edge::new("n1", "n3"),
             ],
         );
-        let err = validate(&plan).unwrap_err();
-        assert!(
-            err.iter().any(|e| e.message.contains("non-branch node")),
-            "should detect excess edges, got: {:?}",
-            err
-        );
+        // Multi-consumer fan-out from a non-branch node is valid dataflow.
+        assert!(validate(&plan).is_ok());
     }
 
     #[test]

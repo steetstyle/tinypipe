@@ -30,7 +30,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::plan::{EdgeKind, ExecutionPlan, Opcode, ToolDep, Type};
+use crate::plan::{ArgValue, EdgeKind, ExecutionPlan, Opcode, ToolDep, Type};
 
 // Re-export FlatBuffers root accessor so VM and other crates can use it
 pub use crate::fb::root_as_execution_plan;
@@ -144,7 +144,12 @@ impl CompiledPlan {
                 .iter()
                 .map(|a| CompiledArg {
                     key: a.key.clone(),
-                    value: serde_json::to_string(&a.value).unwrap_or_default(),
+                    // String'ler transform'dan zaten tırnaklı gelir — JSON encode
+                    // eklemek çift-encode olurdu. Diğer varyantlar JSON string'e çevrilir.
+                    value: match &a.value {
+                        ArgValue::String(s) => s.clone(),
+                        other => serde_json::to_string(other).unwrap_or_default(),
+                    },
                 })
                 .collect();
 

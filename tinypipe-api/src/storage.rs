@@ -49,6 +49,14 @@ pub trait GraphStorage: Send + Sync {
     /// Graph'ın execution_plan blob'unu (FlatBuffers IR) yükle.
     fn load_plan(&self, id: &GraphId) -> Result<Vec<u8>, StorageError>;
 
+    /// Tüm graph'ları listele (name→id çözümleme ve subgraph lookup için).
+    fn list_all_graphs(&self, limit: Option<u64>, offset: Option<u64>)
+        -> Result<Vec<GraphDefinition>, StorageError>;
+
+    /// İsme göre tekil graph bul (subgraph dispatch'in hızlı yolu —
+    /// tüm tablo taraması yerine indeksli sorgu).
+    fn find_graph_by_name(&self, name: &str) -> Result<GraphDefinition, StorageError>;
+
     /// Graph'ın belirli bir versiyonunun execution_plan blob'unu yükle
     /// (pause/resume ve scheduler için immutable versiyon okuma).
     fn load_plan_version(&self, id: &GraphId, version: Version) -> Result<Vec<u8>, StorageError>;
@@ -122,6 +130,93 @@ pub struct GraphTreeNode {
     pub children: Vec<GraphTreeNode>,
 }
 
+/// `Arc<T>` üzerinden paylaşılan storage erişimi (subgraph registry, scheduler).
+impl<T: GraphStorage> GraphStorage for std::sync::Arc<T> {
+    fn create_graph(&self, name: &str, code: &str) -> Result<GraphId, StorageError> {
+        self.as_ref().create_graph(name, code)
+    }
+    fn update_graph(&self, id: &GraphId, code: &str) -> Result<Version, StorageError> {
+        self.as_ref().update_graph(id, code)
+    }
+    fn deploy(&self, id: &GraphId, version: Version) -> Result<(), StorageError> {
+        self.as_ref().deploy(id, version)
+    }
+    fn rollback(&self, id: &GraphId, version: Version) -> Result<(), StorageError> {
+        self.as_ref().rollback(id, version)
+    }
+    fn list_versions(&self, id: &GraphId) -> Result<Vec<(u64, String, String)>, StorageError> {
+        self.as_ref().list_versions(id)
+    }
+    fn load_plan(&self, id: &GraphId) -> Result<Vec<u8>, StorageError> {
+        self.as_ref().load_plan(id)
+    }
+    fn list_all_graphs(
+        &self,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> Result<Vec<GraphDefinition>, StorageError> {
+        self.as_ref().list_all_graphs(limit, offset)
+    }
+    fn find_graph_by_name(&self, name: &str) -> Result<GraphDefinition, StorageError> {
+        self.as_ref().find_graph_by_name(name)
+    }
+    fn load_plan_version(&self, id: &GraphId, version: Version) -> Result<Vec<u8>, StorageError> {
+        self.as_ref().load_plan_version(id, version)
+    }
+    fn save_plan(&self, id: &GraphId, version: Version, plan: &[u8]) -> Result<(), StorageError> {
+        self.as_ref().save_plan(id, version, plan)
+    }
+    fn load_graph(&self, id: &GraphId) -> Result<GraphDefinition, StorageError> {
+        self.as_ref().load_graph(id)
+    }
+    fn save_execution(&self, exec: &Execution) -> Result<(), StorageError> {
+        self.as_ref().save_execution(exec)
+    }
+    fn save_step(&self, step: &ExecutionStep) -> Result<(), StorageError> {
+        self.as_ref().save_step(step)
+    }
+    fn load_execution(&self, id: &str) -> Result<Execution, StorageError> {
+        self.as_ref().load_execution(id)
+    }
+    fn list_executions(
+        &self,
+        graph_id: &GraphId,
+        limit: Option<u64>,
+    ) -> Result<Vec<Execution>, StorageError> {
+        self.as_ref().list_executions(graph_id, limit)
+    }
+    fn list_steps(&self, execution_id: &str) -> Result<Vec<ExecutionStep>, StorageError> {
+        self.as_ref().list_steps(execution_id)
+    }
+    fn list_paused_executions(&self) -> Result<Vec<Execution>, StorageError> {
+        self.as_ref().list_paused_executions()
+    }
+    fn save_checkpoint(&self, execution_id: &str, blob: &[u8]) -> Result<(), StorageError> {
+        self.as_ref().save_checkpoint(execution_id, blob)
+    }
+    fn load_checkpoint(&self, execution_id: &str) -> Result<Vec<u8>, StorageError> {
+        self.as_ref().load_checkpoint(execution_id)
+    }
+    fn fork_graph(
+        &self,
+        id: &GraphId,
+        fork_node: &str,
+        code: &str,
+        label: Option<&str>,
+    ) -> Result<GraphId, StorageError> {
+        self.as_ref().fork_graph(id, fork_node, code, label)
+    }
+    fn list_children(&self, id: &GraphId) -> Result<Vec<GraphDefinition>, StorageError> {
+        self.as_ref().list_children(id)
+    }
+    fn graph_lineage(&self, id: &GraphId) -> Result<Vec<GraphDefinition>, StorageError> {
+        self.as_ref().graph_lineage(id)
+    }
+    fn graph_tree(&self, id: &GraphId) -> Result<GraphTreeNode, StorageError> {
+        self.as_ref().graph_tree(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +245,18 @@ mod tests {
         }
 
         fn load_plan(&self, _id: &GraphId) -> Result<Vec<u8>, StorageError> {
+            Err(StorageError::Internal("not implemented".into()))
+        }
+
+        fn list_all_graphs(
+            &self,
+            _limit: Option<u64>,
+            _offset: Option<u64>,
+        ) -> Result<Vec<GraphDefinition>, StorageError> {
+            Ok(Vec::new())
+        }
+
+        fn find_graph_by_name(&self, _name: &str) -> Result<GraphDefinition, StorageError> {
             Err(StorageError::Internal("not implemented".into()))
         }
 
