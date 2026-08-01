@@ -706,7 +706,7 @@ $ TINYPIPE_SERVER_TOKEN=secret tinypipe-server
 
 ```python
 META(title="hello", http_route="hello", http_method="GET",
-     http_public="true", http_cache_ttl=30)
+     http_public="true", http_timeout_ms=0, http_cache_ttl=30)
 
 def graph(name):
     return "hello " + name
@@ -715,17 +715,21 @@ def graph(name):
 Then deploy it and it's live at `GET /hello?name=world`:
 
 ```
-http_route     published path at the root (leading / optional).
-               Reserved prefixes are rejected: api, healthz, assets, static.
-http_method    one of "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"
-               (default POST); anything else fails the deploy. "OPTIONS" is
-               reserved — it is served automatically (see below).
-http_public    "true" skips token auth (META only accepts string literals,
-               so booleans are written as "true"/"false").
+Publishing is all-or-nothing: if ANY http_* key is present, ALL five below
+must be defined — there are no defaults or fallbacks, missing any fails the
+deploy with the list of missing keys.
+
+http_route       published path at the root (leading / optional).
+                 Reserved prefixes are rejected: api, healthz, assets, static.
+http_method      one of "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"
+                 (no default — required). "OPTIONS" is reserved — it is served
+                 automatically (see below).
+http_public      "true" skips token auth (META only accepts string literals,
+                 so booleans are written as "true"/"false").
 http_timeout_ms  VM timeout override for this route (0 = plan default).
-http_cache_ttl  response cache in seconds for idempotent methods
-               (GET/HEAD/DELETE, 0 = off). Cache hits return
-               X-Tinypipe-Cache: HIT.
+http_cache_ttl   response cache in seconds for idempotent methods
+                 (GET/HEAD/DELETE, 0 = off). Cache hits return
+                 X-Tinypipe-Cache: HIT.
 ```
 
 **Inputs per method:** GET/HEAD/DELETE take inputs from query params
@@ -739,12 +743,12 @@ Inputs come only from query params or the JSON body, and the environment is
 always empty — `Authorization`, `Cookie`, and any other header can never reach
 your graph or its tools.
 
-**Method mismatch:** wrong method → `405` with an `Allow` header listing what
-the path accepts. Different methods may be published on the same path from
-different graphs (`GET /items` + `PUT /items`), but the same (path, method)
-pair is owned by one graph (`409` on conflict). Unknown `http_*` keys and
-invalid `http_method` fail fast — at startup for existing graphs, or as a
-`400`/`409` when creating/updating.
+**Endpoint uniqueness:** the same (path, method) pair can never be actively
+published twice. Create/update → `409`; deploy/rollback to a version whose
+route conflicts is also rejected `409` *before* the mutation is written.
+Different methods may share a path from different graphs (`GET /items` +
+`PUT /items`). Unknown `http_*` keys and invalid `http_method` fail fast —
+at startup for existing graphs, or as a `400`/`409` when creating/updating.
 
 **Endpoint map** (CLI → REST):
 

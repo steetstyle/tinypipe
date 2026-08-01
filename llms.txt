@@ -77,13 +77,15 @@ TINYPIPE_SERVER_TOKEN=secret tinypipe-server   # addr: TINYPIPE_SERVER_ADDR (def
 ```
 
 Publishing = `http_*` keys in `META(...)` (META only accepts string/number/list
-literals, so booleans are written as strings: `http_public="true"`):
+literals, so booleans are written as strings: `http_public="true"`). **All or
+nothing:** if ANY `http_*` key is present, all five below must be defined — no
+defaults, no fallbacks (missing → hard error listing the missing keys):
 
 | META key | Meaning |
 |---|---|
 | `http_route` | root-level path (leading `/` optional); `api`/`healthz`/`assets`/`static` prefixes reserved |
-| `http_method` | `"GET"`/`"POST"`/`"PUT"`/`"PATCH"`/`"DELETE"`/`"HEAD"` (default POST); `"OPTIONS"` rejected (auto-served); invalid → hard error, no fallback |
-| `http_public` | `"true"` → no token required (default `"false"`) |
+| `http_method` | required, no default: `"GET"`/`"POST"`/`"PUT"`/`"PATCH"`/`"DELETE"`/`"HEAD"`; `"OPTIONS"` rejected (auto-served); invalid → hard error |
+| `http_public` | `"true"` → no token required |
 | `http_timeout_ms` | VM timeout override (0 = plan default) |
 | `http_cache_ttl` | response cache seconds for GET/HEAD/DELETE (0 = off); header `X-Tinypipe-Cache: HIT` |
 
@@ -92,10 +94,12 @@ HEAD executes like GET, returns headers only (no body). OPTIONS never executes
 the graph — published paths answer CORS preflight automatically (204 + `Allow`).
 **Header isolation:** published routes never read request headers — inputs come
 only from query/body and env is always empty, so `Authorization`/`Cookie` can
-never reach the graph. Wrong method → 405 + `Allow` header. Different methods
-can share a path from different graphs; same (path, method) pair is owned by
-one graph (409). Invalid `http_*` keys / duplicate routes / reserved paths →
-startup fails fast for existing graphs, or 400/409 on create/update.
+never reach the graph. Wrong method → 405 + `Allow` header. The same (path,
+method) pair can never be published twice: create/update → 409, and
+deploy/rollback to a conflicting version → 409 *before* the mutation is
+written. Different methods can share a path from different graphs. Invalid
+`http_*` keys / missing keys / reserved paths → startup fails fast for existing
+graphs, or 400/409 on create/update.
 
 Endpoint map (CLI → REST):
 

@@ -59,20 +59,22 @@ pub fn route_key(path: &str, method: RouteMethod) -> String {
     format!("{path}\u{1}{}", method.as_str())
 }
 
-/// `META(...)`'taki `http_*` sözleşmesi.
+/// `META(...)`'taki `http_*` sözleşmesi — "ya hep ya hiç".
 ///
-/// Desteklenen anahtarlar:
+/// Yayınlama için `http_` önekiyle başlayan **herhangi bir** anahtarın
+/// varlığı yeterlidir; o noktada aşağıdaki 5 anahtarın TAMAMI tanımlanmalıdır
+/// (hiçbiri için default/fallback yoktur, eksik → HATA):
 /// - `http_route` (string) — yayın yolu; kök seviyede yaşar (`/send-email`).
 ///   `/api`, `/healthz` önekleri rezervdir ve reddedilir.
-/// - `http_method` (string) — `"GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"`
-///   (varsayılan `POST`). Geçersiz değer HATA döner, fallback yoktur.
-///   Input kaynağı: GET/HEAD/DELETE → query param'lar, POST/PUT/PATCH → JSON body.
-///   `OPTIONS` yayınlanamaz; yayınlanmış her path'te otomatik CORS preflight
-///   (204 + `Allow`) döner.
-/// - `http_public` (bool) — `true` ise token gerektirmez (varsayılan `false`).
+/// - `http_method` (string) — `"GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"`.
+///   Default YOKTUR. Input kaynağı: GET/HEAD/DELETE → query param'lar,
+///   POST/PUT/PATCH → JSON body. `OPTIONS` yayınlanamaz; yayınlanmış her
+///   path'te otomatik CORS preflight (204 + `Allow`) döner.
+/// - `http_public` (bool) — `true` ise token gerektirmez.
 /// - `http_timeout_ms` (u32) — VM zaman aşımı override (0 = plan varsayılanı).
 /// - `http_cache_ttl` (u32) — GET yanıt önbelleği süresi sn (0 = kapalı).
 ///
+/// Hiçbir `http_` anahtarı yoksa graph yayınlanmaz (Ok(None)).
 /// `http_` önekiyle başlayan bilinmeyen anahtar da hata verir (yazım hatası yakalar).
 pub fn parse_route_config(meta_json: &str, graph_name: &str) -> Result<Option<RouteConfig>, String> {
     if meta_json.trim().is_empty() {
@@ -85,14 +87,17 @@ pub fn parse_route_config(meta_json: &str, graph_name: &str) -> Result<Option<Ro
         _ => return Err(format!("graph '{graph_name}': META must be a JSON object")),
     };
 
-    let Some(route_val) = obj.get("http_route") else {
-        return Ok(None); // yayınlanmamış
-    };
+    const REQUIRED: [&str; 5] = [
+        "http_route",
+        "http_method",
+        "http_public",
+        "http_timeout_ms",
+        "http_cache_ttl",
+    ];
 
     let mut unknown: Vec<&String> = obj
         .keys()
-        .filter(|k| k.starts_with("http_") && !matches!(k.as_str(),
-            "http_route" | "http_method" | "http_public" | "http_timeout_ms" | "http_cache_ttl"))
+        .filter(|k| k.starts_with("http_") && !REQUIRED.contains(&k.as_str()))
         .collect();
     unknown.sort();
     if !unknown.is_empty() {
@@ -102,8 +107,26 @@ pub fn parse_route_config(meta_json: &str, graph_name: &str) -> Result<Option<Ro
         ));
     }
 
-    let route_raw = match route_val {
-        serde_json::Value::String(s) => s.clone(),
+    let has_http = obj.keys().any(|k| k.starts_with("http_"));
+    if !has_http {
+        return Ok(None); // yayınlanmamış
+    }
+
+    // Ya hep ya hiç: tek bir http_* anahtarı bile varsa hepsi zorunlu.
+    let missing: Vec<&str> = REQUIRED
+        .iter()
+        .copied()
+        .filter(|k| !obj.contains_key(*k) || matches!(obj.get(*k), Some(serde_json::Value::Null)))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "graph '{graph_name}': publishing requires all http_* keys (missing: {})",
+            missing.join(", ")
+        ));
+    }
+
+    let route_raw = match obj.get("http_route") {
+        Some(serde_json::Value::String(s)) => s.clone(),
         _ => return Err(format!("graph '{graph_name}': `http_route` must be a string")),
     };
     let path = route_raw.trim().trim_start_matches('/').to_string();
@@ -130,7 +153,13 @@ pub fn parse_route_config(meta_json: &str, graph_name: &str) -> Result<Option<Ro
     }
 
     let method = match obj.get("http_method") {
-        None | Some(serde_json::Value::Null) => RouteMethod::Post,
+        // Eksik anahtar üstteki "hepsi zorunlu" kontrolünde yakalanır;
+        // burada default/fallback YOK.
+        None | Some(serde_json::Value::Null) => {
+            return Err(format!(
+                "graph '{graph_name}': `http_method` is required (no default; missing keys are reported above)"
+            ))
+        }
         Some(serde_json::Value::String(s)) => match s.to_uppercase().as_str() {
             "GET" => RouteMethod::Get,
             "POST" => RouteMethod::Post,

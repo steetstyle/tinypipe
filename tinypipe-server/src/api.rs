@@ -18,7 +18,7 @@ use crate::engine::{
     build_env, load_plan_self_heal, refresh_all, resolve_graph, resume_execution, run_execution,
     run_scheduler,
 };
-use crate::meta::parse_route_config;
+use crate::meta::{parse_route_config, route_key};
 use crate::state::AppState;
 
 // ==================== Errors ====================
@@ -360,13 +360,28 @@ async fn validate_route_conflict(
     code: &str,
 ) -> ApiResult<()> {
     let compiled = compile(code).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    if let Some(rc) = parse_route_config(&compiled.compiled.metadata.meta_json, "")
-        .map_err(ApiError::BadRequest)?
-    {
+    check_route_conflict(state, graph_id, &compiled.compiled.metadata.meta_json).await
+}
+
+/// Deploy/rollback öncesi: hedef versiyonun plan'ındaki route'u, mutasyon
+/// DB'ye yazılmadan önce tabloya karşı doğrular — aynı (path, method) çifti
+/// "aktif" olarak iki kez tanımlanamaz (409, değişiklik yapılmaz).
+async fn validate_route_conflict_for_plan(
+    state: &Arc<AppState>,
+    graph_id: &str,
+    plan_bytes: &[u8],
+) -> ApiResult<()> {
+    let plan = tinypipe_ir::compiled::CompiledPlan::from_fb_bytes(plan_bytes)
+        .map_err(|e| ApiError::BadRequest(format!("plan decode: {e}")))?;
+    check_route_conflict(state, graph_id, &plan.metadata.meta_json).await
+}
+
+async fn check_route_conflict(state: &Arc<AppState>, graph_id: &str, meta_json: &str) -> ApiResult<()> {
+    if let Some(rc) = parse_route_config(meta_json, "").map_err(ApiError::BadRequest)? {
         // Aynı (path, method) çifti tek graph'a aittir; farklı metodlar farklı
         // graph'lardan aynı path'e yayınlanabilir (ör. GET + POST /items).
         let routes = state.routes.read().await;
-        let key = crate::meta::route_key(&rc.path, rc.method);
+        let key = route_key(&rc.path, rc.method);
         if let Some(existing) = routes.get(&key) {
             if existing.graph_id != graph_id {
                 return Err(ApiError::Conflict(format!(
@@ -469,6 +484,13 @@ pub async fn deploy_graph(
             .map(|(v, _, _)| *v)
             .ok_or_else(|| ApiError::NotFound("no versions to deploy".into()))?,
     };
+    // Hedef versiyonun route'u çakışıyorsa deploy ÖNCESİ reddet
+    // (mutasyon yazılmaz; refresh_all post-hoc hata bırakmaz).
+    let plan_bytes = state
+        .storage
+        .load_plan_version(&graph.id, Version(version))
+        .map_err(|e| err_from(e.to_string()))?;
+    validate_route_conflict_for_plan(&state, &graph.id.0, &plan_bytes).await?;
     state
         .storage
         .deploy(&graph.id, Version(version))
@@ -492,6 +514,12 @@ pub async fn rollback_graph(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_token(&state, &headers)?;
     let graph = resolve_graph(&state.storage, &id).map_err(err_from)?;
+    // Rollback edilecek versiyonun route'u çakışıyorsa ÖNCEDEN reddet.
+    let plan_bytes = state
+        .storage
+        .load_plan_version(&graph.id, Version(req.version))
+        .map_err(|e| err_from(e.to_string()))?;
+    validate_route_conflict_for_plan(&state, &graph.id.0, &plan_bytes).await?;
     state
         .storage
         .rollback(&graph.id, Version(req.version))
