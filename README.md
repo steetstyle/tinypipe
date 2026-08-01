@@ -559,8 +559,13 @@ def graph(user_id: int):
 ```
 
 ```bash
-$ tinypipe-cli create seed_users "<code>"      # then the same for seed_posts,
-$ tinypipe-cli create seed_comments "<code>"   # seed_albums, seed_photos, seed_todos
+# Leaf graphs first, then the parent
+$ tinypipe-cli create seed_users "<seed_users code>"
+$ tinypipe-cli create seed_posts "<seed_posts code>"
+$ tinypipe-cli create seed_albums "<seed_albums code>"
+$ tinypipe-cli create seed_photos "<seed_photos code>"
+$ tinypipe-cli create seed_todos "<seed_todos code>"
+$ tinypipe-cli create seed_comments "<seed_comments code>"
 $ tinypipe-cli create dashboard_seeds "<parent code>"
 $ tinypipe-cli execute dashboard_seeds '{"user_id": 1}'
 ✓ Execution completed
