@@ -46,26 +46,37 @@ $ tinypipe-cli execute hello '{"x": 42}'
 # Env variables + pre-execution env check
 # `env.get` / `env.template` tools read environment variables.
 # execute/resume/scheduler validate the root graph + all transitive subgraphs'
-# required variables BEFORE execution; if any are missing, the run is aborted:
+# required variables BEFORE execution; if any are missing, the run is aborted.
+# Realistic example — pull orders from an API (base URL from env) and persist
+# them via a subgraph (DB path from env):
 
-$ tinypipe-cli create env_root 'def graph():
-    u = call("env.get", key="ROOT_REQ")
-    return u'
-$ tinypipe-cli create env_child 'def graph():
-    d = call("env.get", key="CHILD_REQ")
-    return d'
-$ tinypipe-cli create env_parent 'def graph():
-    c = call("subgraph:env_child")
-    return call("env.get", key="ROOT_REQ")'
+$ cat .env
+API_BASE_URL=https://jsonplaceholder.typicode.com
+ORDER_DB_PATH=./tinypipe_orders.db
 
-$ tinypipe-cli execute env_parent
+# store_orders — child graph: persists the fetched orders into SQLite
+$ tinypipe-cli create store_orders 'def graph(orders: list):
+    db = call("env.get", key="ORDER_DB_PATH")
+    call("sqlite.query", db=db, query="CREATE TABLE IF NOT EXISTS orders(id INTEGER)")
+    return call("array.len", array=orders)'
+
+# order_sync — parent: builds the API URL from env, fetches, delegates to child
+$ tinypipe-cli create order_sync 'def graph():
+    base = call("env.template", value="${API_BASE_URL}/users")
+    resp = call("http_request", url=base)
+    orders = call("json.parse", json=resp.body)
+    return call("subgraph:store_orders", orders=orders)'
+
+# Missing vars are caught before execution — including the subgraph's:
+$ tinypipe-cli execute order_sync
 ✗ Missing environment variables:
-  env_parent.ROOT_REQ
-  env_parent → env_child.CHILD_REQ
+  order_sync.API_BASE_URL
+  order_sync → store_orders.ORDER_DB_PATH
 exit 1
 
-$ tinypipe-cli execute env_parent --env ROOT_REQ=yes --env CHILD_REQ=dbprod
+$ tinypipe-cli execute order_sync --env-file .env
 ✓ Execution completed
+  Output: 10
 
 # Precedence: --env overrides → --env-file → OS env.
 # --no-env-check: skips the check (for graphs using dynamic keys;

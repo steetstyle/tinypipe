@@ -112,11 +112,14 @@ fn validate_calc(node: &Node) -> Result<(), String> {
         None => return Ok(()),
     };
 
-    // Check for string operations that don't make sense
+    // Check for string operations that don't make sense.
+    // Numeric op / string detection, string literal'lerin DIŞINDA yapılır —
+    // yoksa `"https://api/x"` gibi URL'lerdeki `/` false positive üretir.
+    let stripped = strip_string_literals(expr);
     let has_string = has_string_literal(expr);
-    let has_numeric_op = expr.contains('/') || expr.contains('*') || expr.contains('%');
+    let has_numeric_op = stripped.contains('/') || stripped.contains('*') || stripped.contains('%');
 
-    if has_string && has_numeric_op && !expr.contains('+') {
+    if has_string && has_numeric_op && !stripped.contains('+') {
         // String / number or string * number without +
         // Note: string + number is potentially OK (concatenation)
         return Err(format!(
@@ -127,7 +130,7 @@ fn validate_calc(node: &Node) -> Result<(), String> {
 
     // Check for boolean arithmetic
     let has_bool = expr.contains("true") || expr.contains("false");
-    if has_bool && (expr.contains('/') || expr.contains('*') || expr.contains('-')) {
+    if has_bool && (stripped.contains('/') || stripped.contains('*') || stripped.contains('-')) {
         return Err(format!(
             "Type error in expression '{}': arithmetic on boolean values is not allowed",
             expr
@@ -255,6 +258,26 @@ fn has_string_literal(expr: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// String literal'leri (tırnak bölgelerini) expr'den ayıklar; kalan kısımdaki
+/// operatörler gerçek aritmetiktir. Escape'li tırnaklar hesaba katılır.
+fn strip_string_literals(expr: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let escaped = i > 0 && bytes[i - 1] == b'\\';
+        if (b == b'"' || b == b'\'') && !escaped {
+            in_str = !in_str;
+        } else if !in_str {
+            out.push(b as char);
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Parse a type name string into a Type enum.
