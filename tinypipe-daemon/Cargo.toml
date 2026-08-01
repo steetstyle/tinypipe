@@ -1,0 +1,22 @@
+[package]
+name = "tinypipe-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "tinypipe gRPC daemon — worker'ları ağırlar ve CLI tool çağrılarını yönlendirir (pull mimarisi)"
+
+[dependencies]
+tinypipe-proto = { path = "../tinypipe-proto" }
+tonic.workspace = true
+tokio.workspace = true
+dashmap.workspace = true
+uuid.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tinypipe-api = { path = "../tinypipe-api" }
+tinypipe-env = { path = "../tinypipe-env" }

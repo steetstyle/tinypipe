@@ -156,6 +156,10 @@ pub struct Node {
     /// `None` = global scope (branch dışı veya PARALLEL yok).
     /// `Some(id)` = bu node, branch `id`'ye ait.
     pub branch_id: Option<u32>,
+    /// GROUP metadata'sı: `with GROUP("...")` bloğu içinde oluşturulan
+    /// node'ların görsel grup başlığı. Yalnızca görüntüleme amaçlıdır;
+    /// VM yürütme semantiğini etkilemez.
+    pub group: Option<String>,
 }
 
 impl Node {
@@ -166,6 +170,7 @@ impl Node {
             args: Vec::new(),
             inferred_type: None,
             branch_id: None,
+            group: None,
         }
     }
 
@@ -177,6 +182,12 @@ impl Node {
     /// Bu node'u belirtilen PARALLEL branch'ine ata.
     pub fn with_branch(mut self, branch_id: u32) -> Self {
         self.branch_id = Some(branch_id);
+        self
+    }
+
+    /// Bu node'u bir GROUP başlığına ata (display-only metadata).
+    pub fn with_group(mut self, group: &str) -> Self {
+        self.group = Some(group.to_owned());
         self
     }
 }
@@ -276,6 +287,11 @@ pub struct Metadata {
     pub tool_deps: Vec<ToolDep>,
     /// Subgraph dependencies (targets starting with "subgraph:").
     pub subgraph_dependencies: Vec<String>,
+    /// META(...) bloğundan gelen opak JSON (title, description, owner, tags,
+    /// sla_ms, ...). Bilinmeyen anahtarlar olduğu gibi saklanır — yeni alan
+    /// eklemek şema değişikliği gerektirmez.
+    #[serde(default)]
+    pub meta_json: String,
 }
 
 impl Default for Metadata {
@@ -292,6 +308,7 @@ impl Default for Metadata {
             optimizations: Vec::new(),
             tool_deps: Vec::new(),
             subgraph_dependencies: Vec::new(),
+            meta_json: String::new(),
         }
     }
 }

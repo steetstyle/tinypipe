@@ -30,11 +30,13 @@
 use std::collections::HashMap;
 
 use tinypipe_api::storage::GraphStorage;
-use tinypipe_api::types::{Context, Value};
+use tinypipe_api::tool_registry::ToolRegistry;
+use tinypipe_api::types::{CallTarget, Context, Value};
 use tinypipe_api::types::{Execution, ExecutionStatus, ExecutionStep};
 use tinypipe_api::types::{GraphId, Version};
 use tinypipe_compiler::{auto_repair, compile};
 use tinypipe_storage::SqliteStorage;
+use tinypipe_tools::daemon::{daemon_addr_from_env, list_daemon_tools, register_daemon_tools};
 use tinypipe_tools::{default_tools, SubgraphToolRegistry};
 use tinypipe_vm::CompiledExecutor;
 
@@ -75,7 +77,19 @@ fn main() {
         eprintln!("  resume <execution_id> [--max-nodes N]          Resume a paused execution");
         eprintln!("  scheduler run [--max-nodes N]                  Resume all paused executions");
         eprintln!("  plan <id> [version] [--format text|mermaid|dot]");
-        eprintln!("                                   Dump the compiled plan");
+        eprintln!("        [--view full|summary|layers] [--direction td|lr] [--profile <name>]");
+        eprintln!("                                   Dump the compiled plan (role profiles apply)");
+        eprintln!("  report [--profile <name>] [--env KEY=V] [--env-file <path>]");
+        eprintln!("                                   Role-based portfolio report");
+        eprintln!("  profiles list                    List all profiles (builtin + custom)");
+        eprintln!("  profiles show <name>             Show a profile");
+        eprintln!("  profiles create <name> [--label L] [--description D] [--view v] [--direction d] [--focus a,b] [--config <json>]");
+        eprintln!("                                   Create a custom profile");
+        eprintln!("  profiles delete <name>           Delete a custom profile (builtin protected)");
+        eprintln!("  tools list                       List built-in + daemon tools");
+        eprintln!("  tools test <name> '<json args>' [--env KEY=V]");
+        eprintln!("                                   Test a tool with JSON args");
+        eprintln!("  daemon status [addr]             Check the tool daemon (default: TINYPIPE_DAEMON_ADDR)");
         eprintln!("  list                              List graphs");
         eprintln!("  check <code>                      Check code for errors");
         eprintln!();
@@ -231,7 +245,7 @@ fn main() {
         }
         "plan" => {
             if args.len() < 3 {
-                eprintln!("Usage: tinypipe-cli plan <id> [version] [--format text|mermaid|dot]");
+                eprintln!("Usage: tinypipe-cli plan <id> [version] [--format text|mermaid|dot] [--view full|summary|layers] [--direction td|lr] [--profile <name>]");
                 std::process::exit(1);
             }
             let version = args
@@ -245,7 +259,67 @@ fn main() {
                 .and_then(|pos| args.get(pos + 1))
                 .and_then(|s| tinypipe_ir::PlanFormat::parse(s))
                 .unwrap_or(tinypipe_ir::PlanFormat::Text);
-            cmd_plan_dump(&args[2], version, format);
+            let view = args
+                .iter()
+                .position(|a| a == "--view")
+                .and_then(|pos| args.get(pos + 1))
+                .and_then(|s| tinypipe_ir::plan_view::ViewLevel::parse(s))
+                .unwrap_or(tinypipe_ir::plan_view::ViewLevel::Full);
+            let direction = args
+                .iter()
+                .position(|a| a == "--direction")
+                .and_then(|pos| args.get(pos + 1))
+                .and_then(|s| tinypipe_ir::plan_view::Direction::parse(s))
+                .unwrap_or(tinypipe_ir::plan_view::Direction::Td);
+            let mut options = tinypipe_ir::plan_view::RenderOptions {
+                view,
+                direction,
+                numbered_groups: true,
+            };
+            // Rol profili: explicit --view/--direction flag'leri kazanır.
+            if let Some(pos) = args.iter().position(|a| a == "--profile") {
+                let profile_name = match args.get(pos + 1) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("Error: --profile requires a name");
+                        std::process::exit(1);
+                    }
+                };
+                let storage = open_storage();
+                match tinypipe_insight::profile::resolve(&storage, profile_name) {
+                    Ok(Some(profile)) => {
+                        if args.iter().position(|a| a == "--view").is_none() {
+                            options.view = tinypipe_ir::plan_view::ViewLevel::parse(&profile.view)
+                                .unwrap_or(tinypipe_ir::plan_view::ViewLevel::Full);
+                        }
+                        if args.iter().position(|a| a == "--direction").is_none() {
+                            options.direction = tinypipe_ir::plan_view::Direction::parse(
+                                &profile.direction,
+                            )
+                            .unwrap_or(tinypipe_ir::plan_view::Direction::Td);
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("Error: unknown profile '{profile_name}'");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error loading profile '{profile_name}': {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            cmd_plan_dump(&args[2], version, format, options);
+        }
+        "report" => {
+            let profile_name = args
+                .iter()
+                .position(|a| a == "--profile")
+                .and_then(|pos| args.get(pos + 1).cloned());
+            cmd_report(profile_name.as_deref(), &args[2..]);
+        }
+        "profiles" => {
+            cmd_profiles(&args[2..]);
         }
         "check" => {
             if args.len() < 3 {
@@ -254,9 +328,15 @@ fn main() {
             }
             cmd_check(&unescape_code(&args[2]));
         }
+        "tools" => {
+            cmd_tools(&args[2..]);
+        }
+        "daemon" => {
+            cmd_daemon(&args[2..]);
+        }
         _ => {
             eprintln!("Unknown command: {command}");
-            eprintln!("Commands: create, deploy, rollback, versions, update, execute, resume, scheduler, list, check");
+            eprintln!("Commands: create, deploy, rollback, versions, update, execute, resume, scheduler, list, plan, report, profiles, tools, daemon, check");
             std::process::exit(1);
         }
     }
@@ -620,6 +700,183 @@ fn parse_env_args(args: &[String]) -> tinypipe_env::Env {
     tinypipe_env::Env::new(providers)
 }
 
+/// Registry kurar: built-in tool'lar + daemon'dan remote tool'lar (çakışan
+/// isimlerde built-in kazanır). Daemon yoksa sessizce built-in'lerle devam eder;
+/// `TINYPIPE_NO_DAEMON=1` ile daemon bağlantısı tamamen atlanır.
+fn build_registry(storage: SqliteStorage) -> std::sync::Arc<SubgraphToolRegistry<SqliteStorage>> {
+    let tools = default_tools();
+    if std::env::var("TINYPIPE_NO_DAEMON").is_err() {
+        let addr = daemon_addr_from_env();
+        match register_daemon_tools(&tools, &addr) {
+            Ok(n) if n > 0 => {
+                eprintln!("  daemon tools registered: {n} (via {addr})");
+            }
+            _ => {} // daemon kapalı — sadece built-in'ler
+        }
+    }
+    std::sync::Arc::new(SubgraphToolRegistry::with_tools(storage, tools)).init()
+}
+
+/// `tinypipe-cli tools list|test ...`
+fn cmd_tools(args: &[String]) {
+    match args.first().map(|s| s.as_str()) {
+        Some("list") => cmd_tools_list(),
+        Some("test") => {
+            if args.len() < 3 {
+                eprintln!("Usage: tinypipe-cli tools test <name> '<json args>' [--env KEY=V]");
+                std::process::exit(1);
+            }
+            cmd_tools_test(&args[1], &args[2], &args[3..]);
+        }
+        Some(other) => {
+            eprintln!("Unknown tools subcommand: {other}");
+            eprintln!("Commands: list, test");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("Usage: tinypipe-cli tools list | test <name> '<json args>'");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `tinypipe-cli tools list` — built-in + daemon tool'larını listeler.
+fn cmd_tools_list() {
+    let reg = default_tools();
+    let builtin = reg.tool_names();
+    println!("Built-in tools ({}):", builtin.len());
+    for name in &builtin {
+        println!("  {name}");
+    }
+
+    let addr = daemon_addr_from_env();
+    match list_daemon_tools(&addr) {
+        Ok(tools) if !tools.is_empty() => {
+            println!();
+            println!("Daemon tools ({} via {addr}):", tools.len());
+            for t in &tools {
+                let timeout = if t.timeout_ms > 0 {
+                    format!(" [timeout {}ms]", t.timeout_ms)
+                } else {
+                    String::new()
+                };
+                println!("  {} — {}{timeout}", t.name, t.description);
+            }
+        }
+        Ok(_) => {
+            println!();
+            println!("Daemon: OK ({addr}) but no tools registered — bir worker bağlayın.");
+        }
+        Err(e) => {
+            println!();
+            println!("Daemon tools: unreachable ({addr})");
+            println!("  {e}");
+            println!("  İpucu: `tinypipe-daemon` binary'sini çalıştırın ve worker'ları bağlayın.");
+        }
+    }
+}
+
+/// `tinypipe-cli tools test <name> '<json args>'` — tool'u doğrudan çalıştırır.
+fn cmd_tools_test(tool: &str, args_json: &str, rest: &[String]) {
+    let (kwargs_json, env_args): (Vec<&String>, Vec<String>) = {
+        let mut kwargs = Vec::new();
+        let mut env = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            if rest[i] == "--kwargs" && rest.get(i + 1).is_some() {
+                kwargs.push(&rest[i + 1]);
+                i += 2;
+                continue;
+            }
+            env.push(rest[i].clone());
+            i += 1;
+        }
+        (kwargs, env)
+    };
+    let env = parse_env_args(&env_args);
+    let reg = default_tools();
+    if std::env::var("TINYPIPE_NO_DAEMON").is_err() {
+        let addr = daemon_addr_from_env();
+        match register_daemon_tools(&reg, &addr) {
+            Ok(n) if n > 0 => eprintln!("daemon tools registered: {n} (via {addr})"),
+            _ => {}
+        }
+    }
+    let args: Vec<Value> = match serde_json::from_str::<serde_json::Value>(args_json) {
+        Ok(serde_json::Value::Array(arr)) => arr.into_iter().map(json_val_to_tp).collect(),
+        Ok(v) => vec![json_val_to_tp(v)],
+        Err(e) => {
+            eprintln!("Error: invalid JSON args: {e}");
+            std::process::exit(1);
+        }
+    };
+    let kwargs = kwargs_json
+        .first()
+        .map(|json| serde_json::from_str::<serde_json::Value>(json))
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("Error: invalid JSON kwargs: {e}");
+            std::process::exit(1);
+        })
+        .map(json_val_to_tp)
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let kwargs = match kwargs {
+        Value::Object(map) => map,
+        _ => {
+            eprintln!("Error: --kwargs must be a JSON object");
+            std::process::exit(1);
+        }
+    };
+    let mut ct = CallTarget::new(tool);
+    ct.args = args;
+    ct.kwargs = kwargs;
+    let start = std::time::Instant::now();
+    match reg.dispatch(&ct, &Context::new(), &env) {
+        Ok(value) => {
+            println!(
+                "✓ {tool} → {}",
+                serde_json::to_string_pretty(&tp_val_to_json(&value)).unwrap_or_default()
+            );
+            println!("  duration: {:?}", start.elapsed());
+        }
+        Err(e) => {
+            eprintln!("✗ {tool} failed: {e}");
+            eprintln!("  duration: {:?}", start.elapsed());
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `tinypipe-cli daemon status [addr]`
+fn cmd_daemon(args: &[String]) {
+    match args.first().map(|s| s.as_str()) {
+        Some("status") => {
+            let addr = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(daemon_addr_from_env);
+            match list_daemon_tools(&addr) {
+                Ok(tools) => {
+                    println!("Daemon: OK ({addr})");
+                    println!("Registered tools: {}", tools.len());
+                    for t in &tools {
+                        println!("  {} — {}", t.name, t.description);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Daemon: UNREACHABLE ({addr})");
+                    eprintln!("  {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => {
+            eprintln!("Usage: tinypipe-cli daemon status [addr]");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Execution'dan ÖNCE env bağımlılık kontrolü: kök grafik + transitive
 /// subgraph'ların zorunlu değişkenleri ortamda yoksa listeler ve exit(1).
 /// `--no-env-check` ile atlanabilir (dinamik key kullanan grafikler için).
@@ -702,11 +959,7 @@ fn cmd_execute(id: &str, input_json: &str, pause_after: Option<u32>, env: tinypi
         .save_execution(&execution)
         .expect("Failed to save execution");
 
-    let registry = std::sync::Arc::new(SubgraphToolRegistry::with_tools(
-        storage,
-        default_tools(),
-    ))
-    .init();
+    let registry = build_registry(storage);
     if !skip_env_check {
         run_env_check(registry.as_ref(), id, &env);
     }
@@ -854,11 +1107,7 @@ fn cmd_resume(execution_id: &str, max_nodes: Option<u32>, env: tinypipe_env::Env
         }
     };
 
-    let registry = std::sync::Arc::new(SubgraphToolRegistry::with_tools(
-        storage,
-        default_tools(),
-    ))
-    .init();
+    let registry = build_registry(storage);
     if !skip_env_check {
         run_env_check(registry.as_ref(), &exec.graph_id.0, &env);
     }
@@ -956,6 +1205,9 @@ fn cmd_scheduler_run(max_nodes: Option<u32>, env: tinypipe_env::Env) {
 }
 
 /// Record per-node execution steps from an ExecutionResult (basic audit trail).
+/// `node_durations` yalnızca bu segmentte gerçekten çalışan node'ları içerir
+/// (resume'da execution_order checkpoint'ten eski node'ları da taşır — çift
+/// kayıt önlemek için onu değil, durations'ı dolaşırız).
 fn record_steps(
     storage: &SqliteStorage,
     execution_id: &str,
@@ -964,12 +1216,16 @@ fn record_steps(
 ) {
     let node_by_id: HashMap<&str, &tinypipe_ir::compiled::CompiledNode> =
         plan.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    let mut base = now_micros();
-    for node_id in &result.execution_order {
+    // Süreleri gerçek zaman çizelgesine oturt: her step önceki bitişten sonra başlar.
+    let mut cursor: u64 = now_micros().parse().unwrap_or(0);
+    for (node_id, duration_us) in &result.node_durations {
         let op = node_by_id
             .get(node_id.as_str())
             .map(|n| format!("{:?}", n.op))
             .unwrap_or_else(|| "unknown".into());
+        let started_at = cursor;
+        let completed_at = started_at + duration_us;
+        cursor = completed_at;
         let step = ExecutionStep {
             id: uuid::Uuid::new_v4().to_string(),
             execution_id: execution_id.to_string(),
@@ -977,14 +1233,13 @@ fn record_steps(
             node_op: op,
             status: "completed".into(),
             error: None,
-            started_at: base.clone(),
-            completed_at: Some(base.clone()),
-            duration_us: Some(0),
+            started_at: started_at.to_string(),
+            completed_at: Some(completed_at.to_string()),
+            duration_us: Some(*duration_us),
             context_before: None,
             context_after: None,
             parent_step_id: None,
         };
-        base = now_micros();
         storage.save_step(&step).expect("Failed to save step");
     }
 }
@@ -1150,9 +1405,14 @@ fn cmd_check(code: &str) {
     }
 }
 
-/// `tinypipe-cli plan <id> [version] [--format text|mermaid|dot]` — compiled plan'ı dump et.
-/// Renderer mantığı `tinypipe-ir::plan_dump`'da yaşar; CLI sadece kaydedip yazdırır.
-fn cmd_plan_dump(id: &str, version: Option<Version>, format: tinypipe_ir::PlanFormat) {
+/// `tinypipe-cli plan <id> [version] [--format ...] [--view ...] [--direction ...]` — compiled plan'ı dump et.
+/// Renderer mantığı `tinypipe-ir::plan_view`'da yaşar; CLI sadece kaydedip yazdırır.
+fn cmd_plan_dump(
+    id: &str,
+    version: Option<Version>,
+    format: tinypipe_ir::PlanFormat,
+    options: tinypipe_ir::plan_view::RenderOptions,
+) {
     let storage = open_storage();
     let graph_id = resolve_graph_id(&storage, id);
     let graph_def = match storage.load_graph(&graph_id) {
@@ -1181,7 +1441,7 @@ fn cmd_plan_dump(id: &str, version: Option<Version>, format: tinypipe_ir::PlanFo
         graph_version: graph_def.version.0,
         encoded_len: plan_bytes.len(),
     };
-    print!("{}", format.render(&plan, &header));
+    print!("{}", format.render(&plan, &header, options));
 }
 
 /// `tinypipe-cli executions list <id>` — list executions of a graph.
@@ -1282,6 +1542,223 @@ fn cmd_executions_show(execution_id: &str) {
 
 // ─── Helpers ───────────────────────────────────────────────────────
 
+/// `tinypipe-cli report [--profile <name>] [--env K=V]` — rol bazlı portföy raporu.
+/// Varsayılan profil: senior (solo kullanıcı için dengeli görünüm).
+fn cmd_report(profile_name: Option<&str>, args: &[String]) {
+    let storage = open_storage();
+    if let Err(e) = tinypipe_insight::profile::seed_builtin_profiles(&storage) {
+        eprintln!("Error seeding profiles: {e}");
+        std::process::exit(1);
+    }
+    let profile = match profile_name {
+        Some(name) => match tinypipe_insight::profile::resolve(&storage, name) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                eprintln!("Error: unknown profile '{name}'");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error loading profile '{name}': {e}");
+                std::process::exit(1);
+            }
+        },
+        None => tinypipe_insight::profile::builtin_profile("senior").unwrap(),
+    };
+    let env = parse_env_args(args);
+    let metrics = match tinypipe_insight::metrics::collect(&storage, Some(&env)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error collecting metrics: {e}");
+            std::process::exit(1);
+        }
+    };
+    print!("{}", tinypipe_insight::report::render(&profile, &metrics));
+}
+
+/// `tinypipe-cli profiles list|show|create|delete` — profil CRUD.
+fn cmd_profiles(args: &[String]) {
+    let storage = open_storage();
+    if let Err(e) = tinypipe_insight::profile::seed_builtin_profiles(&storage) {
+        eprintln!("Error seeding profiles: {e}");
+        std::process::exit(1);
+    }
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            match storage.list_profiles() {
+                Ok(profiles) => {
+                    println!("{:<14} {:<10} {:<10} {:<14} {:<34} {}", "name", "label", "view", "direction", "focus", "description");
+                    println!("{}", "-".repeat(120));
+                    for p in &profiles {
+                        let tag = if p.builtin { "builtin" } else { "custom" };
+                        println!(
+                            "{:<14} {:<10} {:<10} {:<14} {:<34} {}",
+                            p.name,
+                            p.label,
+                            p.view,
+                            p.direction,
+                            truncate(&p.focus.join(","), 34),
+                            truncate(&p.description, 40)
+                        );
+                        let _ = tag;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error listing profiles: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("show") => {
+            let name = match args.get(1) {
+                Some(n) => n,
+                None => {
+                    eprintln!("Usage: tinypipe-cli profiles show <name>");
+                    std::process::exit(1);
+                }
+            };
+            match storage.load_profile(name) {
+                Ok(p) => print_profile(&p),
+                Err(_) => match tinypipe_insight::profile::builtin_profile(name) {
+                    Some(p) => print_profile(&p),
+                    None => {
+                        eprintln!("Error: profile '{name}' not found");
+                        std::process::exit(1);
+                    }
+                },
+            }
+        }
+        Some("create") => {
+            cmd_profile_create(&storage, &args[1..]);
+        }
+        Some("delete") => {
+            let name = match args.get(1) {
+                Some(n) => n,
+                None => {
+                    eprintln!("Usage: tinypipe-cli profiles delete <name>");
+                    std::process::exit(1);
+                }
+            };
+            match storage.delete_profile(name) {
+                Ok(()) => println!("Profile '{name}' deleted."),
+                Err(e) => {
+                    eprintln!("Error deleting profile '{name}': {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!("Unknown profiles subcommand: {other}");
+            eprintln!("Commands: list, show, create, delete");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("Usage: tinypipe-cli profiles list | show <name> | create <name> [...] | delete <name>");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `profiles create` alt komutu — bayraklardan özel profil kurar.
+fn cmd_profile_create(storage: &SqliteStorage, args: &[String]) {
+    let name = match args.first() {
+        Some(n) if !n.starts_with("--") => n,
+        _ => {
+            eprintln!("Usage: tinypipe-cli profiles create <name> [--label L] [--description D] [--view full|summary|layers] [--direction td|lr] [--focus a,b] [--config <json>]");
+            std::process::exit(1);
+        }
+    };
+    if tinypipe_insight::profile::builtin_profile(name).is_some() {
+        eprintln!("Error: '{name}' is a builtin profile name — pick a different name");
+        std::process::exit(1);
+    }
+    let flag = |key: &str| {
+        args.iter()
+            .position(|a| a == key)
+            .and_then(|pos| args.get(pos + 1).cloned())
+    };
+    let label = flag("--label").unwrap_or_else(|| name.to_string());
+    let description = flag("--description").unwrap_or_default();
+    let view = flag("--view")
+        .filter(|v| tinypipe_ir::plan_view::ViewLevel::parse(v).is_some())
+        .unwrap_or_else(|| {
+            eprintln!("Error: --view must be one of: full, summary, layers");
+            std::process::exit(1);
+        });
+    let direction = flag("--direction")
+        .filter(|d| tinypipe_ir::plan_view::Direction::parse(d).is_some())
+        .unwrap_or_else(|| {
+            eprintln!("Error: --direction must be one of: td, lr");
+            std::process::exit(1);
+        });
+    let focus: Vec<String> = flag("--focus")
+        .map(|f| {
+            f.split(',')
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            vec![
+                "portfolio".into(),
+                "executions".into(),
+                "structure".into(),
+            ]
+        });
+    for key in &focus {
+        if !VALID_FOCUS_KEYS.contains(&key.as_str()) {
+            eprintln!(
+                "Error: unknown focus key '{key}' — valid: {}",
+                VALID_FOCUS_KEYS.join(", ")
+            );
+            std::process::exit(1);
+        }
+    }
+    let config: serde_json::Value = flag("--config")
+        .map(|c| serde_json::from_str(&c).unwrap_or_else(|e| {
+            eprintln!("Error: --config must be valid JSON: {e}");
+            std::process::exit(1);
+        }))
+        .unwrap_or_else(|| serde_json::json!({}));
+    let profile = tinypipe_api::types::Profile {
+        name: name.clone(),
+        label,
+        description,
+        view,
+        direction,
+        focus,
+        config,
+        builtin: false,
+    };
+    match storage.save_profile(&profile) {
+        Ok(()) => println!("Profile '{name}' created."),
+        Err(e) => {
+            eprintln!("Error creating profile '{name}': {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Rapor bölümü anahtar listesi (profil create validation'ı için).
+const VALID_FOCUS_KEYS: [&str; 10] = [
+    "portfolio", "executions", "duration", "reliability", "tools", "endpoints", "env",
+    "structure", "subgraphs", "churn",
+];
+
+/// Profili güzel yazdırır.
+fn print_profile(p: &tinypipe_api::types::Profile) {
+    println!("name:        {}", p.name);
+    println!("label:       {}", p.label);
+    println!("description: {}", p.description);
+    println!("view:        {} (plan --view)", p.view);
+    println!("direction:   {} (plan --direction)", p.direction);
+    println!("focus:       {}", p.focus.join(", "));
+    println!(
+        "config:      {}",
+        serde_json::to_string_pretty(&p.config).unwrap_or_default()
+    );
+    println!("builtin:     {}", p.builtin);
+}
+
 fn open_storage() -> SqliteStorage {
     let db_path = std::env::var("TINYPIPE_DB").unwrap_or_else(|_| "./tinypipe.db".to_string());
     SqliteStorage::open(&db_path)
@@ -1327,11 +1804,13 @@ fn unescape_code(s: &str) -> String {
     out
 }
 
+/// UTF-8 güvenli kısaltma (char sınırlarında keser).
 fn truncate(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
+    if s.chars().count() <= max_chars {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_chars.saturating_sub(3)])
+        let cut: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{}...", cut)
     }
 }
 

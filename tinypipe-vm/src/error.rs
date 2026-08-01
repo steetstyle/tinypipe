@@ -8,7 +8,7 @@ use tinypipe_api::types::{Context, Value};
 pub const MIN_SUPPORTED_VERSION: u16 = 2;
 
 /// Maximum supported IR version (current).
-pub const MAX_SUPPORTED_VERSION: u16 = 3;
+pub const MAX_SUPPORTED_VERSION: u16 = 4;
 
 /// Check if an IR version is compatible with this VM.
 /// Returns Ok(()) if compatible, Err with message if not.
@@ -72,6 +72,11 @@ pub struct ExecutionResult {
     pub context: Context,
     /// Node IDs in execution order (only actually-executed nodes).
     pub execution_order: Vec<String>,
+    /// Per-node wall-clock durations (node_id, microseconds).
+    /// Yalnızca ana passta çalıştırılan node'ları kapsar; paralel branch
+    /// thread'leri ve loop gövde iterasyonları LOOP/PARALLEL node'unun
+    /// toplam süresi içinde değerlendirilir.
+    pub node_durations: Vec<(String, u64)>,
     /// Total nodes executed.
     pub node_count: u32,
     /// Wall-clock duration in microseconds.

@@ -8,6 +8,9 @@ members = [
     "tinypipe-storage",
     "tinypipe-scheduler",
     "tinypipe-tools",
+    "tinypipe-insight",
+    "tinypipe-proto",
+    "tinypipe-daemon",
     "tinypipe-cli",
 ]
 resolver = "2"
@@ -28,3 +31,11 @@ flatbuffers = "25"
 uuid = { version = "1", features = ["v4"] }
 ureq = "2"
 postgres = "0.19"
+tonic = { version = "0.14", features = ["transport", "codegen"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = { version = "0.14", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+dashmap = "6"
+futures = "0.3"
+async-stream = "0.3"

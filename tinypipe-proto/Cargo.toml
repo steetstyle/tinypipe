@@ -1,0 +1,15 @@
+[package]
+name = "tinypipe-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "tinypipe gRPC sözleşmesi (proto/tinypipe.proto) — daemon, CLI köprüsü ve worker SDK'ları için üretilmiş stubs"
+build = "build.rs"
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"

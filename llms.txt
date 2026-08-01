@@ -1,0 +1,196 @@
+# tinypipe
+
+> Execution graphs from Restricted Python. Compile `def graph(...)` functions into a typed DAG,
+> run them through a lightweight VM, version/deploy/rollback them, pause/resume, and audit every step.
+
+Use this file as the primary context for writing tinypipe graphs (DSL) and driving the CLI.
+The full README (repo root) has deeper examples; this file is the compressed, LLM-optimized version.
+
+## What tinypipe is
+
+- A **compiler** that turns a restricted subset of Python into an `ExecutionPlan` (DAG of typed nodes:
+  `Input`, `Calc`, `Decide`, `Act`, `Parallel`, `Loop`, `Merge`, `Call`, `Return`, ...).
+- A **VM** that interprets the compiled plan (FlatBuffers binary) with pause/resume at node granularity.
+- **Storage**: SQLite (default `./tinypipe.db`, override `TINYPIPE_DB`). Everything is versioned:
+  every `update`/`rollback` creates a new immutable version; `graphs.last_event` records
+  `deploy: vN` / `rollback: vN` / `fork: <parent>`.
+- **Tools**: built-in callable services (HTTP, JSON, SQLite, env, math, ...).
+- **Remote tools (daemon)**: `tinypipe-daemon` (gRPC, default `127.0.0.1:50051`)
+  hosts workers from ANY language. Workers connect OUTBOUND via bidi stream and
+  register tools (`registered_tools` as first message); the CLI bridges them into
+  the registry at execute/resume time (built-in names win). Go SDK + sample:
+  `examples/go-worker/` (send_email, text.reverse).
+- **Subgraphs**: graphs calling other graphs via `call("subgraph:<name>", ...)`.
+- **Roles**: 6 profiles (pm, ba, ceo, architect, senior, devops) that drive plan rendering
+  (`--view`, `--direction`) and `report` sections.
+
+## CLI (fast reference)
+
+| Command | Notes |
+|---|---|
+| `tinypipe-cli check "<code>"` | Validate without saving. Code arg uses `\n` escapes for newlines. |
+| `tinypipe-cli create <name> "<code>"` | Compile + save (v1). Name must be unique. |
+| `tinypipe-cli update <id> "<code>"` | New version (immutable history). |
+| `tinypipe-cli deploy <id> [version]` | Set active version. |
+| `tinypipe-cli rollback <id> <version>` | Restore old code as a NEW version. |
+| `tinypipe-cli versions <id>` | Version history. |
+| `tinypipe-cli execute <id> '<json>' [--pause-after N] [--env K=V] [--env-file .env] [--no-env-check]` | Run. `--pause-after N` saves a checkpoint. |
+| `tinypipe-cli resume <execution_id> [--max-nodes N]` | Continue a paused execution. |
+| `tinypipe-cli scheduler run [--max-nodes N]` | Step ALL paused executions forward. |
+| `tinypipe-cli executions list <id>` / `executions show <id>` | Execution records + per-node steps (real durations). |
+| `tinypipe-cli plan <id> [version] [--format text\|mermaid\|dot] [--view full\|summary\|layers] [--direction td\|lr] [--profile <name>]` | Render compiled plan. |
+| `tinypipe-cli report [--profile <name>] [--env ...]` | Role-based portfolio report (executions, error rates, p95, tools, endpoints, env, churn). Default profile: `senior`. |
+| `tinypipe-cli profiles list\|show\|create\|delete` | Built-in: pm, ba, ceo, architect, senior, devops. Built-ins cannot be overwritten/deleted. |
+| `tinypipe-cli tools list` | Built-in + daemon tools (if `tinypipe-daemon` is running). |
+| `tinypipe-cli tools test <name> '<json args>' [--kwargs '<json>'] [--env K=V]` | Run any registered tool directly (remote ones go through the daemon). |
+| `tinypipe-cli daemon status [addr]` | Daemon health + registered worker tools. |
+| `tinypipe-cli list` | All graphs. |
+
+Remote tool conventions:
+
+- Daemon addr: `TINYPIPE_DAEMON_ADDR` (default `127.0.0.1:50051`); set
+  `TINYPIPE_NO_DAEMON=1` to skip remote registration entirely.
+- From the DSL, call remote tools exactly like built-ins: `call("text.reverse", value=s)`
+  (the language passes named params as kwargs; positional args arrive via
+  `tools test`-style calls, so robust workers accept both).
+- Remote calls in graphs work in `execute`/`resume`/`scheduler`; a dead daemon
+  produces an actionable error. Worker disconnect → pending tasks fail-fast,
+  tools disappear from `tools list`.
+
+`<id>` accepts either the UUID or the graph name.
+
+## The DSL — restricted Python
+
+One function named `graph`. Everything is a pure dataflow: no control-flow side effects
+beyond the DAG. **Allowed:** arithmetic, comparisons, boolean ops, `if/elif/else`,
+bounded `for i in range(...)`, `call("tool", ...)`, dict/array literals, constant-key subscripting
+(`d["key"]`, `items[0]`), attribute access on results (`resp.body`, `users.count`),
+string concatenation with `+` (NO f-strings — `"..." + x` is the idiom).
+
+**Forbidden (compiler rejects):** `import`, `class`, `lambda`, `while`, `try/except`, `async`,
+comprehensions, f-strings, walrus `:=`, `global`, `nonlocal`, `yield`, `del`, decorators,
+nested functions, dynamic subscript keys (`items[a + b]`), `**kwargs`.
+
+### Module-level metadata: `META(...)`
+
+Before `def graph`, at module level. Keyword args only; values must be constant literals
+(strings, numbers, booleans, or lists of constants). Stored as JSON graph metadata.
+
+```python
+META(title="Seed dashboard", sla_ms=5000, tags=["seeds", "demo"])
+
+def graph(user_id: int):
+    return user_id
+```
+
+### Logical grouping: `with GROUP("Label"):`
+
+Purely structural — wraps statements into named groups shown in plan dumps and
+collapsed in `--view summary` renderings. No runtime semantics.
+
+```python
+def graph():
+    with GROUP("Seeding"):
+        users = call("subgraph:seed_users")
+    with GROUP("Output"):
+        return users
+```
+
+### Parallel branches: `with parallel() as p:` / `with PARALLEL() as p:`
+
+Each `p.act("tool", ...)` runs in its own thread. Branches get **isolated scopes**:
+`set()` inside a branch stays local; MERGE combines them (default: last writer wins).
+If all branches only READ shared state, results are trivially mergeable.
+
+```python
+def graph(x: int, y: int):
+    with parallel() as p:
+        p.act("process", value=x)
+        p.act("process", value=y)
+    return 0
+```
+
+### Loops
+
+Only `for i in range(n)` where `n` is bounded at runtime by a value (literal or `len(x)`).
+Loop bodies can end with a bare `call(...)`; constants feeding the body are cached.
+No `while`, no `break`/`continue` mutation of arbitrary variables.
+
+### Subgraph calls
+
+```python
+def graph(user_id: int):
+    users = call("subgraph:seed_users")                    # no args — child needs no input
+    posts = call("subgraph:seed_posts", user_id=user_id)   # explicit kwargs → child inputs
+    return {"users": users.count, "posts": posts.count}
+```
+
+Semantics: explicit kwargs are passed to the child's input context (overriding inherited
+vars); the caller's full context is inherited otherwise. The child's `return` becomes the
+call value; child internals merge into the caller context. Recursion depth limit: 5.
+
+## Built-in tools (call("name", **kwargs))
+
+| Tool | Signature / behavior |
+|---|---|
+| `http_request` | `url`, `method` (GET default), `headers` (object), `body` (string), `timeout_secs`. Returns `{status, body, headers}` — use `resp.body` (string), `resp.status` (int). |
+| `json.parse` | `json` (string) → parsed JSON value (arrays/objects/numbers/strings/bools). |
+| `array.len` | `array` → element count. |
+| `array.count_where` | `array`, `key` (string), `value` → count of items where `item[key] == value`. |
+| `list.get` | `array`, `index` → element at index. |
+| `string.len` | → string length. |
+| `math.add` / `math.mul` | `a`, `b` → arithmetic (use `+`/`*` in expressions instead when possible). |
+| `env.get` | `key`, optional `default`. Literal string keys are statically detected; dynamic keys skip the pre-check and fail at runtime if missing. |
+| `env.template` | `value` with `${KEY}`, `${KEY:-default}`, `{{KEY}}` placeholders → resolved string. |
+| `env.list` | → list of `{key, value}` pairs. |
+| `sqlite.query` | `db` (default `:memory:`; a file path shares state across calls), `query`. SELECT → array of row objects; DDL/DML → `{changes, last_insert_rowid}`. |
+| `postgres` | Query with params (blocking NoTLS). |
+| `echo` | Pass-through/debug. |
+| `test.*` | `test.sleep`, `test.error`, `test.large` — testing only. |
+| remote via daemon | Any tool registered by a connected worker (e.g. `send_email`, `text.reverse` from the Go example). |
+
+**Env check:** `execute`/`resume`/`scheduler` validate required env vars of the root graph
+AND all transitive subgraphs BEFORE running; missing vars abort with a list.
+Precedence: `--env K=V` overrides → `--env-file` → OS env. Use `--no-env-check` only for
+dynamic-key graphs.
+
+## Canonical example: composed seed pipeline
+
+```python
+META(title="Dashboard seeds", sla_ms=10000)
+
+def graph(user_id: int):
+    users = call("subgraph:seed_users")
+    posts = call("subgraph:seed_posts", user_id=user_id)
+    todos = call("subgraph:seed_todos", user_id=user_id)
+    total = 0
+    for i in range(len(posts.items)):
+        p = call("list.get", array=posts.items, index=i)
+        c = call("subgraph:seed_comments", post_id=p.id)
+        total = total + c.count
+    return {"users": users.count, "posts": posts.count, "comments": total}
+```
+
+Workflow to materialize it:
+
+```bash
+tinypipe-cli create seed_users '<code>'      # leaf graphs first
+tinypipe-cli create seed_comments '<code>'
+tinypipe-cli create dashboard_seeds '<parent code>'
+tinypipe-cli execute dashboard_seeds '{"user_id": 1}' --env-file .env
+tinypipe-cli plan dashboard_seeds --profile architect --format mermaid
+tinypipe-cli report --profile devops
+tinypipe-cli deploy dashboard_seeds 1
+```
+
+## Rules for writing good graphs
+
+1. Prefer explicit kwargs (`call("http_request", url=base)`) over positional args.
+2. Build URLs with `+` concatenation, never f-strings.
+3. Read config from env (`env.template`/`env.get` with `default`) — never hardcode credentials.
+4. Split reusable units into subgraphs; keep a parent graph thin and sequential.
+5. Name subgraphs with a domain prefix (`seed_`, `process_`, `report_`).
+6. Use `META(...)` for title/SLA/tags; use `GROUP("...")` to structure readable plan dumps.
+7. Keep loop bodies minimal — every iteration re-executes the body nodes.
+8. Validate with `check` before `create`; expect failures at runtime to be visible in
+   `executions list/show` with per-node steps.

@@ -127,6 +127,7 @@ impl<'a> CompiledExecutor<'a> {
         let mut ctx = inputs;
         let mut node_outputs: HashMap<u32, Value> = HashMap::new();
         let mut execution_order: Vec<String> = Vec::new();
+        let mut node_durations: Vec<(String, u64)> = Vec::new();
         let mut node_count: u32 = 0;
         let mut output: Option<Value> = None;
         let mut enabled: HashSet<u32> = HashSet::new();
@@ -163,6 +164,8 @@ impl<'a> CompiledExecutor<'a> {
                 obs.on_node_start(&node.id);
             }
 
+            let order_len_before = execution_order.len();
+            let node_t0 = Instant::now();
             match self.run_node(
                 node,
                 &mut ctx,
@@ -198,6 +201,11 @@ impl<'a> CompiledExecutor<'a> {
                 }
                 NodeOutcome::Ok => {}
             }
+            // Skip/ertelenen node'lar execution_order'ı büyütmez — yalnızca
+            // gerçekten çalışan node'ların süresi kaydedilir.
+            if execution_order.len() > order_len_before {
+                node_durations.push((node.id.clone(), node_t0.elapsed().as_micros() as u64));
+            }
 
             if let Some(obs) = observer.as_deref_mut() {
                 obs.on_node_end(&node.id);
@@ -226,6 +234,7 @@ impl<'a> CompiledExecutor<'a> {
         Ok(ExecutionOutcome::Completed(ExecutionResult {
             context: ctx,
             execution_order,
+            node_durations,
             node_count,
             duration_us: duration,
             output,
@@ -252,6 +261,7 @@ impl<'a> CompiledExecutor<'a> {
         let mut ctx = checkpoint.context.clone();
         let mut node_outputs = checkpoint.node_outputs.clone();
         let mut execution_order = checkpoint.execution_order.clone();
+        let mut node_durations: Vec<(String, u64)> = Vec::new();
         let mut node_count = checkpoint.node_count;
         let mut output = checkpoint.output.clone();
         let mut enabled = checkpoint.enabled.clone();
@@ -332,6 +342,8 @@ impl<'a> CompiledExecutor<'a> {
                 obs.on_node_start(&node.id);
             }
 
+            let order_len_before = execution_order.len();
+            let node_t0 = Instant::now();
             match self.run_node(
                 node,
                 &mut ctx,
@@ -367,6 +379,11 @@ impl<'a> CompiledExecutor<'a> {
                 }
                 NodeOutcome::Ok => {}
             }
+            // Skip/ertelenen node'lar execution_order'ı büyütmez — yalnızca
+            // gerçekten çalışan node'ların süresi kaydedilir.
+            if execution_order.len() > order_len_before {
+                node_durations.push((node.id.clone(), node_t0.elapsed().as_micros() as u64));
+            }
 
             if let Some(obs) = observer.as_deref_mut() {
                 obs.on_node_end(&node.id);
@@ -395,6 +412,7 @@ impl<'a> CompiledExecutor<'a> {
         Ok(ExecutionOutcome::Completed(ExecutionResult {
             context: ctx,
             execution_order,
+            node_durations,
             node_count,
             duration_us: duration,
             output,

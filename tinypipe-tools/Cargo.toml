@@ -11,14 +11,19 @@ tinypipe-env = { path = "../tinypipe-env" }
 tinypipe-compiler = { path = "../tinypipe-compiler" }
 tinypipe-ir = { path = "../tinypipe-ir" }
 tinypipe-vm = { path = "../tinypipe-vm" }
+tinypipe-proto = { path = "../tinypipe-proto" }
 serde.workspace = true
 serde_json.workspace = true
 ureq = { workspace = true }
 postgres = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
+tokio.workspace = true
+tonic.workspace = true
 
 [dev-dependencies]
 tinypipe-storage = { path = "../tinypipe-storage" }
+tinypipe-daemon = { path = "../tinypipe-daemon" }
+futures.workspace = true
 
 [[bench]]
 name = "bench_subgraph"

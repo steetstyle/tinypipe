@@ -560,6 +560,29 @@ pub struct ExecutionStep {
     pub parent_step_id: Option<String>,
 }
 
+/// Rol bazlı görünüm profili (PM, BA, CEO, Architect, Senior, DevOps...).
+///
+/// `view`/`direction` string'leri `tinypipe-ir::plan_view`'daki enum'larla
+/// eşleşir ("full" | "summary" | "layers", "td" | "lr") — api katmanı
+/// ir'e bağımlı kalmasın diye burada ham string tutulur.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Profile {
+    pub name: String,
+    /// Görünen ad (ör. "CEO").
+    pub label: String,
+    pub description: String,
+    /// `RenderOptions.view`: "full" | "summary" | "layers".
+    pub view: String,
+    /// `RenderOptions.direction`: "td" | "lr".
+    pub direction: String,
+    /// Profilin önemsediği metrik anahtarları (rapor bölümleri).
+    pub focus: Vec<String>,
+    /// Opak profil konfigürasyonu (ör. devops → endpoint listesi filtreleri).
+    pub config: serde_json::Value,
+    /// Built-in profil mi (silinemez / ezilemez mi).
+    pub builtin: bool,
+}
+
 /// Registry hataları.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RegistryError {

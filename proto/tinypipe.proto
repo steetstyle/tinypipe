@@ -1,0 +1,90 @@
+// tinypipe gRPC sözleşmesi — daemon ile worker'lar arasındaki "anayasa".
+//
+// Mimari (pull model):
+//   tinypipe-cli ──unary Invoke/ListTools──▶ tinypipe-daemon ──bidi ConnectWorker──▶ worker
+//
+// - Worker, daemon'a OUTBOUND bağlanır (firewall dostu): tek TCP bağlantısı
+//   üzerinden tool'larını kaydeder ve iş bekler.
+// - Daemon, CLI'dan gelen Invoke'ları ilgili worker'a yönlendirir; aynı tool
+//   adına sahip birden fazla worker varsa round-robin ile dağıtır.
+// - Eşleşme task_id üzerinden yapılır: worker'lar task'leri paralel işleyip
+//   farklı sırada cevaplayabilir (sıra önemsizdir).
+//
+// Sözleşme kuralları:
+// - TaskResponse.success=true ise output_json geçerli JSON olmalıdır.
+// - success=false ise error_message doldurulur.
+// - registered_tools yalnızca worker'ın İLK TaskResponse'unda iletilir
+//   (kayıt mesajı); sonraki mesajlarda boş bırakılır.
+syntax = "proto3";
+
+package tinypipe.v1;
+
+option go_package = "tinypipe-worker/gen/tinypipe/v1;tinypipev1";
+
+// Worker → daemon: worker, stream üzerinden cevaplarını gönderirken
+// daemon'dan işleri (TaskRequest) dinler.
+service ToolWorkerService {
+  rpc ConnectWorker (stream TaskResponse) returns (stream TaskRequest);
+}
+
+// CLI → daemon: tool çağrıları ve envanter sorgusu.
+service ToolDispatchService {
+  // Tek tool çağrısı. Daemon, tool'a bağlı worker(lar)a yönlendirir.
+  rpc Invoke (InvokeRequest) returns (InvokeResponse);
+  // Şu anda kayıtlı tüm tool tanımlarını döndürür (CLI registry kurulumu).
+  rpc ListTools (ListToolsRequest) returns (ListToolsResponse);
+}
+
+message ToolDefinition {
+  string name = 1;
+  string description = 2;
+  // JSON Schema metni; geçersizse daemon `{}`'a düşer.
+  string input_schema_json = 3;
+  string output_schema_json = 4;
+  bool pure = 5;
+  // Bu tool için çağrı başına zaman aşımı (ms). 0 = daemon varsayılanı (30s).
+  uint64 timeout_ms = 6;
+}
+
+message TaskRequest {
+  // Benzersiz iş kimliği — cevap eşleştirmesi bu id üzerinden yapılır.
+  string task_id = 1;
+  string tool_name = 2;
+  // Tinypipe Value dizisinin JSON temsili (positional args).
+  string args_json = 3;
+  // kwargs map'inin JSON temsili (DSL: call("tool", key=val)).
+  string kwargs_json = 4;
+  // Çağrı anındaki çözülmüş ortam görünümü (subgraph scope'lu olabilir).
+  map<string, string> env = 5;
+}
+
+message TaskResponse {
+  string task_id = 1;
+  bool success = 2;
+  // success=true iken worker'ın döndürdüğü JSON değer.
+  string output_json = 3;
+  string error_message = 4;
+  // Yalnızca ilk mesajda: worker'ın sunduğu tool tanımları (kayıt).
+  repeated ToolDefinition registered_tools = 5;
+}
+
+message InvokeRequest {
+  string tool_name = 1;
+  string args_json = 2;
+  string kwargs_json = 3;
+  map<string, string> env = 4;
+}
+
+message InvokeResponse {
+  bool success = 1;
+  string output_json = 2;
+  string error_message = 3;
+  // İşlem süresi (µs) — CLI timing raporu için.
+  uint64 duration_us = 4;
+}
+
+message ListToolsRequest {}
+
+message ListToolsResponse {
+  repeated ToolDefinition tools = 1;
+}

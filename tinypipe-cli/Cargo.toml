@@ -17,6 +17,7 @@ tinypipe-vm = { path = "../tinypipe-vm" }
 tinypipe-storage = { path = "../tinypipe-storage" }
 tinypipe-scheduler = { path = "../tinypipe-scheduler" }
 tinypipe-tools = { path = "../tinypipe-tools" }
+tinypipe-insight = { path = "../tinypipe-insight" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

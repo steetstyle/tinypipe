@@ -194,6 +194,41 @@ def graph():
     return d["key"]
 ```
 
+```python
+# Graph metadata — META(...) at module level, before `def graph`.
+# Keyword arguments only; values must be constant literals.
+# Metadata is stored as JSON alongside the graph (graph metadata, not execution).
+META(title="Seed dashboard", sla_ms=5000, tags=["seeds", "demo"])
+
+def graph(user_id: int):
+    return user_id
+```
+
+```python
+# Logical grouping — `with GROUP("..."):` wraps a statement block into a named
+# group. Groups are purely structural: they show up in plan dumps (text/summary/
+# mermaid) as labeled subgraphs and are collapsed in summary views.
+
+def graph():
+    with GROUP("Seeding"):
+        users = call("subgraph:seed_users")
+        posts = call("subgraph:seed_posts")
+    with GROUP("Output"):
+        return {"users": users.count, "posts": posts.count}
+```
+
+```python
+# Parallel branches — `with PARALLEL() as p:` runs each p.act(...) in its own
+# thread. Branches get isolated scopes: set() inside a branch stays local,
+# MERGE strategies control how variables combine (default: last writer wins).
+
+def graph(x: int, y: int):
+    with parallel() as p:
+        p.act("process", value=x)
+        p.act("process", value=y)
+    return 0
+```
+
 **What's forbidden:** `import`, `class`, `lambda`, `while`, `try`/`except`, `async`, comprehensions, f-strings, walrus operator (`:=`), `global`, `nonlocal`, `yield`, `del`, decorators, nested functions, dynamic subscript keys (`items[a + b]`).
 
 ## Architecture
@@ -248,10 +283,71 @@ The compiler pipeline:
 | `execute <id> <json> --pause-after N` | Run, pause after N nodes, save a checkpoint |
 | `resume <execution_id> [--max-nodes N]` | Resume a paused execution from its checkpoint |
 | `scheduler run [--max-nodes N]` | Resume all paused executions (budgeted loop mode with `--max-nodes`) |
-| `plan <id> [version]` | Dump the compiled plan as plain text |
+| `executions list <id>` | List executions of a graph |
+| `executions show <execution_id>` | Show execution details + per-node steps with real durations |
+| `plan <id> [version] [--format text\|mermaid\|dot]` | Dump the compiled plan |
+| `plan <id> --view full\|summary\|layers` | View level: full DAG / grouped summary / layer overview |
+| `plan <id> --direction td\|lr` | Graph direction (top-down / left-right) |
+| `plan <id> --profile <name>` | Apply a role profile's view + direction |
+| `report [--profile <name>] [--env KEY=V]` | Role-based portfolio report (metrics + risk signals) |
+| `profiles list / show / create / delete` | Manage role profiles (6 built-in, custom allowed) |
+| `tools list` | List built-in + daemon tools |
+| `tools test <name> '<json args>' [--kwargs '<json>'] [--env KEY=V]` | Run a tool directly |
+| `daemon status [addr]` | Daemon health + registered worker tools |
 | `list` | List all graphs |
 
 IDs can be either a UUID or the graph name (the CLI resolves it).
+
+## Roles & profiles
+
+tinypipe ships 6 role profiles. Each profile bundles a `view`/`direction` pair
+for `plan` dumps and a `focus` list that selects which sections the `report`
+command renders. Built-in profiles are seeded into storage on first use and
+cannot be overwritten or deleted.
+
+| Profile | view | direction | report focus |
+|---------|------|-----------|--------------|
+| `pm` | full | td | executions, tools, structure, churn |
+| `ba` | summary | td | duration, structure, endpoints, churn |
+| `ceo` | summary | lr | portfolio, executions, reliability |
+| `architect` | layers | td | structure, subgraphs, endpoints, tools |
+| `senior` (default) | full | td | structure, tools, churn, reliability |
+| `devops` | full | td | reliability, endpoints, env, duration |
+
+```bash
+# Plan with a role's view — explicit flags always win
+$ tinypipe-cli plan dashboard_seeds --profile ceo --format mermaid
+$ tinypipe-cli plan dashboard_seeds --profile architect --view full
+
+# Role-based report (default profile: senior)
+$ tinypipe-cli report --profile devops --env-file .env
+tinypipe report — DevOps
+...
+## Reliability
+dashboard_seeds           40.0% failed (6/15)
+## External Endpoints
+dashboard_seeds — jsonplaceholder.typicode.com
+## Env
+dashboard_seeds — API_BASE_URL, ORDER_DB_PATH
+    ⚠ MISSING: ORDER_DB_PATH
+```
+
+The report scans every graph's compiled plan for tool calls (histogram),
+external HTTP endpoints, subgraph dependencies, env dependencies (missing
+required vars are flagged when an env is supplied), plus execution stats
+(counts, failure rate, avg/p95 duration) and change churn (version count,
+last deploy/rollback event).
+
+Custom profiles extend the set:
+
+```bash
+$ tinypipe-cli profiles create auditor --label "Auditor" \
+    --description "License auditor" --view summary --direction lr \
+    --focus portfolio,churn
+$ tinypipe-cli profiles list          # builtin + custom
+$ tinypipe-cli profiles show auditor
+$ tinypipe-cli profiles delete auditor # built-ins are protected
+```
 
 ## Real-world example: User Dashboard
 
@@ -504,11 +600,73 @@ with the full context, loop state, and node bookkeeping). `resume` and the sched
 load the plan from the execution's immutable version, so later graph edits do not
 affect in-flight executions.
 
+## Remote tools & daemon
+
+`tinypipe-daemon` lets you extend the built-in tool set with **workers in any
+language**. Workers connect **outbound** (pull model) — no open ports, no
+reverse proxies. The daemon registers their tools, dispatches calls from your
+graphs, and forwards results back.
+
+```
+graph (CLI) ──► daemon (gRPC, 127.0.0.1:50051) ──► worker (Rust / Go / any)
+                   ▲                                   │
+                   └────────── task_id matched ◄───────┘
+```
+
+- **Outbound registration**: the worker opens a single bidi stream and sends
+  its tool definitions as the first message (`registered_tools`).
+- **Fail-fast**: if a worker disconnects, pending tasks fail immediately
+  (`worker disconnected`) and its tools disappear from listings.
+- **Per-tool timeout**: `timeout_ms` in the tool definition (0 = daemon
+  default, 30s via `TINYPIPE_DAEMON_DEFAULT_TIMEOUT_MS`).
+- **Keepalive**: HTTP/2 + TCP keepalive (`TINYPIPE_DAEMON_KEEPALIVE_MS`,
+  default 30s) catch half-open connections.
+- **Round-robin**: multiple workers for the same tool name share load.
+
+```bash
+# Start the daemon
+$ tinypipe-daemon                      # env: TINYPIPE_DAEMON_ADDR (default 127.0.0.1:50051)
+
+# Start a worker (Go example ships in examples/go-worker)
+$ cd examples/go-worker && go run .
+
+# See the remote tools next to built-ins
+$ tinypipe-cli tools list
+Built-in tools (16): array.len, echo, env.get, ...
+Daemon tools (2 via 127.0.0.1:50051):
+  send_email — Sends an email (stub). [timeout 5000ms]
+  text.reverse — Reverses a string.
+
+# Test a remote tool directly
+$ tinypipe-cli tools test text.reverse '["hello"]'
+✓ text.reverse → "olleh"
+
+# Call it from a graph (kwargs convention; args pass via tools test)
+$ tinypipe-cli create e2e 'def graph(s):
+    x = call("text.reverse", value=s)
+    return call("text.reverse", value=x)'
+$ tinypipe-cli execute e2e '{"s": "tinypipe"}'
+  Output: "tinypipe"
+
+# Daemon status
+$ tinypipe-cli daemon status
+Daemon: OK (127.0.0.1:50051)
+Registered tools: 2
+```
+
+Bridge rules:
+
+- Built-in tool names always win over remote ones (`TINYPIPE_NO_DAEMON=1`
+  skips daemon registration entirely).
+- CLI passes `--kwargs '{"k": "v"}'` and `--env KEY=V` through to workers.
+- Worker tools are registered lazily at execute/resume time; a dead daemon
+  yields an actionable error (with retry/backoff in the Go SDK).
+
 ## Storage
 
 Graphs, versions, executions, and execution steps are stored in SQLite (`./tinypipe.db` by default, override with `TINYPIPE_DB` env var).
 
-The `graphs` table tracks the current version and active deployment. Every update and rollback inserts a row into `graph_versions`, so nothing is ever overwritten or lost.
+The `graphs` table tracks the current version and active deployment. Every update and rollback inserts a row into `graph_versions`, so nothing is ever overwritten or lost. A `last_event` marker records the latest lifecycle event (`deploy: v2`, `rollback: v1`, `fork: <parent>`) and drives the risk signals in `report` (rollback counts, deployed status).
 
 ## LLM integration (optional)
 
@@ -524,10 +682,13 @@ It checks `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, then falls back to a local Olla
 ## Project structure
 
 ```
-tinypipe-api/        — shared types (Context, Value, GraphId, Scope)
+tinypipe-api/        — shared types (Context, Value, GraphId, Scope, Profile)
 tinypipe-compiler/   — sanitizer, transformer, validator, optimizer, codegen
 tinypipe-ir/         — ExecutionPlan + CompiledPlan + FlatBuffers schema
-                       + plan_dump: plain-text renderer (CLI'den bağımsız)
+                       + plan_view/plan_dump: semantic plan rendering
+                         (text/summary/layers/mermaid/dot, role-aware)
+                       + env_deps: env dependency scanning (pure IR)
+tinypipe-env/        — environment providers (OS, dotenv, static) + templates
 tinypipe-storage/    — SQLite implementation of GraphStorage trait
 tinypipe-tools/      — MockToolRegistry + built-in tools (each tool in its own file):
                        math.add/mul, string.len, echo, test.*, http_request (ureq),
@@ -535,7 +696,11 @@ tinypipe-tools/      — MockToolRegistry + built-in tools (each tool in its own
                        postgres (blocking NoTLS) — heavy deps live only here
 tinypipe-vm/         — DAG interpreter + pause/resume + parallel tool execution
 tinypipe-scheduler/  — resumes paused executions from checkpoints
+tinypipe-insight/    — role profiles (6 built-in) + metrics collection + reports
 tinypipe-cli/        — binary with all commands (uses tinypipe-tools::default_tools)
+tinypipe-daemon/     — gRPC daemon: worker registration + tool dispatch (tonic)
+tinypipe-proto/      — generated gRPC stubs from proto/tinypipe.proto
+examples/go-worker/  — Go worker SDK + sample tools (send_email, text.reverse)
 benches/             — baseline benchmarks
 ```
 
@@ -550,6 +715,9 @@ benches/             — baseline benchmarks
   `array.len`/`list.get`/`array.count_where`, and `postgres` (query with params) —
   dispatchable from DSL with `call("http_request", url=..., ...)`; loops with `range()`
   and string concatenation (`"..." + x`) are first-class DSL features
+- Remote tools: `tinypipe-daemon` + workers in any language (Go SDK in
+  `examples/go-worker`), outbound bidi registration, fail-fast, per-tool timeouts,
+  keepalive, round-robin; `tinypipe-cli tools list/test`, `daemon status`
 - What's missing: network proxy, persistent execution scheduling, tier-2/3 sandboxing (KVM fork, wasm)
 
 ## License

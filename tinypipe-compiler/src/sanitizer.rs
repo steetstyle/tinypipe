@@ -80,6 +80,7 @@ struct SanitizerEngine<'a> {
     function_depth: u32,
     loop_depth: u32,
     parallel_depth: u32,
+    group_depth: u32,
     top_level_names: Vec<String>,
 }
 
@@ -93,6 +94,7 @@ impl<'a> SanitizerEngine<'a> {
             function_depth: 0,
             loop_depth: 0,
             parallel_depth: 0,
+            group_depth: 0,
             top_level_names: Vec::new(),
         }
     }
@@ -215,12 +217,27 @@ impl<'a> SanitizerEngine<'a> {
             }
             ast::Stmt::With(s) => {
                 let is_parallel =
-                    s.items.len() == 1 && is_name_call(&s.items[0].context_expr, "parallel");
-                if !is_parallel {
+                    s.items.len() == 1 && is_name_call(&s.items[0].context_expr, "PARALLEL");
+                let is_group =
+                    s.items.len() == 1 && is_name_call(&s.items[0].context_expr, "GROUP");
+                if !is_parallel && !is_group {
                     self.err(
                         stmt,
-                        format_args!("`with` is forbidden except for `with parallel() as p:`"),
+                        format_args!(
+                            "`with` is forbidden except for `with PARALLEL() as p:` or `with GROUP(\"...\"):`"
+                        ),
                     );
+                } else if is_group {
+                    if self.group_depth > 0 {
+                        self.err(stmt, format_args!("nested `with GROUP(...)` is forbidden"));
+                    }
+                    self.validate_group_item(&s.items[0], stmt);
+                    self.group_depth += 1;
+                    for child in &s.body {
+                        self.visit_stmt(child);
+                    }
+                    self.group_depth -= 1;
+                    return;
                 } else {
                     self.parallel_depth += 1;
                     for child in &s.body {
@@ -301,7 +318,45 @@ impl<'a> SanitizerEngine<'a> {
             ast::Stmt::AugAssign(s) => {
                 self.record_assignment_target(&s.target);
             }
-            ast::Stmt::Expr(_) => {}
+            ast::Stmt::Expr(s) => {
+                // Module-level META(...) — reserved DSL keyword for graph metadata.
+                // Allowed only once, before `def graph`, with constant keyword args.
+                if let Some(call) = as_meta_call(&s.value) {
+                    if self.function_depth != 0 {
+                        self.err(
+                            s.value.as_ref(),
+                            format_args!(
+                                "`META(...)` is only allowed at module level, before `def graph`"
+                            ),
+                        );
+                    } else if !call.args.is_empty() {
+                        self.err(
+                            s.value.as_ref(),
+                            format_args!("`META(...)` accepts keyword arguments only"),
+                        );
+                    } else {
+                        for kw in &call.keywords {
+                            if kw.arg.is_none() {
+                                self.err(
+                                    s.value.as_ref(),
+                                    format_args!("`**kwargs` is forbidden in `META(...)`"),
+                                );
+                                continue;
+                            }
+                            if !is_meta_constant(&kw.value) {
+                                self.err(
+                                    &kw.value,
+                                    format_args!(
+                                        "`META` values must be constant literals (strings, numbers, booleans, or lists of constants)"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+                self.visit_expr(&s.value);
+            }
         }
 
         // For Return, walk its value manually (already done above for
@@ -318,8 +373,7 @@ impl<'a> SanitizerEngine<'a> {
 
     // ── Expression visitor ───────────────────────────────────────
 
-    fn visit_expr(&mut self, expr: &ast::Expr) {
-        match expr {
+    fn visit_expr(&mut self, expr: &ast::Expr) {        match expr {
             ast::Expr::Lambda(_) => {
                 self.err(
                     expr,
@@ -431,6 +485,43 @@ impl<'a> SanitizerEngine<'a> {
         self.walk_expr_children(expr);
     }
 
+    /// `with GROUP(...)` item'ını doğrular: as-var yok, tek string literal arg.
+    fn validate_group_item(&mut self, item: &ast::WithItem, stmt: &ast::Stmt) {
+        if item.optional_vars.is_some() {
+            self.err(
+                stmt,
+                format_args!("`with GROUP(\"...\"):` does not support `as` binding"),
+            );
+            return;
+        }
+        match &item.context_expr {
+            ast::Expr::Call(c) => match c.args.as_slice() {
+                [ast::Expr::Constant(ast::ExprConstant {
+                    value: ast::Constant::Str(s),
+                    ..
+                })] if !s.is_empty() => {}
+                [ast::Expr::Constant(ast::ExprConstant {
+                    value: ast::Constant::Str(_),
+                    ..
+                })] => {
+                    self.err(
+                        stmt,
+                        format_args!("`GROUP` title must be a non-empty string literal"),
+                    );
+                }
+                _ => {
+                    self.err(
+                        stmt,
+                        format_args!(
+                            "`GROUP` expects exactly one string literal argument, e.g. `with GROUP(\"Seeding\"):`"
+                        ),
+                    );
+                }
+            },
+            _ => {}
+        }
+    }
+
     // ── Call-specific checks ────────────────────────────────────
 
     fn check_call(&mut self, call: &ast::ExprCall) {
@@ -468,6 +559,17 @@ impl<'a> SanitizerEngine<'a> {
             self.err(
                 call.func.as_ref(),
                 format_args!("dunder method `{}()` is forbidden", name),
+            );
+            return;
+        }
+
+        if name == "META" || name == "GROUP" || name == "PARALLEL" {
+            self.err(
+                call.func.as_ref(),
+                format_args!(
+                    "`{}` is a reserved DSL keyword (META(...) at module level, `with GROUP(\"...\"):`, `with PARALLEL() as p:`)",
+                    name
+                ),
             );
             return;
         }
@@ -1005,6 +1107,26 @@ fn is_name_call(expr: &ast::Expr, name: &str) -> bool {
     }
 }
 
+/// Eğer ifade `META(...)` name-call'ı ise `Some(call)` döndürür.
+fn as_meta_call(expr: &ast::Expr) -> Option<&ast::ExprCall> {
+    match expr {
+        ast::Expr::Call(c) if is_name_call(expr, "META") => Some(c),
+        _ => None,
+    }
+}
+
+/// META kwarg değeri olarak izin verilen sabit ifadeler:
+/// literal, unary işaretli sayı, list/tuple (içi sabit).
+fn is_meta_constant(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Constant(_) => true,
+        ast::Expr::UnaryOp(u) => matches!(&*u.operand, ast::Expr::Constant(_)),
+        ast::Expr::List(l) => l.elts.iter().all(is_meta_constant),
+        ast::Expr::Tuple(t) => t.elts.iter().all(is_meta_constant),
+        _ => false,
+    }
+}
+
 // ─── Tests (60+ cases) ────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1080,7 +1202,69 @@ mod tests {
 
     #[test]
     fn allow_parallel_with() {
-        assert!(sanitize("def graph():\n    with parallel() as p:\n        x = p.run(call, \"tool1\")\n    return x").is_ok());
+        assert!(sanitize("def graph():\n    with PARALLEL() as p:\n        x = p.run(call, \"tool1\")\n    return x").is_ok());
+    }
+
+    // ── META / GROUP ────────────────────────────────────────────
+
+    #[test]
+    fn allow_meta_module_level() {
+        assert!(sanitize("META(title=\"X\", sla_ms=5)\n\ndef graph():\n    return 0").is_ok());
+    }
+
+    #[test]
+    fn allow_meta_list_values() {
+        assert!(sanitize("META(tags=[\"a\", \"b\"], n=42, ok=True)\n\ndef graph():\n    return 0").is_ok());
+    }
+
+    #[test]
+    fn reject_meta_inside_function() {
+        let err = sanitize("def graph():\n    META(title=\"X\")\n    return 0").unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("module level")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_meta_positional_args() {
+        let err = sanitize("META(\"X\")\n\ndef graph():\n    return 0").unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("keyword arguments")));
+    }
+
+    #[test]
+    fn reject_meta_non_constant_value() {
+        let err = sanitize("META(title=x)\n\ndef graph():\n    return 0").unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("constant")));
+    }
+
+    #[test]
+    fn reject_meta_as_plain_call() {
+        let err = sanitize("def graph():\n    META()\n    return 0").unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("module level") || e.message.contains("reserved DSL keyword")));
+    }
+
+    #[test]
+    fn allow_group_with() {
+        assert!(sanitize("def graph():\n    with GROUP(\"Seeding\"):\n        x = call(\"tool1\")\n    return x").is_ok());
+    }
+
+    #[test]
+    fn reject_group_without_title() {
+        let err = sanitize("def graph():\n    with GROUP():\n        x = 1\n    return x").unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("string literal")));
+    }
+
+    #[test]
+    fn reject_nested_group() {
+        let err = sanitize("def graph():\n    with GROUP(\"A\"):\n        with GROUP(\"B\"):\n            x = 1\n    return x").unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("nested")));
+    }
+
+    #[test]
+    fn reject_group_as_plain_call() {
+        let err = sanitize("def graph():\n    GROUP(\"x\")\n    return 0").unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("reserved DSL keyword")));
     }
 
     #[test]
@@ -1495,7 +1679,7 @@ mod tests {
     #[test]
     fn scope_isolation_simple_parallel() {
         assert!(sanitize(
-            "def graph():\n    with parallel() as p:\n        p.act(\"print\", x=1)\n    return 0"
+            "def graph():\n    with PARALLEL() as p:\n        p.act(\"print\", x=1)\n    return 0"
         )
         .is_ok());
     }
@@ -1504,7 +1688,7 @@ mod tests {
     fn scope_isolation_parallel_assign_local() {
         // Assignment inside parallel() to a variable NOT used outside is fine
         assert!(
-            sanitize("def graph():\n    with parallel() as p:\n        x = 1\n    return 0")
+            sanitize("def graph():\n    with PARALLEL() as p:\n        x = 1\n    return 0")
                 .is_ok()
         );
     }
@@ -1513,7 +1697,7 @@ mod tests {
     fn scope_isolation_reject_shared_mutation() {
         // Assign inside parallel() to a variable that was assigned at top level → data race warning
         let code =
-            "def graph():\n    x = 0\n    with parallel() as p:\n        x = 1\n    return x";
+            "def graph():\n    x = 0\n    with PARALLEL() as p:\n        x = 1\n    return x";
         let e = sanitize(code).unwrap_err();
         assert!(
             e.iter().any(|e| e.message.contains("data race")),
@@ -1525,7 +1709,7 @@ mod tests {
     #[test]
     fn scope_isolation_parallel_no_leak_on_new_var() {
         // A variable created inside parallel() is fine — it's local to the parallel block
-        let code = "def graph():\n    with parallel() as p:\n        y = 42\n    return 0";
+        let code = "def graph():\n    with PARALLEL() as p:\n        y = 42\n    return 0";
         assert!(sanitize(code).is_ok());
     }
 

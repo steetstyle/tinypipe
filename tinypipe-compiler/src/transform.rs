@@ -87,6 +87,13 @@ struct TransformEngine<'a> {
     // Current PARALLEL branch ID (None = outside any parallel branch)
     current_branch: Option<u32>,
 
+    // Current GROUP title (None = outside any `with GROUP(...)` block).
+    // Yalnızca görüntüleme metadata'sı — yürütme semantiğini etkilemez.
+    current_group: Option<String>,
+
+    // META(...) modül ifadesinden çıkarılan opak JSON.
+    meta_json: String,
+
     // Error collector
     errors: Vec<TransformError>,
 }
@@ -103,12 +110,16 @@ impl<'a> TransformEngine<'a> {
             terminal_nodes: HashSet::new(),
             next_id: 0,
             current_branch: None,
+            current_group: None,
+            meta_json: String::new(),
             errors: Vec::new(),
         }
     }
 
     fn build(self) -> ExecutionPlan {
-        ExecutionPlan::new(self.nodes, self.edges)
+        let mut plan = ExecutionPlan::new(self.nodes, self.edges);
+        plan.metadata.meta_json = self.meta_json;
+        plan
     }
 
     // ── ID generation ──────────────────────────────────────────
@@ -121,11 +132,15 @@ impl<'a> TransformEngine<'a> {
 
     /// Push a plan node and return its id.
     /// If currently inside a PARALLEL branch, assigns the branch_id automatically.
+    /// If currently inside a GROUP block, assigns the group title (display-only).
     fn push_node(&mut self, op: Opcode, args: Vec<(&str, ArgValue)>) -> String {
         let id = self.gen_id();
         let mut node = PlanNode::new(&id, op);
         if let Some(bid) = self.current_branch {
             node.branch_id = Some(bid);
+        }
+        if let Some(g) = self.current_group.clone() {
+            node.group = Some(g);
         }
         for (k, v) in args {
             node = node.with_arg(k, v);
@@ -172,6 +187,19 @@ impl<'a> TransformEngine<'a> {
     // ── Module / Function ──────────────────────────────────────
 
     fn transform_module(&mut self, module: &ast::ModModule) -> Result<(), Vec<TransformError>> {
+        // Module-level META(...) — extract opaque JSON (graph metadata).
+        for stmt in &module.body {
+            if let ast::Stmt::Expr(e) = stmt {
+                if let Some(json) = self.extract_meta(&e.value) {
+                    if !self.meta_json.is_empty() {
+                        self.error(e.value.as_ref(), "multiple `META(...)` blocks are not allowed");
+                        return Err(std::mem::take(&mut self.errors));
+                    }
+                    self.meta_json = json;
+                }
+            }
+        }
+
         // Find the `graph` function definition
         let graph_func = module.body.iter().find_map(|stmt| match stmt {
             ast::Stmt::FunctionDef(f) if f.name.as_str() == "graph" => Some(f),
@@ -222,6 +250,25 @@ impl<'a> TransformEngine<'a> {
         }
 
         Ok(())
+    }
+
+    /// Modül seviyesi `META(...)` çağrısından opak JSON üretir.
+    /// META değilse `None`; sanitizer değerleri doğrulamıştır.
+    fn extract_meta(&self, expr: &ast::Expr) -> Option<String> {
+        if !is_name_call(expr, "META") {
+            return None;
+        }
+        let call = match expr {
+            ast::Expr::Call(c) => c,
+            _ => return None,
+        };
+        let mut map = serde_json::Map::new();
+        for kw in &call.keywords {
+            if let Some(arg) = &kw.arg {
+                map.insert(arg.as_str().to_owned(), meta_expr_to_json(&kw.value));
+            }
+        }
+        Some(serde_json::Value::Object(map).to_string())
     }
 
     // ── Statement transformer ──────────────────────────────────
@@ -426,10 +473,10 @@ impl<'a> TransformEngine<'a> {
                 Ok((loop_id.clone(), loop_id))
             }
 
-            // ── With parallel ──────────────────────────────────
+            // ── With parallel / group ───────────────────────────
             ast::Stmt::With(s) => {
-                // Verify it's `with parallel() as p:`
-                if s.items.len() == 1 && is_name_call(&s.items[0].context_expr, "parallel") {
+                let item = &s.items[0];
+                if is_name_call(&item.context_expr, "PARALLEL") {
                     let par_id = self.push_node(Opcode::Parallel, vec![]);
                     // Her parallel branch'e unique branch_id ata
                     for (branch_idx, child) in s.body.iter().enumerate() {
@@ -440,6 +487,28 @@ impl<'a> TransformEngine<'a> {
                         self.push_edge(&par_id, &cid);
                     }
                     Ok((par_id.clone(), par_id))
+                } else if is_name_call(&item.context_expr, "GROUP") {
+                    // Display-only grouping: gövde node'larına grup başlığı atanır.
+                    let title = group_title_from_call(&item.context_expr);
+                    let saved_group = self.current_group.take();
+                    self.current_group = Some(title);
+                    let mut first: Option<String> = None;
+                    let mut last: Option<String> = None;
+                    for child in &s.body {
+                        let (f, l) = self.transform_stmt(child, &None)?;
+                        if first.is_none() {
+                            first = Some(f.clone());
+                        }
+                        if let Some(prev) = &last {
+                            self.push_edge(prev, &f);
+                        }
+                        last = Some(l);
+                    }
+                    self.current_group = saved_group;
+                    let fallback = self.gen_id();
+                    let first = first.unwrap_or_else(|| fallback.clone());
+                    let last = last.unwrap_or(fallback);
+                    Ok((first, last))
                 } else {
                     self.error(stmt, "unsupported `with` statement");
                     Ok((self.gen_id(), self.gen_id()))
@@ -927,6 +996,57 @@ fn is_name_call(expr: &ast::Expr, name: &str) -> bool {
     }
 }
 
+/// `with GROUP(...)` çağrısından başlık string'ini çıkarır.
+fn group_title_from_call(expr: &ast::Expr) -> String {
+    match expr {
+        ast::Expr::Call(c) => match c.args.first() {
+            Some(ast::Expr::Constant(ast::ExprConstant {
+                value: ast::Constant::Str(s),
+                ..
+            })) => s.to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// Sabit META ifadesini JSON değerine çevirir (sanitizer doğrulamıştır).
+fn meta_expr_to_json(expr: &ast::Expr) -> serde_json::Value {
+    match expr {
+        ast::Expr::Constant(c) => match &c.value {
+            ast::Constant::None => serde_json::Value::Null,
+            ast::Constant::Bool(b) => serde_json::Value::Bool(*b),
+            ast::Constant::Int(i) => i
+                .to_string()
+                .parse::<serde_json::Number>()
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            ast::Constant::Float(f) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            ast::Constant::Str(s) => serde_json::Value::String(s.clone()),
+            _ => serde_json::Value::Null,
+        },
+        ast::Expr::UnaryOp(u) => match (&u.op, &*u.operand) {
+            (ast::UnaryOp::USub, ast::Expr::Constant(c)) => match &c.value {
+                ast::Constant::Int(i) => i
+                .to_string()
+                .parse::<serde_json::Number>()
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+                ast::Constant::Float(f) => serde_json::Number::from_f64(-f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            },
+            _ => serde_json::Value::Null,
+        },
+        ast::Expr::List(l) => serde_json::Value::Array(l.elts.iter().map(meta_expr_to_json).collect()),
+        ast::Expr::Tuple(t) => serde_json::Value::Array(t.elts.iter().map(meta_expr_to_json).collect()),
+        _ => serde_json::Value::Null,
+    }
+}
+
 /// Allowed built-in functions that don't require special handling.
 fn is_allowed_builtin(name: &str) -> bool {
     matches!(
@@ -1346,7 +1466,7 @@ mod tests {
     #[test]
     fn transform_parallel() {
         let code = r#"def graph():
-    with parallel() as p:
+    with PARALLEL() as p:
         x = call("tool1")
         y = call("tool2")
     return x"#;
@@ -1356,6 +1476,85 @@ mod tests {
             "should have PARALLEL node"
         );
         assert!(plan.topological_order().is_ok());
+    }
+
+    // ── META / GROUP ────────────────────────────────────────────
+
+    #[test]
+    fn transform_meta_extracts_json() {
+        let code = r#"META(
+    title="User Dashboard",
+    sla_ms=5000,
+    tags=["dashboard", "seed"],
+)
+
+def graph(user_id: int):
+    return user_id"#;
+        let plan = transform(code).expect("should succeed");
+        let meta: serde_json::Value =
+            serde_json::from_str(&plan.metadata.meta_json).expect("meta_json must be JSON");
+        assert_eq!(meta["title"], "User Dashboard");
+        assert_eq!(meta["sla_ms"], 5000);
+        assert_eq!(meta["tags"], serde_json::json!(["dashboard", "seed"]));
+    }
+
+    #[test]
+    fn transform_meta_empty_without_block() {
+        let plan = transform("def graph(x: int):\n    return x").expect("should succeed");
+        assert!(plan.metadata.meta_json.is_empty());
+    }
+
+    #[test]
+    fn transform_meta_unknown_key_passes_through() {
+        let code = r#"META(title="X", custom_field="hello")
+
+def graph():
+    return 0"#;
+        let plan = transform(code).expect("unknown keys must pass through");
+        let meta: serde_json::Value =
+            serde_json::from_str(&plan.metadata.meta_json).expect("meta_json must be JSON");
+        assert_eq!(meta["custom_field"], "hello");
+    }
+
+    #[test]
+    fn transform_group_assigns_nodes() {
+        let code = r#"def graph(user_id: int):
+    with GROUP("Seeding"):
+        users = call("subgraph:seed_users")
+    with GROUP("Output"):
+        out = users
+    return out"#;
+        let plan = transform(code).expect("should succeed");
+        let call_node = plan
+            .nodes
+            .iter()
+            .find(|n| n.op == Opcode::Call)
+            .expect("has a Call node");
+        assert_eq!(call_node.group.as_deref(), Some("Seeding"));
+        let out_node = plan
+            .nodes
+            .iter()
+            .find(|n| n.args.iter().any(|a| a.key == "output" && a.value == ArgValue::String("out".into())))
+            .expect("has out calc");
+        assert_eq!(out_node.group.as_deref(), Some("Output"));
+        // Input node (created before any GROUP) stays ungrouped
+        let input_node = plan
+            .nodes
+            .iter()
+            .find(|n| n.op == Opcode::Input)
+            .expect("has Input node");
+        assert_eq!(input_node.group, None);
+        assert!(plan.topological_order().is_ok());
+    }
+
+    #[test]
+    fn transform_group_multiple_meta_rejected() {
+        let code = r#"META(title="A")
+META(title="B")
+
+def graph():
+    return 0"#;
+        assert!(transform(code).is_err(), "multiple META blocks must fail");
     }
 
     // ── Error cases ─────────────────────────────────────────────

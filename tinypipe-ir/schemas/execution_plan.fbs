@@ -74,6 +74,7 @@ table CompiledNode {
     args: [CompiledArg];                          // @3 — key-value params
     inferred_type: Type = Unspecified;            // @4
     branch_id: uint = 4294967295;                 // @5 — PARALLEL branch ID, default u32::MAX = None
+    group_id: uint = 4294967295;                  // @6 — GROUP index (display-only), default u32::MAX = None
 }
 
 table CompiledEdge {
@@ -98,14 +99,16 @@ table CompiledMetadata {
     optimizations: [string];                      // @8
     tool_deps: [ToolDep];                         // @9
     subgraph_dependencies: [string];              // @10
+    meta_json: string;                            // @11 — META(...) opaque JSON
 }
 
 table ExecutionPlan {
-    version: ushort = 3;                          // @0 — v3: FlatBuffers canonical format
+    version: ushort = 4;                          // @0 — v4: + groups, group_id, meta_json
     nodes: [CompiledNode];                        // @1
     edges: [CompiledEdge];                        // @2
     metadata: CompiledMetadata;                   // @3
     id_map: [IdEntry];                            // @4 — string ID → uint32 index
+    groups: [string];                             // @5 — GROUP titles; node.group_id indexes here
 }
 
 root_type ExecutionPlan;

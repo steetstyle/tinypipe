@@ -5,8 +5,10 @@
 //! v3: FlatBuffers binary format (zero-copy, canonical .fbs schema).
 
 pub mod compiled;
+pub mod env_deps;
 pub mod plan;
 pub mod plan_dump;
+pub mod plan_view;
 
 // Include FlatBuffers generated bindings
 #[allow(clippy::all)]

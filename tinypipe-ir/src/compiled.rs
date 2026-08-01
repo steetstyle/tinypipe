@@ -51,6 +51,9 @@ pub struct CompiledNode {
     /// PARALLEL branch ID: bu node hangi branch'e ait.
     /// VM bu alanı scope isolation için kullanır.
     pub branch_id: Option<u32>,
+    /// GROUP index'i: `plan.groups[group_id]` başlığına işaret eder.
+    /// Yalnızca görüntüleme metadata'sı — VM tarafından kullanılmaz.
+    pub group_id: Option<u32>,
 }
 
 /// Compiled arg — key-value çifti.
@@ -88,6 +91,8 @@ pub struct CompiledMetadata {
     pub tool_deps: Vec<ToolDep>,
     /// Subgraph dependencies (targets starting with "subgraph:").
     pub subgraph_dependencies: Vec<String>,
+    /// META(...) opaque JSON (title, description, owner, tags, ...).
+    pub meta_json: String,
 }
 
 impl Default for CompiledMetadata {
@@ -104,6 +109,7 @@ impl Default for CompiledMetadata {
             optimizations: Vec::new(),
             tool_deps: Vec::new(),
             subgraph_dependencies: Vec::new(),
+            meta_json: String::new(),
         }
     }
 }
@@ -122,6 +128,8 @@ pub struct CompiledPlan {
     /// String ID → uint32 index mapping (VM'in string→index çözümlemesi için).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id_map: Option<Vec<(String, u32)>>,
+    /// GROUP başlıkları: `node.group_id` bu vektöre index'ler.
+    pub groups: Vec<String>,
 }
 
 impl CompiledPlan {
@@ -134,6 +142,11 @@ impl CompiledPlan {
         let mut id_to_index: std::collections::HashMap<&str, u32> =
             std::collections::HashMap::with_capacity(node_count);
         let mut compiled_nodes: Vec<CompiledNode> = Vec::with_capacity(node_count);
+
+        // GROUP başlıkları → index tablosu (display-only metadata)
+        let mut group_names: Vec<String> = Vec::new();
+        let mut group_index: std::collections::HashMap<&str, u32> =
+            std::collections::HashMap::new();
 
         for (idx, node) in plan.nodes.iter().enumerate() {
             let index = idx as u32;
@@ -153,6 +166,13 @@ impl CompiledPlan {
                 })
                 .collect();
 
+            let group_id = node.group.as_deref().map(|g| {
+                *group_index.entry(g).or_insert_with(|| {
+                    group_names.push(g.to_owned());
+                    (group_names.len() - 1) as u32
+                })
+            });
+
             compiled_nodes.push(CompiledNode {
                 index,
                 id: node.id.clone(),
@@ -160,6 +180,7 @@ impl CompiledPlan {
                 args,
                 inferred_type: node.inferred_type.clone(),
                 branch_id: node.branch_id,
+                group_id,
             });
         }
 
@@ -196,7 +217,7 @@ impl CompiledPlan {
             .collect();
 
         CompiledPlan {
-            version: 3,
+            version: 4,
             nodes: compiled_nodes,
             edges: compiled_edges,
             metadata: CompiledMetadata {
@@ -211,8 +232,10 @@ impl CompiledPlan {
                 optimizations,
                 tool_deps: plan.metadata.tool_deps.clone(),
                 subgraph_dependencies: plan.metadata.subgraph_dependencies.clone(),
+                meta_json: plan.metadata.meta_json.clone(),
             },
             id_map: Some(id_map),
+            groups: group_names,
         }
     }
 
@@ -308,6 +331,9 @@ impl CompiledPlan {
             .collect();
         let subgraph_deps_vec = fbb.create_vector(&subgraph_deps);
 
+        // Build meta_json (META(...) opaque JSON, empty = absent)
+        let meta_json = fbb.create_string(&self.metadata.meta_json);
+
         // Build metadata
         let compiler_version = fbb.create_string(&self.metadata.compiler_version);
         let compiled_at = fbb.create_string(&self.metadata.compiled_at);
@@ -325,6 +351,7 @@ impl CompiledPlan {
                 optimizations: Some(optimizations_vec),
                 tool_deps: Some(tool_deps_vec),
                 subgraph_dependencies: Some(subgraph_deps_vec),
+                meta_json: Some(meta_json),
             },
         );
 
@@ -413,6 +440,7 @@ impl CompiledPlan {
                     Some(Type::Any) => crate::fb::Type::Any,
                 };
                 let branch_id = node.branch_id.unwrap_or(u32::MAX);
+                let group_id = node.group_id.unwrap_or(u32::MAX);
                 crate::fb::CompiledNode::create(
                     &mut fbb,
                     &crate::fb::CompiledNodeArgs {
@@ -422,11 +450,16 @@ impl CompiledPlan {
                         args: Some(args_vec),
                         inferred_type,
                         branch_id,
+                        group_id,
                     },
                 )
             })
             .collect();
         let nodes_vec = fbb.create_vector(&nodes);
+
+        // Build groups vector (display-only GROUP titles)
+        let groups: Vec<_> = self.groups.iter().map(|g| fbb.create_string(g)).collect();
+        let groups_vec = fbb.create_vector(&groups);
 
         // Build root ExecutionPlan
         let root = crate::fb::ExecutionPlan::create(
@@ -437,6 +470,7 @@ impl CompiledPlan {
                 edges: Some(edges_vec),
                 metadata: Some(metadata),
                 id_map: id_map_vec,
+                groups: Some(groups_vec),
             },
         );
 
@@ -487,6 +521,7 @@ impl CompiledPlan {
             optimizations,
             tool_deps,
             subgraph_dependencies: subgraph_deps,
+            meta_json: fb_meta.meta_json().unwrap_or_default().to_string(),
         };
 
         // Convert edges
@@ -597,6 +632,12 @@ impl CompiledPlan {
                         } else {
                             Some(fb_branch_id)
                         };
+                        let fb_group_id = n.group_id();
+                        let group_id = if fb_group_id == u32::MAX {
+                            None
+                        } else {
+                            Some(fb_group_id)
+                        };
                         CompiledNode {
                             index: n.index(),
                             id: n.id().unwrap_or_default().to_string(),
@@ -604,6 +645,7 @@ impl CompiledPlan {
                             args,
                             inferred_type,
                             branch_id,
+                            group_id,
                         }
                     })
                     .collect()
@@ -617,12 +659,19 @@ impl CompiledPlan {
                 .collect()
         });
 
+        // Convert groups (display-only GROUP titles)
+        let groups: Vec<String> = fb_plan
+            .groups()
+            .map(|gs| gs.iter().map(|g| g.to_string()).collect())
+            .unwrap_or_default();
+
         Ok(CompiledPlan {
             version: fb_plan.version(),
             nodes,
             edges,
             metadata,
             id_map,
+            groups,
         })
     }
 }

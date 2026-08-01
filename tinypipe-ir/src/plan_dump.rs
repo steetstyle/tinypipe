@@ -1,11 +1,15 @@
 //! Plan dump renderer'ları: text / mermaid / dot formatları.
 //!
 //! CLI'dan bağımsızdır — `CompiledPlan` üzerinde çalışır, sonucu `String`
-//! olarak döndürür (CLI sadece yazdırır). Mermaid çıktısı mermaid.live,
-//! dot çıktısı graphviz ile render edilebilir.
+//! olarak döndürür (CLI sadece yazdırır).
+//!
+//! - **Text**: ham node/edge dökümü (debug/audit).
+//! - **Mermaid / Dot**: `plan_view`'daki semantik renderer (label + simplify +
+//!   GROUP subgraph'ları + collapse). Mermaid çıktısı mermaid.live'da,
+//!   dot çıktısı graphviz ile render edilebilir.
 
-use crate::compiled::{CompiledEdge, CompiledNode, CompiledPlan};
-use crate::plan::{EdgeKind, Opcode};
+use crate::compiled::CompiledPlan;
+use crate::plan_view::{render_dot, render_mermaid, RenderOptions};
 
 /// Plan dump formatları (CLI `plan --format` için).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -35,6 +39,12 @@ impl PlanFormat {
             PlanFormat::Dot => "dot",
         }
     }
+
+    /// `--format` dışındaki görünüm seçimlerinin (`--view/--direction`)
+    /// geçerli olup olmadığı.
+    pub fn supports_options(self) -> bool {
+        !matches!(self, PlanFormat::Text)
+    }
 }
 
 /// Text dump header bilgisi (kaynak graph ve encoded boyut, CLI'den gelir).
@@ -45,11 +55,16 @@ pub struct PlanDumpHeader<'a> {
 }
 
 impl PlanFormat {
-    pub fn render(self, plan: &CompiledPlan, header: &PlanDumpHeader) -> String {
+    pub fn render(
+        self,
+        plan: &CompiledPlan,
+        header: &PlanDumpHeader,
+        options: RenderOptions,
+    ) -> String {
         match self {
             PlanFormat::Text => dump_text(plan, header),
-            PlanFormat::Mermaid => dump_mermaid(plan),
-            PlanFormat::Dot => dump_dot(plan),
+            PlanFormat::Mermaid => render_mermaid(plan, options),
+            PlanFormat::Dot => render_dot(plan, options),
         }
     }
 }
@@ -60,65 +75,9 @@ fn arg_value(raw: &str) -> String {
     raw.trim_matches(|c| c == '"' || c == '\\').to_string()
 }
 
-/// Mermaid label'larında sorun çıkarabilecek karakterleri encode et
-/// (`#` yorum başlatır, tırnak label sınırıyla çakışır).
-fn mermaid_escape(s: &str) -> String {
-    s.replace('#', "&#35;").replace('"', "'")
-}
-
-/// Node etiketi: `op: kısa özet` (mermaid/dot için).
-fn node_label(n: &CompiledNode) -> String {
-    let arg = |key: &str| {
-        n.args
-            .iter()
-            .find(|a| a.key == key)
-            .map(|a| arg_value(&a.value))
-    };
-    let op = format!("{:?}", n.op);
-    match n.op {
-        Opcode::Input => arg("name").map(|v| format!("Input {}", v)).unwrap_or(op),
-        Opcode::Calc => match (arg("output"), arg("expr")) {
-            (Some(out), Some(expr)) => format!("{} = {}", out, expr),
-            (None, Some(expr)) => expr,
-            _ => op,
-        },
-        Opcode::Act => arg("type").map(|v| format!("Act {}", v)).unwrap_or(op),
-        Opcode::Decide => {
-            let src = arg("source").unwrap_or_default();
-            let op = arg("op").unwrap_or_default();
-            let val = arg("value").unwrap_or_default();
-            match (src.is_empty(), op.is_empty(), val.is_empty()) {
-                (false, false, false) => format!("Decide {} {} {}", src, op, val),
-                _ => arg("condition")
-                    .map(|c| format!("Decide {}", c))
-                    .unwrap_or(op),
-            }
-        }
-        Opcode::Loop => {
-            let target = arg("target").unwrap_or_default();
-            let max = arg("max_iterations").unwrap_or_default();
-            if target.is_empty() {
-                op
-            } else {
-                format!("Loop {} max={}", target, max)
-            }
-        }
-        _ => op,
-    }
-}
-
-/// Edge etiketi: koşullu edge'ler koşulunu, control edge'leri "control" gösterir.
-fn edge_label(e: &CompiledEdge) -> Option<String> {
-    match e.condition.as_deref() {
-        Some(c) => Some(c.to_string()),
-        None => match e.kind {
-            EdgeKind::Control => Some("control".into()),
-            EdgeKind::Data => None,
-        },
-    }
-}
-
 fn dump_text(plan: &CompiledPlan, header: &PlanDumpHeader) -> String {
+    use crate::plan::EdgeKind;
+
     let mut out = String::new();
     out.push_str(&format!(
         "Graph: {} (v{})\n",
@@ -137,6 +96,14 @@ fn dump_text(plan: &CompiledPlan, header: &PlanDumpHeader) -> String {
         }
         if let Some(bid) = n.branch_id {
             out.push_str(&format!("      (branch_id: {})\n", bid));
+        }
+        if let Some(gid) = n.group_id {
+            let title = plan
+                .groups
+                .get(gid as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("?");
+            out.push_str(&format!("      (group: {} -> {})\n", gid, title));
         }
     }
 
@@ -167,52 +134,12 @@ fn dump_text(plan: &CompiledPlan, header: &PlanDumpHeader) -> String {
     out
 }
 
-fn dump_mermaid(plan: &CompiledPlan) -> String {
-    let mut out = String::new();
-    out.push_str("```mermaid\nflowchart LR\n");
-    for n in &plan.nodes {
-        let label = mermaid_escape(&node_label(n));
-        out.push_str(&format!("    N{}[\"{}\"]\n", n.index, label));
-    }
-    for e in &plan.edges {
-        match edge_label(e) {
-            Some(l) => out.push_str(&format!(
-                "    N{} -->|{}| N{}\n",
-                e.from_index,
-                mermaid_escape(&l),
-                e.to_index
-            )),
-            None => out.push_str(&format!("    N{} --> N{}\n", e.from_index, e.to_index)),
-        }
-    }
-    out.push_str("```\n");
-    out
-}
-
-fn dump_dot(plan: &CompiledPlan) -> String {
-    let mut out = String::new();
-    out.push_str("digraph plan {\n");
-    for n in &plan.nodes {
-        let label = node_label(n).replace('"', "'");
-        out.push_str(&format!("    N{} [label=\"{}\"];\n", n.index, label));
-    }
-    for e in &plan.edges {
-        match edge_label(e) {
-            Some(l) => out.push_str(&format!(
-                "    N{} -> N{} [label=\"{}\"];\n",
-                e.from_index, e.to_index, l
-            )),
-            None => out.push_str(&format!("    N{} -> N{};\n", e.from_index, e.to_index)),
-        }
-    }
-    out.push_str("}\n");
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiled::{CompiledArg, CompiledMetadata};
+    use crate::compiled::{CompiledArg, CompiledMetadata, CompiledNode};
+    use crate::plan::{EdgeKind, Opcode};
+    use crate::plan_view::{Direction, ViewLevel};
 
     fn sample_plan() -> CompiledPlan {
         CompiledPlan {
@@ -228,6 +155,7 @@ mod tests {
                     }],
                     inferred_type: None,
                     branch_id: None,
+                    group_id: None,
                 },
                 CompiledNode {
                     index: 1,
@@ -249,6 +177,7 @@ mod tests {
                     ],
                     inferred_type: None,
                     branch_id: None,
+                    group_id: None,
                 },
                 CompiledNode {
                     index: 2,
@@ -260,6 +189,7 @@ mod tests {
                     }],
                     inferred_type: None,
                     branch_id: None,
+                    group_id: None,
                 },
             ],
             edges: vec![
@@ -282,7 +212,7 @@ mod tests {
                     kind: EdgeKind::Data,
                 },
                 crate::compiled::CompiledEdge {
-                    from_index: 1,
+                    from_index: 0,
                     to_index: 2,
                     condition: None,
                     mapping: None,
@@ -293,6 +223,7 @@ mod tests {
             ],
             metadata: CompiledMetadata::default(),
             id_map: None,
+            groups: Vec::new(),
         }
     }
 
@@ -314,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_dump_text_contains_all_sections() {
-        let out = PlanFormat::Text.render(&sample_plan(), &header());
+        let out = PlanFormat::Text.render(&sample_plan(), &header(), RenderOptions::default());
         assert!(out.contains("Graph: g1 (v3)"));
         assert!(out.contains("FlatBuffers (42 bytes)"));
         assert!(out.contains("Nodes (3):"));
@@ -324,50 +255,58 @@ mod tests {
         assert!(out.contains("value = 5"));
         assert!(out.contains("Edges (3):"));
         assert!(out.contains("1 -> 2 [data cond=true]"));
-        assert!(out.contains("1 -> 2 [control]"));
+        assert!(out.contains("0 -> 2 [control]"));
         assert!(out.contains("Metadata: version=1"));
     }
 
     #[test]
-    fn test_dump_mermaid_renders_graph() {
-        let out = PlanFormat::Mermaid.render(&sample_plan(), &header());
+    fn test_dump_text_shows_group() {
+        let mut plan = sample_plan();
+        plan.groups = vec!["Seeding".into()];
+        plan.nodes[1].group_id = Some(0);
+        let out = PlanFormat::Text.render(&plan, &header(), RenderOptions::default());
+        assert!(out.contains("(group: 0 -> Seeding)"));
+    }
+
+    #[test]
+    fn test_dump_mermaid_semantic_labels() {
+        let out = PlanFormat::Mermaid.render(&sample_plan(), &header(), RenderOptions::default());
         assert!(out.contains("```mermaid"));
-        assert!(out.contains("flowchart LR"));
-        assert!(out.contains("N0[\"Input x\"]"));
-        assert!(out.contains("N1[\"Decide x lt 5\"]"));
-        assert!(out.contains("N2[\"Act return\"]"));
+        assert!(out.contains("flowchart TD"));
+        assert!(out.contains("N0[\"Input: x\"]"));
+        assert!(out.contains("N1{\"x lt 5 ?\"}"), "Decide → diamond");
+        assert!(out.contains("N2([\"Return\"])"), "Return → stadium");
         assert!(out.contains("N0 --> N1"));
         assert!(out.contains("N1 -->|true| N2"));
-        assert!(out.contains("N1 -->|control| N2"));
+        // Control edge → dashed (data edge'i olmayan çiftlerde)
+        assert!(out.contains("N0 -.-> N2"));
     }
 
     #[test]
-    fn test_dump_mermaid_escapes_special_chars() {
-        // `#` mermaid'de yorum başlatır — encode edilmeli.
-        let mut plan = sample_plan();
-        plan.nodes[1].args[1].value = "big #5".into();
-        let out = PlanFormat::Mermaid.render(&plan, &header());
-        assert!(out.contains("Decide x big &#35;5"));
-        assert!(!out.contains("Decide x big #5"));
-    }
-
-    #[test]
-    fn test_dump_text_strips_legacy_escaped_quotes() {
-        // Eski FB formatı `"\"x\""` — arg_value her iki formu da sadeleştirmeli.
-        let mut plan = sample_plan();
-        plan.nodes[0].args[0].value = "\"\\\"x\\\"\"".into();
-        let out = PlanFormat::Text.render(&plan, &header());
-        assert!(out.contains("name = x"));
-        assert!(!out.contains("\\\""));
+    fn test_dump_mermaid_honors_options() {
+        let options = RenderOptions {
+            view: ViewLevel::Summary,
+            direction: Direction::Lr,
+            numbered_groups: true,
+        };
+        let out = PlanFormat::Mermaid.render(&sample_plan(), &header(), options);
+        assert!(out.contains("flowchart LR"));
+        assert!(!out.contains("subgraph"));
     }
 
     #[test]
     fn test_dump_dot_renders_graph() {
-        let out = PlanFormat::Dot.render(&sample_plan(), &header());
+        let out = PlanFormat::Dot.render(&sample_plan(), &header(), RenderOptions::default());
         assert!(out.contains("digraph plan {"));
-        assert!(out.contains("N0 [label=\"Input x\"];"));
-        assert!(out.contains("N1 -> N2 [label=\"true\"];"));
-        assert!(out.contains("N1 -> N2 [label=\"control\"];"));
-        assert!(out.contains("N0 -> N1;"));
+        assert!(out.contains("N0 [label=\"Input: x\"];"));
+        assert!(out.contains("N1 -> N2 [label=\"true\", style=solid];"));
+        assert!(out.contains("N0 -> N2 [style=dashed];"));
+    }
+
+    #[test]
+    fn test_supports_options() {
+        assert!(!PlanFormat::Text.supports_options());
+        assert!(PlanFormat::Mermaid.supports_options());
+        assert!(PlanFormat::Dot.supports_options());
     }
 }

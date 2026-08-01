@@ -4,7 +4,9 @@
 //! tinypipe-vm tarafından tüketilir.
 //! Test'lerde mock implementasyon kullanılır.
 
-use crate::types::{Execution, ExecutionStep, GraphId, StorageError, Version};
+use crate::types::{
+    Execution, ExecutionStep, GraphId, Profile, StorageError, Version,
+};
 
 /// Graph definition (nodes + edges) — storage'dan dönen tam graph.
 #[derive(Debug, Clone)]
@@ -23,6 +25,8 @@ pub struct GraphDefinition {
     pub fork_node: Option<String>,
     /// Branch tree: fork sebebi / etiketi ("yaş<25").
     pub fork_label: Option<String>,
+    /// Son yaşam döngüsü olayı: `deploy: v3`, `rollback: v2`, `fork: <parent>`.
+    pub last_event: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -121,6 +125,21 @@ pub trait GraphStorage: Send + Sync {
     /// Fork tree'yi döndürür: graph + tüm child'ları recursive olarak.
     /// Her graph'ın altında `children: Vec<GraphDefinition>` alanı doldurulur.
     fn graph_tree(&self, id: &GraphId) -> Result<GraphTreeNode, StorageError>;
+
+    // ==================== Profiles (v2.5) ====================
+
+    /// Tüm profilleri listele (built-in'ler dahil, ad sıralı).
+    fn list_profiles(&self) -> Result<Vec<Profile>, StorageError>;
+
+    /// Profili ad ile yükle.
+    fn load_profile(&self, name: &str) -> Result<Profile, StorageError>;
+
+    /// Profil kaydet (INSERT OR REPLACE). Aynı adla built-in profil varsa
+    /// built-in olmayan kayıt üzerine yazar; built-in kayıt silinemez/ezilemez.
+    fn save_profile(&self, profile: &Profile) -> Result<(), StorageError>;
+
+    /// Profili sil (yalnızca built-in olmayanlar).
+    fn delete_profile(&self, name: &str) -> Result<(), StorageError>;
 }
 
 /// Branch tree node — recursive children.
@@ -214,6 +233,18 @@ impl<T: GraphStorage> GraphStorage for std::sync::Arc<T> {
     }
     fn graph_tree(&self, id: &GraphId) -> Result<GraphTreeNode, StorageError> {
         self.as_ref().graph_tree(id)
+    }
+    fn list_profiles(&self) -> Result<Vec<Profile>, StorageError> {
+        self.as_ref().list_profiles()
+    }
+    fn load_profile(&self, name: &str) -> Result<Profile, StorageError> {
+        self.as_ref().load_profile(name)
+    }
+    fn save_profile(&self, profile: &Profile) -> Result<(), StorageError> {
+        self.as_ref().save_profile(profile)
+    }
+    fn delete_profile(&self, name: &str) -> Result<(), StorageError> {
+        self.as_ref().delete_profile(name)
     }
 }
 
@@ -337,6 +368,25 @@ mod tests {
 
         fn graph_tree(&self, _id: &GraphId) -> Result<GraphTreeNode, StorageError> {
             Err(StorageError::Internal("not implemented".into()))
+        }
+
+        fn list_profiles(&self) -> Result<Vec<Profile>, StorageError> {
+            Ok(vec![])
+        }
+
+        fn load_profile(&self, name: &str) -> Result<Profile, StorageError> {
+            Err(StorageError::Internal(format!(
+                "profile '{}' not available in mock",
+                name
+            )))
+        }
+
+        fn save_profile(&self, _profile: &Profile) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn delete_profile(&self, _name: &str) -> Result<(), StorageError> {
+            Ok(())
         }
     }
 

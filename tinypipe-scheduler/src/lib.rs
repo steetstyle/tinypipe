@@ -12,9 +12,9 @@
 //! kadar (veya `max_rounds` sınırına kadar) tur atar.
 
 use tinypipe_api::storage::GraphStorage;
-use tinypipe_api::types::{Execution, ExecutionStatus};
+use tinypipe_api::types::{Execution, ExecutionStatus, ExecutionStep};
 use tinypipe_ir::compiled::CompiledPlan;
-use tinypipe_vm::{Checkpoint, CompiledExecutor, ExecutionOutcome, PausePolicy};
+use tinypipe_vm::{Checkpoint, CompiledExecutor, ExecutionOutcome, ExecutionResult, PausePolicy};
 
 /// Scheduler hataları (fatal — turu durdurur).
 #[derive(Debug, thiserror::Error)]
@@ -154,9 +154,18 @@ impl<S: GraphStorage> Scheduler<S> {
 
         // 3. Env doğrulaması — resume'dan ÖNCE tüm (transitive) bağımlılıklar
         //    ortamda yoksa bu execution atlanır ve hata raporlanır.
+        let tools = tinypipe_tools::default_tools();
+        // Daemon varsa remote tool'lar da registry'ye eklenir (çakışan isimlerde
+        // built-in kazanır); daemon kapalıysa sessizce built-in'lerle devam edilir.
+        if std::env::var("TINYPIPE_NO_DAEMON").is_err() {
+            let _ = tinypipe_tools::register_daemon_tools(
+                &tools,
+                &tinypipe_tools::daemon_addr_from_env(),
+            );
+        }
         let registry = std::sync::Arc::new(tinypipe_tools::SubgraphToolRegistry::with_tools(
             self.storage.clone(),
-            tinypipe_tools::default_tools(),
+            tools,
         ))
         .init();
         match registry.validate_env(&exec.graph_id.0, &self.env) {
@@ -192,6 +201,7 @@ impl<S: GraphStorage> Scheduler<S> {
 
         match result {
             ExecutionOutcome::Completed(res) => {
+                self.record_steps(&exec.id, &plan, &res)?;
                 let mut updated = exec.clone();
                 updated.status = ExecutionStatus::Completed;
                 updated.output = res.output;
@@ -212,6 +222,47 @@ impl<S: GraphStorage> Scheduler<S> {
                 Ok(ResumeOutcome::StillPaused)
             }
         }
+    }
+
+    /// Bu segmentte gerçekten çalışan node'ları step olarak kaydeder.
+    /// `node_durations` checkpoint'ten taşınan eski node'ları içermez — resume
+    /// segmentleri çift kayıt yaratmaz.
+    fn record_steps(
+        &self,
+        execution_id: &str,
+        plan: &CompiledPlan,
+        result: &ExecutionResult,
+    ) -> Result<(), SchedulerError> {
+        let node_by_id: std::collections::HashMap<&str, &tinypipe_ir::compiled::CompiledNode> =
+            plan.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let mut cursor: u64 = crate::now_micros().parse().unwrap_or(0);
+        for (node_id, duration_us) in &result.node_durations {
+            let op = node_by_id
+                .get(node_id.as_str())
+                .map(|n| format!("{:?}", n.op))
+                .unwrap_or_else(|| "unknown".into());
+            let started_at = cursor;
+            let completed_at = started_at + duration_us;
+            cursor = completed_at;
+            let step = ExecutionStep {
+                id: uuid::Uuid::new_v4().to_string(),
+                execution_id: execution_id.to_string(),
+                node_id: node_id.clone(),
+                node_op: op,
+                status: "completed".into(),
+                error: None,
+                started_at: started_at.to_string(),
+                completed_at: Some(completed_at.to_string()),
+                duration_us: Some(*duration_us),
+                context_before: None,
+                context_after: None,
+                parent_step_id: None,
+            };
+            self.storage
+                .save_step(&step)
+                .map_err(|e| SchedulerError::Storage(e.to_string()))?;
+        }
+        Ok(())
     }
 }
 

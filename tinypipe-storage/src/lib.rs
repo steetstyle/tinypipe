@@ -11,7 +11,7 @@ use serde_json;
 
 use tinypipe_api::storage::{GraphDefinition, GraphStorage, GraphTreeNode};
 use tinypipe_api::types::{
-    Execution, ExecutionStatus, ExecutionStep, GraphId, StorageError, Value, Version,
+    Execution, ExecutionStatus, ExecutionStep, GraphId, Profile, StorageError, Value, Version,
 };
 
 /// SQLite-backed GraphStorage implementation.
@@ -170,6 +170,29 @@ impl SqliteStorage {
                 tracing::warn!("FTS5 not available (graphs search disabled): {}", e);
             }
         }
+
+        // v2.4 migration: last_event column (deploy/rollback/fork işaretleri)
+        let has_last_event: bool = conn.prepare("SELECT last_event FROM graphs LIMIT 0").is_ok();
+        if !has_last_event {
+            conn.execute_batch("ALTER TABLE graphs ADD COLUMN last_event TEXT;").map_err(
+                |e| StorageError::Internal(format!("migration v2.4 failed: {}", e)),
+            )?;
+        }
+
+        // v2.5 migration: profiles table (rol bazlı görünüm profilleri)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS profiles (
+                 name        TEXT PRIMARY KEY,
+                 label       TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '',
+                 view        TEXT NOT NULL DEFAULT 'full',
+                 direction   TEXT NOT NULL DEFAULT 'td',
+                 focus       TEXT NOT NULL DEFAULT '[]',
+                 config      TEXT NOT NULL DEFAULT '{}',
+                 builtin     INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .map_err(|e| StorageError::Internal(format!("migration v2.5 failed: {e}")))?;
 
         // name→id çözümleme için indeks (subgraph dispatch hot path)
         if let Err(e) = conn.execute_batch(
@@ -400,8 +423,8 @@ impl GraphStorage for SqliteStorage {
             return Err(StorageError::VersionNotFound(version, id.clone()));
         }
         conn.execute(
-            "UPDATE graphs SET active_version = ?1, status = 'deployed' WHERE id = ?2",
-            params![ver, id.0],
+            "UPDATE graphs SET active_version = ?1, status = 'deployed', last_event = ?2 WHERE id = ?3",
+            params![ver, format!("deploy: v{}", version.0), id.0],
         )
         .map_err(|e| StorageError::Internal(format!("deploy failed: {}", e)))?;
         Ok(())
@@ -498,6 +521,13 @@ impl GraphStorage for SqliteStorage {
             })?;
         }
 
+        // 5. Rollback işaretini graphs.last_event'e yaz (audit / raporlama).
+        conn.execute(
+            "UPDATE graphs SET last_event = ?1 WHERE id = ?2",
+            params![format!("rollback: v{}", version.0), id.0],
+        )
+        .map_err(|e| StorageError::Internal(format!("rollback last_event failed: {}", e)))?;
+
         Ok(())
     }
 
@@ -522,7 +552,7 @@ impl GraphStorage for SqliteStorage {
     ) -> Result<Vec<GraphDefinition>, StorageError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at FROM graphs ORDER BY created_at DESC")
+            .prepare("SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at, last_event FROM graphs ORDER BY created_at DESC")
             .map_err(|e| StorageError::Internal(format!("prepare list_all_graphs: {}", e)))?;
         let rows = stmt
             .query_map([], row_to_graph)
@@ -535,7 +565,7 @@ impl GraphStorage for SqliteStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at FROM graphs WHERE name = ?1 ORDER BY created_at DESC LIMIT 1",
+                "SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at, last_event FROM graphs WHERE name = ?1 ORDER BY created_at DESC LIMIT 1",
             )
             .map_err(|e| StorageError::Internal(format!("prepare find_graph_by_name: {}", e)))?;
         let mut rows = stmt
@@ -583,7 +613,7 @@ impl GraphStorage for SqliteStorage {
     fn load_graph(&self, id: &GraphId) -> Result<GraphDefinition, StorageError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at
+            "SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at, last_event
              FROM graphs WHERE id = ?1",
             params![id.0],
             |row| {
@@ -601,6 +631,7 @@ impl GraphStorage for SqliteStorage {
                     parent_id: parent_id.map(|p| GraphId::new(&p)),
                     fork_node: row.get(7)?,
                     fork_label: row.get(8)?,
+                    last_event: row.get(11)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
                 })
@@ -878,7 +909,7 @@ impl GraphStorage for SqliteStorage {
     fn list_children(&self, id: &GraphId) -> Result<Vec<GraphDefinition>, StorageError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at
+            "SELECT id, name, version, status, code, active_version, parent_id, fork_node, fork_label, created_at, updated_at, last_event
              FROM graphs WHERE parent_id = ?1 ORDER BY created_at ASC"
         ).map_err(|e| StorageError::Internal(format!("list_children prepare: {}", e)))?;
 
@@ -898,6 +929,7 @@ impl GraphStorage for SqliteStorage {
                     parent_id: parent_id.map(|p| GraphId::new(&p)),
                     fork_node: row.get(7)?,
                     fork_label: row.get(8)?,
+                    last_event: row.get(11)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
                 })
@@ -941,6 +973,109 @@ impl GraphStorage for SqliteStorage {
             children: tree_children,
         })
     }
+
+    // ==================== Profiles (v2.5) ====================
+
+    fn list_profiles(&self) -> Result<Vec<Profile>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, label, description, view, direction, focus, config, builtin
+                 FROM profiles ORDER BY name ASC",
+            )
+            .map_err(|e| StorageError::Internal(format!("list_profiles prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], profile_row)
+            .map_err(|e| StorageError::Internal(format!("list_profiles query: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StorageError::Internal(format!("list_profiles row: {e}")))
+    }
+
+    fn load_profile(&self, name: &str) -> Result<Profile, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT name, label, description, view, direction, focus, config, builtin
+             FROM profiles WHERE name = ?1",
+            params![name],
+            profile_row,
+        )
+        .map_err(|_| StorageError::Internal(format!("profile '{name}' not found")))
+    }
+
+    fn save_profile(&self, profile: &Profile) -> Result<(), StorageError> {
+        let conn = self.conn.lock().unwrap();
+        // Built-in profiller ezilemez: aynı adla builtin kayıt varsa hata.
+        let existing_builtin: Option<bool> = conn
+            .query_row(
+                "SELECT builtin FROM profiles WHERE name = ?1",
+                params![profile.name],
+                |row| row.get(0),
+            )
+            .ok();
+        if existing_builtin == Some(true) {
+            return Err(StorageError::Internal(format!(
+                "profile '{}' is built-in and cannot be overwritten",
+                profile.name
+            )));
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO profiles
+             (name, label, description, view, direction, focus, config, builtin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                profile.name,
+                profile.label,
+                profile.description,
+                profile.view,
+                profile.direction,
+                serde_json::to_string(&profile.focus).unwrap_or_default(),
+                serde_json::to_string(&profile.config).unwrap_or_default(),
+                profile.builtin,
+            ],
+        )
+        .map_err(|e| StorageError::Internal(format!("save_profile failed: {e}")))?;
+        Ok(())
+    }
+
+    fn delete_profile(&self, name: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let builtin: Option<bool> = conn
+            .query_row(
+                "SELECT builtin FROM profiles WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .ok();
+        match builtin {
+            None => Err(StorageError::Internal(format!(
+                "profile '{name}' not found"
+            ))),
+            Some(true) => Err(StorageError::Internal(format!(
+                "profile '{name}' is built-in and cannot be deleted"
+            ))),
+            Some(false) => {
+                conn.execute("DELETE FROM profiles WHERE name = ?1", params![name])
+                    .map_err(|e| StorageError::Internal(format!("delete_profile failed: {e}")))?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `profiles` satırını `Profile`'a çevirir.
+fn profile_row(row: &rusqlite::Row) -> rusqlite::Result<Profile> {
+    let focus: String = row.get(5)?;
+    let config: String = row.get(6)?;
+    Ok(Profile {
+        name: row.get(0)?,
+        label: row.get(1)?,
+        description: row.get(2)?,
+        view: row.get(3)?,
+        direction: row.get(4)?,
+        focus: serde_json::from_str(&focus).unwrap_or_default(),
+        config: serde_json::from_str(&config).unwrap_or_else(|_| serde_json::Value::Null),
+        builtin: row.get(7)?,
+    })
 }
 
 #[cfg(test)]
@@ -1038,6 +1173,32 @@ mod tests {
             "deployed graph should remain active after rollback"
         );
         assert_eq!(g.version.0, 3);
+    }
+
+    #[test]
+    fn test_last_event_marks_deploy_and_rollback() {
+        let store = setup();
+        let id = store.create_graph("test", "def graph(): return 1").unwrap();
+        assert_eq!(store.load_graph(&id).unwrap().last_event, None);
+
+        store.deploy(&id, Version(1)).unwrap();
+        assert_eq!(
+            store.load_graph(&id).unwrap().last_event.as_deref(),
+            Some("deploy: v1")
+        );
+
+        store.update_graph(&id, "def graph(): return 2").unwrap();
+        store.deploy(&id, Version(2)).unwrap();
+        assert_eq!(
+            store.load_graph(&id).unwrap().last_event.as_deref(),
+            Some("deploy: v2")
+        );
+
+        store.rollback(&id, Version(1)).unwrap();
+        assert_eq!(
+            store.load_graph(&id).unwrap().last_event.as_deref(),
+            Some("rollback: v1")
+        );
     }
 
     #[test]
@@ -1376,6 +1537,7 @@ fn row_to_graph(row: &rusqlite::Row) -> rusqlite::Result<GraphDefinition> {
         parent_id: row.get::<_, Option<String>>(6)?.map(|s| GraphId::new(&s)),
         fork_node: row.get::<_, Option<String>>(7)?,
         fork_label: row.get::<_, Option<String>>(8)?,
+        last_event: row.get::<_, Option<String>>(11)?,
         created_at: row.get::<_, String>(9)?,
         updated_at: row.get::<_, String>(10)?,
     })
