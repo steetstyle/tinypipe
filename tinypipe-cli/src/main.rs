@@ -215,7 +215,7 @@ fn main() {
             let version = args
                 .get(3)
                 .filter(|s| !s.starts_with("--"))
-                .and_then(|v| v.parse::<u64>().ok())
+                .and_then(|v| parse_version_arg(v))
                 .map(Version);
             let format = args
                 .iter()
@@ -418,6 +418,109 @@ fn resolve_graph_id(storage: &SqliteStorage, input: &str) -> GraphId {
     GraphId::new(input)
 }
 
+/// Plan'ı DB'den yükler. Eski sürümlerde oluşturulan graph'larda plan
+/// sütunu NULL kalabilir (save_plan yokken) — bu durumda kodu yeniden
+/// derleyip kalıcı olarak kaydeder (self-heal).
+fn load_plan_self_heal(storage: &SqliteStorage, graph_id: &GraphId) -> Vec<u8> {
+    match storage.load_plan(graph_id) {
+        Ok(bytes) => bytes,
+        Err(tinypipe_api::types::StorageError::PlanMissing(_)) => {
+            let graph = match storage.load_graph(graph_id) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("Error loading graph: {e}");
+                    std::process::exit(1);
+                }
+            };
+            eprintln!(
+                "⚠ No stored plan for '{}' (v{}) — recompiling and persisting...",
+                graph.name, graph.version.0
+            );
+            let output = match compile(&graph.code) {
+                Ok(o) => o,
+                Err(msg) => {
+                    eprintln!("Recompilation failed: {msg}");
+                    std::process::exit(1);
+                }
+            };
+            storage
+                .save_plan(graph_id, graph.version, &output.fb_binary)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to persist repaired plan: {e}");
+                    std::process::exit(1);
+                });
+            eprintln!(
+                "✓ Plan repaired (v{}, {} nodes)",
+                graph.version.0, output.compiled.metadata.node_count
+            );
+            output.fb_binary
+        }
+        Err(e) => {
+            eprintln!("Error loading plan: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Belirli bir version'ın planını yükler; eksikse o version'ın kodunu
+/// derleyip kaydeder (self-heal).
+fn load_plan_version_self_heal(
+    storage: &SqliteStorage,
+    graph_id: &GraphId,
+    version: Version,
+) -> Vec<u8> {
+    use tinypipe_api::types::StorageError;
+    match storage.load_plan_version(graph_id, version) {
+        Ok(bytes) => bytes,
+        Err(StorageError::PlanVersionMissing(_, _)) => {
+            let code = storage
+                .list_versions(graph_id)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error listing versions: {e}");
+                    std::process::exit(1);
+                })
+                .into_iter()
+                .find(|(v, _, _)| *v == version.0)
+                .map(|(_, code, _)| code)
+                .unwrap_or_else(|| {
+                    eprintln!("Version v{} not found for graph", version.0);
+                    std::process::exit(1);
+                });
+            eprintln!(
+                "⚠ No stored plan for v{} — recompiling and persisting...",
+                version.0
+            );
+            let output = match compile(&code) {
+                Ok(o) => o,
+                Err(msg) => {
+                    eprintln!("Recompilation failed: {msg}");
+                    std::process::exit(1);
+                }
+            };
+            storage
+                .save_plan(graph_id, version, &output.fb_binary)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to persist repaired plan: {e}");
+                    std::process::exit(1);
+                });
+            eprintln!(
+                "✓ Plan repaired (v{}, {} nodes)",
+                version.0, output.compiled.metadata.node_count
+            );
+            output.fb_binary
+        }
+        Err(e) => {
+            eprintln!("Error loading plan: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// "4" veya "v4" formatında version argümanını parse eder.
+fn parse_version_arg(s: &str) -> Option<u64> {
+    s.strip_prefix('v').unwrap_or(s).parse::<u64>().ok()
+}
+
 /// `tinypipe-cli update <id> <code>` — compile new code and save as a new version.
 fn cmd_update(id: &str, code: &str) {
     let output = match compile(code) {
@@ -465,14 +568,9 @@ fn cmd_execute(id: &str, input_json: &str, pause_after: Option<u32>) {
         }
     };
 
-    // Load the stored compiled plan (FlatBuffers, canonical format)
-    let plan_bytes = match storage.load_plan(&graph_id) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("Error loading compiled plan: {e}");
-            std::process::exit(1);
-        }
-    };
+    // Load the stored compiled plan (FlatBuffers, canonical format).
+    // Eski DB'lerde plan NULL olabilir — self-heal yeniden derleyip kaydeder.
+    let plan_bytes = load_plan_self_heal(&storage, &graph_id);
     let plan = match tinypipe_ir::compiled::CompiledPlan::from_fb_bytes(&plan_bytes) {
         Ok(plan) => plan,
         Err(e) => {
@@ -946,20 +1044,8 @@ fn cmd_plan_dump(id: &str, version: Option<Version>, format: tinypipe_ir::PlanFo
     };
 
     let plan_bytes = match version {
-        Some(v) => match storage.load_plan_version(&graph_id, v) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("Error loading plan (v{}): {e}", v.0);
-                std::process::exit(1);
-            }
-        },
-        None => match storage.load_plan(&graph_id) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("Error loading plan: {e}");
-                std::process::exit(1);
-            }
-        },
+        Some(v) => load_plan_version_self_heal(&storage, &graph_id, v),
+        None => load_plan_self_heal(&storage, &graph_id),
     };
 
     let plan = match tinypipe_ir::compiled::CompiledPlan::from_fb_bytes(&plan_bytes) {

@@ -496,26 +496,30 @@ impl GraphStorage for SqliteStorage {
 
     fn load_plan(&self, id: &GraphId) -> Result<Vec<u8>, StorageError> {
         let conn = self.conn.lock().unwrap();
-        let plan: Vec<u8> = conn
-            .query_row(
-                "SELECT execution_plan FROM graphs WHERE id = ?1",
-                params![id.0],
-                |row| row.get(0),
-            )
-            .map_err(|_| StorageError::GraphNotFound(id.clone()))?;
-        Ok(plan)
+        let row: Result<Option<Vec<u8>>, _> = conn.query_row(
+            "SELECT execution_plan FROM graphs WHERE id = ?1",
+            params![id.0],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(Some(plan)) => Ok(plan),
+            Ok(None) => Err(StorageError::PlanMissing(id.clone())),
+            Err(_) => Err(StorageError::GraphNotFound(id.clone())),
+        }
     }
 
     fn load_plan_version(&self, id: &GraphId, version: Version) -> Result<Vec<u8>, StorageError> {
         let conn = self.conn.lock().unwrap();
-        let plan: Vec<u8> = conn
-            .query_row(
-                "SELECT execution_plan FROM graph_versions WHERE graph_id = ?1 AND version = ?2",
-                params![id.0, version.0 as i64],
-                |row| row.get(0),
-            )
-            .map_err(|_| StorageError::VersionNotFound(version, id.clone()))?;
-        Ok(plan)
+        let row: Result<Option<Vec<u8>>, _> = conn.query_row(
+            "SELECT execution_plan FROM graph_versions WHERE graph_id = ?1 AND version = ?2",
+            params![id.0, version.0 as i64],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(Some(plan)) => Ok(plan),
+            Ok(None) => Err(StorageError::PlanVersionMissing(version, id.clone())),
+            Err(_) => Err(StorageError::VersionNotFound(version, id.clone())),
+        }
     }
 
     fn save_plan(&self, id: &GraphId, version: Version, plan: &[u8]) -> Result<(), StorageError> {
@@ -1259,5 +1263,39 @@ mod tests {
         // NULL checkpoint → load_checkpoint boş blob döner (deserialize başarısız olur, ama hata vermez)
         let loaded = store.load_checkpoint("exec-cp-mig").unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_load_plan_missing_returns_plan_missing() {
+        // save_plan çağrılmadan oluşturulan graph (eski sürüm davranışı):
+        // graph var ama plan NULL → PlanMissing, GraphNotFound değil.
+        let store = setup();
+        let id = store
+            .create_graph("demo", "def graph(x: int): return x")
+            .unwrap();
+        let err = store.load_plan(&id).unwrap_err();
+        assert!(matches!(err, StorageError::PlanMissing(_)));
+        assert!(!matches!(err, StorageError::GraphNotFound(_)));
+
+        let err = store.load_plan_version(&id, Version(1)).unwrap_err();
+        assert!(matches!(err, StorageError::PlanVersionMissing(_, _)));
+
+        // Plan kaydedildikten sonra yüklenebilir
+        store.save_plan(&id, Version(1), b"plan-bytes").unwrap();
+        assert_eq!(store.load_plan(&id).unwrap(), b"plan-bytes");
+        assert_eq!(
+            store.load_plan_version(&id, Version(1)).unwrap(),
+            b"plan-bytes"
+        );
+    }
+
+    #[test]
+    fn test_load_plan_nonexistent_graph_returns_not_found() {
+        let store = setup();
+        let id = GraphId::new("does-not-exist");
+        let err = store.load_plan(&id).unwrap_err();
+        assert!(matches!(err, StorageError::GraphNotFound(_)));
+        let err = store.load_plan_version(&id, Version(1)).unwrap_err();
+        assert!(matches!(err, StorageError::VersionNotFound(_, _)));
     }
 }

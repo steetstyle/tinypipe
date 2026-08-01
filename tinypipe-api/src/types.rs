@@ -584,6 +584,10 @@ pub enum StorageError {
     GraphNotFound(GraphId),
     #[error("Version {0} not found for graph '{1}'")]
     VersionNotFound(Version, GraphId),
+    #[error("Graph '{0}' has no stored plan (created before plan persistence; recompile)")]
+    PlanMissing(GraphId),
+    #[error("Version {0} of graph '{1}' has no stored plan (created before plan persistence)")]
+    PlanVersionMissing(Version, GraphId),
     #[error("Execution '{0}' not found")]
     ExecutionNotFound(String),
     #[error("Storage internal error: {0}")]
