@@ -77,6 +77,51 @@ Version  Active   Created              Code
   v2                      1785102466522726     def graph(x: int):
   v3                      1785102466544555     def graph(x: int):
   v4             ◄── DEPLOYED 1785102466582054     def graph(x: int):
+
+# List all graphs
+$ tinypipe-cli list
+Graphs:
+ID                                    Name                 Ver  Status      CodeB
+------------------------------------------------------------------------------------------
+b5d2b135-0ca3-4ef6-ba95-ef52110a4587  hello                v 4  deployed       30
+
+# Inspect the compiled plan (text, default)
+$ tinypipe-cli plan hello
+Graph: hello (v4)
+Format: FlatBuffers (1128 bytes)
+
+Nodes (3):
+  [0] "n0" op=Input
+      name = "x"
+  [1] "n1" op=Calc
+      expr = "x"
+  [2] "n2" op=Act
+      type = "return"
+
+Edges (2):
+  0 -> 1 [data]
+  1 -> 2 [data]
+
+Metadata: version=3 max_nodes=10000 max_time_ms=30000 max_mem_bytes=10485760
+
+# Or as a Mermaid flowchart (paste into mermaid.live)
+$ tinypipe-cli plan hello --format mermaid
+```mermaid
+flowchart LR
+    N0["Input x"]
+    N1["x"]
+    N2["Act return"]
+    N0 --> N1
+    N1 --> N2
+```
+
+# Or as Graphviz DOT (any earlier version: accept "2" or "v2")
+$ tinypipe-cli plan hello v2 --format dot
+digraph plan {
+    N0 [label="Input x"];
+    N0 -> N1;
+    N1 -> N2;
+}
 ```
 
 ## What you can write
@@ -186,19 +231,48 @@ resumed later — even from a different process, because the full execution stat
 persisted:
 
 ```
+# Pause a long-running graph after 3 nodes — a checkpoint is saved
 $ tinypipe-cli execute my_loop '{"x": 0}' --pause-after 3
-⏸ Execution paused at 4 nodes (id: <uuid>)
-$ tinypipe-cli resume <uuid>            # run to completion
-$ tinypipe-cli resume <uuid> --max-nodes 2   # or resume in steps
+⏸ Execution paused at 3 nodes (id: c2a23bea-...)
+  Resume: tinypipe-cli resume c2a23bea-...
+
+# See the paused execution
+$ tinypipe-cli executions list my_loop
+Executions for 'my_loop':
+ID                                      Status      Started                Dur(μs)  Output
+----------------------------------------------------------------------------------------------------
+c2a23bea-...                            paused      ...
+
+# Resume it — run to completion
+$ tinypipe-cli resume c2a23bea-...
+✓ Execution completed (id: c2a23bea-...)
+  Total duration: 35 μs
+  Nodes executed: 15
+  Output: 5
+
+# Or resume in steps (budgeted) — still paused after the budget
+$ tinypipe-cli resume c2a23bea-... --max-nodes 2
+⏸ Still paused at 5 nodes (id: c2a23bea-...)
+  Resume again: tinypipe-cli resume c2a23bea-...
 ```
 
-Paused executions are listed by `executions list <id>` and picked up automatically
-by the scheduler, which steps them forward in rounds (`--max-nodes` per round) until
-they complete:
+Paused executions are picked up automatically by the scheduler, which steps
+them forward in rounds (`--max-nodes` per round) until they complete:
 
 ```
 $ tinypipe-cli scheduler run            # finish everything in one round
+Scheduler run complete:
+  Processed:  1
+  Completed:  1
+  Still paused: 0
+  Failed:     0
+
 $ tinypipe-cli scheduler run --max-nodes 2   # step each execution by 2 nodes/round
+Scheduler run complete:
+  Processed:  1
+  Completed:  1
+  Still paused: 0
+  Failed:     0
 ```
 
 Checkpoints are stored as a BLOB on the `executions` row (JSON-encoded `Checkpoint`

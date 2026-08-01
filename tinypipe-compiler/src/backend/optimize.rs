@@ -91,12 +91,20 @@ fn constant_folding(plan: ExecutionPlan) -> (ExecutionPlan, usize) {
                 if is_constant_expression(expr_str) {
                     // Try to evaluate simple integer expressions
                     if let Some(result) = eval_simple_int_expr(expr_str) {
-                        // Use Arg::new instead of .into() tuple
-                        let arg = tinypipe_ir::plan::Arg::new(
-                            "expr",
-                            ArgValue::String(format!("{}", result)),
-                        );
-                        node.args = vec![arg];
+                        // Folded expr + diğer arg'ları koru — özellikle `output`
+                        // (output düşerse değişken ctx'e yazılmaz: `total = 0` gibi
+                        // sabit atamalar loop body'lerinde kırılırdı).
+                        let mut args: Vec<tinypipe_ir::plan::Arg> =
+                            vec![tinypipe_ir::plan::Arg::new(
+                                "expr",
+                                ArgValue::String(format!("{}", result)),
+                            )];
+                        for a in &node.args {
+                            if a.key != "expr" {
+                                args.push(a.clone());
+                            }
+                        }
+                        node.args = args;
                         folded += 1;
                     }
                 }
@@ -647,6 +655,43 @@ mod tests {
             .optimizations_applied
             .iter()
             .any(|o| o.starts_with("constant_folding")));
+    }
+
+    #[test]
+    fn test_constant_folding_preserves_output_arg() {
+        // `total = 0` gibi sabit atamalar fold edilirken `output` arg'ı
+        // KORUNMALI — düşerse değişken ctx'e yazılmaz ve loop body'leri
+        // ("total + 1") "cannot evaluate" ile kırılır.
+        let plan = ExecutionPlan::new(
+            vec![
+                Node::new("calc1", Opcode::Calc)
+                    .with_arg("expr", "0".into())
+                    .with_arg("output", "total".into()),
+                Node::new("act1", Opcode::Act).with_arg("type", "return".into()),
+            ],
+            vec![Edge::new("calc1", "act1")],
+        );
+        let result = optimize_all(plan);
+        let calc_node = result.plan.nodes.iter().find(|n| n.id == "calc1").unwrap();
+        assert_eq!(
+            calc_node
+                .args
+                .iter()
+                .find(|a| a.key == "output")
+                .unwrap()
+                .value,
+            ArgValue::String("total".into())
+        );
+        assert_eq!(
+            calc_node
+                .args
+                .iter()
+                .find(|a| a.key == "expr")
+                .unwrap()
+                .value,
+            ArgValue::String("0".into())
+        );
+        assert_eq!(calc_node.args.len(), 2);
     }
 
     #[test]
