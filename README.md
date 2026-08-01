@@ -39,9 +39,7 @@ $ tinypipe-cli execute hello '{"x": 42}'
   Duration: 22 μs
   Nodes executed: 3
 
-  Output: {
-    "x": 42
-  }
+  Output: 42
 
 # Env variables + pre-execution env check
 # `env.get` / `env.template` tools read environment variables.
@@ -173,7 +171,7 @@ def graph(items: list):
 ```python
 # Calling real tools: http_request + json.parse + array.len (see "Real-world example")
 def graph():
-    r = call("http_request", target="http_request", url="https://jsonplaceholder.typicode.com/users")
+    r = call("http_request", url="https://jsonplaceholder.typicode.com/users")
     users = call("json.parse", json=r.body)
     return call("array.len", array=users)
 ```
@@ -358,34 +356,34 @@ endpoints with a bounded loop, string concatenation, and the built-in tools:
 
 ```python
 def graph(user_id: int):
-    users_resp = call("http_request", target="http_request",
+    users_resp = call("http_request",
                       url="https://jsonplaceholder.typicode.com/users")
     users = call("json.parse", json=users_resp.body)
     user_count = call("array.len", array=users)
 
-    posts_resp = call("http_request", target="http_request",
+    posts_resp = call("http_request",
                       url="https://jsonplaceholder.typicode.com/posts?userId=" + user_id)
     posts = call("json.parse", json=posts_resp.body)
     post_count = call("array.len", array=posts)
 
     total_comments = 0
     for i in range(10):
-        c_resp = call("http_request", target="http_request",
-                      url="https://jsonplaceholder.typicode.com/comments?postId=" + 1 + i)
+        c_resp = call("http_request",
+                      url="https://jsonplaceholder.typicode.com/comments?postId=" + i)
         c = call("json.parse", json=c_resp.body)
         total_comments = total_comments + call("array.len", array=c)
 
-    albums_resp = call("http_request", target="http_request",
+    albums_resp = call("http_request",
                        url="https://jsonplaceholder.typicode.com/albums?userId=" + user_id)
     albums = call("json.parse", json=albums_resp.body)
     album_count = call("array.len", array=albums)
 
-    photos_resp = call("http_request", target="http_request",
+    photos_resp = call("http_request",
                        url="https://jsonplaceholder.typicode.com/photos?albumId=1")
     photos = call("json.parse", json=photos_resp.body)
     photo_count = call("array.len", array=photos)
 
-    todos_resp = call("http_request", target="http_request",
+    todos_resp = call("http_request",
                       url="https://jsonplaceholder.typicode.com/todos?userId=" + user_id)
     todos = call("json.parse", json=todos_resp.body)
     todo_count = call("array.len", array=todos)
@@ -397,8 +395,8 @@ def graph(user_id: int):
 ```
 
 The loop `for i in range(10)` compiles to a `Loop` node whose body is executed
-inline by the VM; `i` is injected per iteration, so `"..." + 1 + i` resolves to
-`...?postId=1` … `...?postId=10` at runtime (no f-strings — string concatenation
+inline by the VM; `i` is injected per iteration, so `"..." + i` resolves to
+`...?postId=0` … `...?postId=9` at runtime (no f-strings — string concatenation
 with `+` is the DSL idiom).
 
 ```bash
@@ -459,7 +457,9 @@ def graph(user_id: int):
 ```bash
 $ tinypipe-cli execute dashboard '{"user_id": 1}'
 ✓ Execution completed
-  Output: {"users": 10}
+  Output: {
+    "users": 10
+  }
 $ sqlite3 tinypipe_dashboard.db "SELECT COUNT(*) FROM users"   # 10 — persisted
 ```
 
@@ -477,7 +477,7 @@ business unit. A seed graph per domain:
 ```python
 # seed_users — no input needed (fetches external data)
 def graph():
-    resp = call("http_request", target="http_request",
+    resp = call("http_request",
                 url="https://jsonplaceholder.typicode.com/users")
     items = call("json.parse", json=resp.body)
     n = call("array.len", array=items)
@@ -485,7 +485,7 @@ def graph():
 
 # seed_comments — input comes from the caller via kwargs
 def graph(post_id: int):
-    resp = call("http_request", target="http_request",
+    resp = call("http_request",
                 url="https://jsonplaceholder.typicode.com/comments?postId=" + post_id)
     items = call("json.parse", json=resp.body)
     n = call("array.len", array=items)
@@ -515,7 +515,14 @@ $ tinypipe-cli create seed_users "<code>" && tinypipe-cli create seed_comments "
 $ tinypipe-cli create dashboard_seeds "<parent code>"
 $ tinypipe-cli execute dashboard_seeds '{"user_id": 1}'
 ✓ Execution completed
-  Output: {"albums": 10, "comments": 50, "photos": 50, "posts": 10, "todos": 20, "users": 10}
+  Output: {
+    "albums": 10,
+    "comments": 50,
+    "photos": 50,
+    "posts": 10,
+    "todos": 20,
+    "users": 10
+  }
 ```
 
 Semantics:
@@ -611,8 +618,8 @@ graphs, and forwards results back.
 
 ```
 graph (CLI) ──► daemon (gRPC, 127.0.0.1:50051) ──► worker (Rust / Go / any)
-                   ▲                                   │
-                   └────────── task_id matched ◄───────┘
+                   ▲                                       │
+                   └────────── task_id matched ◄───────────┘
 ```
 
 - **Outbound registration**: the worker opens a single bidi stream and sends
@@ -644,7 +651,9 @@ $ TINYPIPE_DAEMON_API_KEY=s3cret go run .        # worker env
 
 # Option B: generated key printed in the daemon log (WARN line)
 $ tinypipe-daemon
-WARN tinypipe_daemon: no TINYPIPE_DAEMON_API_KEY set — generated random key; workers must send it
+WARN tinypipe_daemon: worker auth: NO key configured — generated random key;
+    workers must set TINYPIPE_DAEMON_API_KEY=4f2c1a9e-...
+
 
 # Option C: disable auth entirely (open network only — never on the internet)
 $ tinypipe-daemon --no-auth        # or TINYPIPE_DAEMON_NO_AUTH=1
@@ -670,7 +679,7 @@ $ tinypipe-cli create e2e 'def graph(s):
     x = call("text.reverse", value=s)
     return call("text.reverse", value=x)'
 $ tinypipe-cli execute e2e '{"s": "tinypipe"}'
-  Output: "tinypipe"
+  Output: tinypipe
 
 # Daemon status
 $ tinypipe-cli daemon status
