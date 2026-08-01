@@ -57,6 +57,11 @@ impl<S: GraphStorage> SubgraphToolRegistry<S> {
         &self.storage
     }
 
+    /// Kayıtlı tool adları (sıralı) — daemon/server listeleme için.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.inner.tool_names()
+    }
+
     fn self_registry(&self) -> Arc<SubgraphToolRegistry<S>> {
         self.self_ref
             .lock()

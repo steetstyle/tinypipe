@@ -35,10 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "tinypipe-daemon starting"
     );
 
-    let daemon = std::sync::Arc::new(Daemon::with_default_timeout(
-        addr.clone(),
-        Duration::from_millis(timeout_ms.max(1)),
-    ));
+    let daemon = std::sync::Arc::new(
+        Daemon::with_default_timeout(addr.clone(), Duration::from_millis(timeout_ms.max(1)))
+            .with_api_key(resolve_api_key()),
+    );
     let socket_addr = addr.parse()?;
 
     tokio::runtime::Builder::new_multi_thread()
@@ -78,6 +78,55 @@ fn init_tracing() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+}
+
+/// Worker kayıt API anahtarı çözümleme sırası:
+///   1. `--no-auth` / `TINYPIPE_DAEMON_NO_AUTH=1` → auth tamamen kapalı (yerel dev).
+///   2. `--api-key <key>` / `TINYPIPE_DAEMON_API_KEY=<key>` → verilen anahtar.
+///   3. Hiçbiri yok → rastgele anahtar üretilir ve loglanır (güvenlik default açık).
+fn resolve_api_key() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    let mut flag_key: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--no-auth" => return None,
+            "--api-key" => flag_key = args.next(),
+            other if other.starts_with("--api-key=") => {
+                flag_key = Some(other["--api-key=".len()..].to_string())
+            }
+            other if other.starts_with("--no-auth=") => {
+                if &other["--no-auth=".len()..] == "1" {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if std::env::var("TINYPIPE_DAEMON_NO_AUTH").as_deref() == Ok("1") {
+        return None;
+    }
+
+    if let Some(key) = flag_key.filter(|k| !k.is_empty()) {
+        tracing::info!("worker auth: enabled (key from --api-key / TINYPIPE_DAEMON_API_KEY)");
+        return Some(key);
+    }
+    if let Ok(key) = std::env::var("TINYPIPE_DAEMON_API_KEY") {
+        if !key.trim().is_empty() {
+            tracing::info!("worker auth: enabled (key from TINYPIPE_DAEMON_API_KEY)");
+            return Some(key);
+        }
+    }
+
+    let generated = uuid::Uuid::new_v4().to_string();
+    tracing::warn!(
+        "worker auth: NO key configured — generated random key; workers must set TINYPIPE_DAEMON_API_KEY={}",
+        generated
+    );
+    tracing::warn!(
+        "worker auth: to disable (local dev only) run with --no-auth or TINYPIPE_DAEMON_NO_AUTH=1"
+    );
+    Some(generated)
 }
 
 async fn shutdown_signal() {

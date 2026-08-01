@@ -3,6 +3,9 @@
 // Kullanım:
 //   go run .                                  # TINYPIPE_DAEMON_ADDR (default 127.0.0.1:50051)
 //
+// Daemon auth açıkken (varsayılan) kayıt anahtarı gerekir:
+//   TINYPIPE_DAEMON_API_KEY=<key> go run .
+//
 // Graceful shutdown: SIGINT/SIGTERM → CloseSend → daemon worker'ı havuzdan
 // çıkarır, bekleyen task'lerine fail-fast verir.
 //
@@ -31,6 +34,9 @@ func main() {
 	}
 
 	w := worker.New(addr)
+	if key := os.Getenv("TINYPIPE_DAEMON_API_KEY"); key != "" {
+		w.SetAPIKey(key)
+	}
 	if err := w.RegisterTool(worker.Tool{
 		Name:        "send_email",
 		Description: "Sends an email (stub).",

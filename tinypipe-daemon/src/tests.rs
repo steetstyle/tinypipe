@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream;
+use futures::{stream, StreamExt};
 use tinypipe_proto::tinypipe::v1::{
     tool_dispatch_service_client::ToolDispatchServiceClient,
     tool_worker_service_client::ToolWorkerServiceClient,
@@ -38,6 +38,7 @@ fn ok_response(task: &TaskRequest, output: &str) -> TaskResponse {
         output_json: output.into(),
         error_message: String::new(),
         registered_tools: Vec::new(),
+        api_key: String::new(),
     }
 }
 
@@ -75,6 +76,7 @@ async fn spawn_worker(
         output_json: String::new(),
         error_message: String::new(),
         registered_tools: tools,
+        api_key: String::new(),
     };
 
     // İlk mesaj kayıt olmalı; gerisi handler cevapları.
@@ -210,12 +212,60 @@ async fn invalid_registration_rejected() {
         output_json: String::new(),
         error_message: String::new(),
         registered_tools: vec![def("")],
+        api_key: String::new(),
     };
     let err = client
         .connect_worker(stream::iter(vec![bad]))
         .await
         .expect_err("empty tool name must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn api_key_auth_required() {
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+            .with_test_writer()
+            .finish(),
+    );
+    let daemon = Arc::new(Daemon::new("127.0.0.1:0").with_api_key(Some("s3cret".into())));
+    let addr = bind_and_serve(daemon.clone(), std::future::pending())
+        .await
+        .unwrap();
+
+    // Yanlış anahtar → kayıt reddedilir, tool kaydedilmez.
+    let chan = Endpoint::new(format!("http://{addr}")).unwrap().connect().await.unwrap();
+    let mut registration = TaskResponse {
+        task_id: String::new(),
+        success: true,
+        output_json: String::new(),
+        error_message: String::new(),
+        registered_tools: vec![def("ping")],
+        api_key: "wrong".into(),
+    };
+    let mut client2 = ToolWorkerServiceClient::new(chan.clone());
+    let err = client2
+        .connect_worker(stream::iter(vec![registration.clone()]))
+        .await
+        .expect_err("wrong api key must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    assert!(daemon.tools().is_empty(), "no tools may register with a bad key");
+
+    // Doğru anahtar → kayıt başarılı. (Response stream canlı tutulur;
+    // drop edilince daemon worker'ı havuzdan çıkarır.) Taze bağlantı üzerinden.
+    registration.api_key = "s3cret".into();
+    let chan3 = Endpoint::new(format!("http://{addr}")).unwrap().connect().await.unwrap();
+    let mut client3 = ToolWorkerServiceClient::new(chan3);
+    // Request stream açık kalmalı (iter tek mesajdan sonra yarı kapanır;
+    // daemon inbound loop'u EOF görünce worker'ı anında çıkarır).
+    let req_stream = stream::iter(vec![registration]).chain(stream::pending::<TaskResponse>());
+    let _stream = client3
+        .connect_worker(req_stream)
+        .await
+        .expect("correct api key must register")
+        .into_inner();
+    assert_eq!(daemon.worker_count("ping"), 1, "tools={:?}", daemon.tools());
 }
 
 #[tokio::test]

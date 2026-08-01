@@ -231,6 +231,8 @@ def graph(x: int, y: int):
 
 **What's forbidden:** `import`, `class`, `lambda`, `while`, `try`/`except`, `async`, comprehensions, f-strings, walrus operator (`:=`), `global`, `nonlocal`, `yield`, `del`, decorators, nested functions, dynamic subscript keys (`items[a + b]`).
 
+**Money & numbers — kuruş-int rule:** the type system is `int`/`float` only; there is no `Decimal`/money type. Money amounts are always integer **kuruş** (100 kuruş = 1 TL): store, compute and return amounts as `int` — e.g. `price = 2499` means 24.99 TL — never as `float`. If a computation involves division, round back to integer kuruş at the boundary (`total = round(total / 1.18)` is fine as long as the money value itself stays `int`; the rule is that a money value must never *be* a float). Convention: name money variables with a `_kurus` (or `_cents`) suffix so the unit is explicit, e.g. `vat_kurus`, `total_cents`.
+
 ## Architecture
 
 ```
@@ -629,6 +631,28 @@ $ tinypipe-daemon                      # env: TINYPIPE_DAEMON_ADDR (default 127.
 
 # Start a worker (Go example ships in examples/go-worker)
 $ cd examples/go-worker && go run .
+```
+
+**Worker auth (default ON):** the daemon requires a shared API key from every
+worker. If you don't set one, the daemon generates a random key and logs it at
+startup — copy it to the worker via env or CLI flag:
+
+```bash
+# Option A: shared key, explicit
+$ TINYPIPE_DAEMON_API_KEY=s3cret tinypipe-daemon
+$ TINYPIPE_DAEMON_API_KEY=s3cret go run .        # worker env
+
+# Option B: generated key printed in the daemon log (WARN line)
+$ tinypipe-daemon
+WARN tinypipe_daemon: no TINYPIPE_DAEMON_API_KEY set — generated random key; workers must send it
+
+# Option C: disable auth entirely (open network only — never on the internet)
+$ tinypipe-daemon --no-auth        # or TINYPIPE_DAEMON_NO_AUTH=1
+```
+
+The Go worker SDK passes the key with `Worker.SetAPIKey(...)`; `examples/go-worker`
+reads `TINYPIPE_DAEMON_API_KEY` automatically. A worker with a wrong/missing key is
+rejected with `Unauthenticated` and its tools never register.
 
 # See the remote tools next to built-ins
 $ tinypipe-cli tools list
@@ -661,6 +685,99 @@ Bridge rules:
 - CLI passes `--kwargs '{"k": "v"}'` and `--env KEY=V` through to workers.
 - Worker tools are registered lazily at execute/resume time; a dead daemon
   yields an actionable error (with retry/backoff in the Go SDK).
+
+## HTTP server (`tinypipe-server`)
+
+Exposes the full CLI surface over REST for headless deployments (e.g. a
+Raspberry Pi serving graphs to the internet). Published graphs live at the
+**site root** — no `/api/publish/` prefix — while the management API sits
+under `/api`.
+
+```bash
+$ TINYPIPE_SERVER_TOKEN=secret tinypipe-server
+# env:
+#   TINYPIPE_SERVER_ADDR   listen address (default 127.0.0.1:8080)
+#   TINYPIPE_SERVER_TOKEN  bearer token for mutating endpoints (optional)
+#   TINYPIPE_SERVER_AUDIT  "1" writes every execution to the DB (default off)
+#   TINYPIPE_DB            SQLite path (default ./tinypipe.db)
+```
+
+**Publishing a graph** — set `http_*` keys in the graph's `META(...)`:
+
+```python
+META(title="hello", http_route="hello", http_method="GET",
+     http_public="true", http_cache_ttl=30)
+
+def graph(name):
+    return "hello " + name
+```
+
+Then deploy it and it's live at `GET /hello?name=world`:
+
+```
+http_route     published path at the root (leading / optional).
+               Reserved prefixes are rejected: api, healthz, assets, static.
+http_method    one of "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"
+               (default POST); anything else fails the deploy. "OPTIONS" is
+               reserved — it is served automatically (see below).
+http_public    "true" skips token auth (META only accepts string literals,
+               so booleans are written as "true"/"false").
+http_timeout_ms  VM timeout override for this route (0 = plan default).
+http_cache_ttl  response cache in seconds for idempotent methods
+               (GET/HEAD/DELETE, 0 = off). Cache hits return
+               X-Tinypipe-Cache: HIT.
+```
+
+**Inputs per method:** GET/HEAD/DELETE take inputs from query params
+(`?name=world`); POST/PUT/PATCH from a JSON body (`{"a": 1, "b": 2}`).
+`HEAD` executes like GET but returns headers only (no body). `OPTIONS` never
+executes the graph — every published path answers CORS preflight automatically
+(`204` + `Allow` + `Access-Control-Allow-*`).
+
+**Header/cookie isolation:** published routes never read request headers.
+Inputs come only from query params or the JSON body, and the environment is
+always empty — `Authorization`, `Cookie`, and any other header can never reach
+your graph or its tools.
+
+**Method mismatch:** wrong method → `405` with an `Allow` header listing what
+the path accepts. Different methods may be published on the same path from
+different graphs (`GET /items` + `PUT /items`), but the same (path, method)
+pair is owned by one graph (`409` on conflict). Unknown `http_*` keys and
+invalid `http_method` fail fast — at startup for existing graphs, or as a
+`400`/`409` when creating/updating.
+
+**Endpoint map** (CLI → REST):
+
+| CLI | Endpoint | Auth |
+| --- | --- | --- |
+| `check` | `POST /api/check` | token |
+| `create` | `POST /api/graphs` | token |
+| `update` | `PUT /api/graphs/{id}` | token |
+| `deploy` | `POST /api/graphs/{id}/deploy` | token |
+| `rollback` | `POST /api/graphs/{id}/rollback` | token |
+| `versions` | `GET /api/graphs/{id}/versions` | open |
+| `list` | `GET /api/graphs` | open |
+| `execute` | `POST /api/graphs/{id}/execute` | open |
+| `resume` | `POST /api/executions/{id}/resume` | token |
+| `scheduler run` | `POST /api/scheduler/run` | token |
+| `executions list/show` | `GET /api/executions?graph_id=`, `GET /api/executions/{id}` | token |
+| `plan` | `GET /api/graphs/{id}/plan?format=&view=&direction=&profile=` | token |
+| `report` | `GET /api/report?profile=&env=K=V` | token |
+| `profiles` | `GET/POST /api/profiles/{name}`, `DELETE /api/profiles/{name}` | token |
+| `tools list` | `GET /api/tools` | open |
+| `tools test` | `POST /api/tools/test` | token |
+| `daemon status` | `GET /api/daemon/status?addr=` | open |
+| — | `POST /api/run` (run raw code, cached LRU) | token |
+| — | `GET /healthz` | open |
+
+Execution responses carry `{status: completed|paused|failed, execution_id,
+duration_us, nodes_executed, output?, error?}`. Paused executions and the
+scheduler require `TINYPIPE_SERVER_AUDIT=1` (checkpoints live in the DB);
+with audit off, no request ever writes to the database — good for a
+read-heavy site at the cost of execution history.
+
+Blocking tools (`sqlite.query`, `http_request`, ...) run on a blocking
+thread pool, and a fresh execution never blocks another request.
 
 ## Storage
 
@@ -699,6 +816,8 @@ tinypipe-scheduler/  — resumes paused executions from checkpoints
 tinypipe-insight/    — role profiles (6 built-in) + metrics collection + reports
 tinypipe-cli/        — binary with all commands (uses tinypipe-tools::default_tools)
 tinypipe-daemon/     — gRPC daemon: worker registration + tool dispatch (tonic)
+tinypipe-server/     — HTTP server (axum): full CLI surface over REST + root-level
+                       published routes from META http_* keys
 tinypipe-proto/      — generated gRPC stubs from proto/tinypipe.proto
 examples/go-worker/  — Go worker SDK + sample tools (send_email, text.reverse)
 benches/             — baseline benchmarks
@@ -718,6 +837,9 @@ benches/             — baseline benchmarks
 - Remote tools: `tinypipe-daemon` + workers in any language (Go SDK in
   `examples/go-worker`), outbound bidi registration, fail-fast, per-tool timeouts,
   keepalive, round-robin; `tinypipe-cli tools list/test`, `daemon status`
+- HTTP server: `tinypipe-server` — the full CLI surface over REST, root-level
+  published routes via META `http_*` keys, token auth, optional audit,
+  GET response caching, dynamic code endpoint, daemon/tool proxies
 - What's missing: network proxy, persistent execution scheduling, tier-2/3 sandboxing (KVM fork, wasm)
 
 ## License

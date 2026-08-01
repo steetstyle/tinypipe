@@ -66,6 +66,9 @@ message TaskResponse {
   string error_message = 4;
   // Yalnızca ilk mesajda: worker'ın sunduğu tool tanımları (kayıt).
   repeated ToolDefinition registered_tools = 5;
+  // Yalnızca ilk mesajda: daemon API anahtarı (TINYPIPE_DAEMON_API_KEY).
+  // Daemon auth açıkken eşleşmeyen anahtar kaydı reddeder.
+  string api_key = 6;
 }
 
 message InvokeRequest {

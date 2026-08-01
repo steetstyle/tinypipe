@@ -1,0 +1,24 @@
+[package]
+name = "tinypipe-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP server for tinypipe — the full CLI surface over REST"
+
+[dependencies]
+tinypipe-api = { path = "../tinypipe-api" }
+tinypipe-compiler = { path = "../tinypipe-compiler" }
+tinypipe-env = { path = "../tinypipe-env" }
+tinypipe-insight = { path = "../tinypipe-insight" }
+tinypipe-proto = { path = "../tinypipe-proto" }
+tinypipe-ir = { path = "../tinypipe-ir" }
+tinypipe-storage = { path = "../tinypipe-storage" }
+tinypipe-tools = { path = "../tinypipe-tools" }
+tinypipe-vm = { path = "../tinypipe-vm" }
+axum = "0.8"
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

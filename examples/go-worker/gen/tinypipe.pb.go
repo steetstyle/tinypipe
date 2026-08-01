@@ -214,8 +214,11 @@ type TaskResponse struct {
 	ErrorMessage string `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
 	// Yalnızca ilk mesajda: worker'ın sunduğu tool tanımları (kayıt).
 	RegisteredTools []*ToolDefinition `protobuf:"bytes,5,rep,name=registered_tools,json=registeredTools,proto3" json:"registered_tools,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Yalnızca ilk mesajda: daemon API anahtarı (TINYPIPE_DAEMON_API_KEY).
+	// Daemon auth açıkken eşleşmeyen anahtar kaydı reddeder.
+	ApiKey        string `protobuf:"bytes,6,opt,name=api_key,json=apiKey,proto3" json:"api_key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TaskResponse) Reset() {
@@ -281,6 +284,13 @@ func (x *TaskResponse) GetRegisteredTools() []*ToolDefinition {
 		return x.RegisteredTools
 	}
 	return nil
+}
+
+func (x *TaskResponse) GetApiKey() string {
+	if x != nil {
+		return x.ApiKey
+	}
+	return ""
 }
 
 type InvokeRequest struct {
@@ -522,14 +532,15 @@ const file_tinypipe_proto_rawDesc = "" +
 	"\x03env\x18\x05 \x03(\v2!.tinypipe.v1.TaskRequest.EnvEntryR\x03env\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcf\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe8\x01\n" +
 	"\fTaskResponse\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\x12\x1f\n" +
 	"\voutput_json\x18\x03 \x01(\tR\n" +
 	"outputJson\x12#\n" +
 	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\x12F\n" +
-	"\x10registered_tools\x18\x05 \x03(\v2\x1b.tinypipe.v1.ToolDefinitionR\x0fregisteredTools\"\xd9\x01\n" +
+	"\x10registered_tools\x18\x05 \x03(\v2\x1b.tinypipe.v1.ToolDefinitionR\x0fregisteredTools\x12\x17\n" +
+	"\aapi_key\x18\x06 \x01(\tR\x06apiKey\"\xd9\x01\n" +
 	"\rInvokeRequest\x12\x1b\n" +
 	"\ttool_name\x18\x01 \x01(\tR\btoolName\x12\x1b\n" +
 	"\targs_json\x18\x02 \x01(\tR\bargsJson\x12\x1f\n" +

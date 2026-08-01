@@ -20,6 +20,17 @@ The full README (repo root) has deeper examples; this file is the compressed, LL
   register tools (`registered_tools` as first message); the CLI bridges them into
   the registry at execute/resume time (built-in names win). Go SDK + sample:
   `examples/go-worker/` (send_email, text.reverse).
+- **Daemon auth (default ON)**: workers must send the daemon's API key in their
+  registration message. Set `TINYPIPE_DAEMON_API_KEY` (or `--api-key`) on both
+  sides; without one the daemon generates a random key and logs it (WARN).
+  Disable with `--no-auth` / `TINYPIPE_DAEMON_NO_AUTH=1` (open network only).
+  Go SDK: `Worker.SetAPIKey(...)` / `TINYPIPE_DAEMON_API_KEY` env.
+- **HTTP server**: `tinypipe-server` exposes the full CLI surface over REST
+  (axum). Graphs publish at the site ROOT via META `http_*` keys; the management
+  API lives under `/api`. Static-graph execution is open; mutations require a
+  bearer token (`TINYPIPE_SERVER_TOKEN`). Audit is OFF by default
+  (`TINYPIPE_SERVER_AUDIT=1` to record executions). Blocking tools run on a
+  thread pool; nothing blocks concurrent requests.
 - **Subgraphs**: graphs calling other graphs via `call("subgraph:<name>", ...)`.
 - **Roles**: 6 profiles (pm, ba, ceo, architect, senior, devops) that drive plan rendering
   (`--view`, `--direction`) and `report` sections.
@@ -58,6 +69,58 @@ Remote tool conventions:
   tools disappear from `tools list`.
 
 `<id>` accepts either the UUID or the graph name.
+
+## HTTP server (fast reference)
+
+```bash
+TINYPIPE_SERVER_TOKEN=secret tinypipe-server   # addr: TINYPIPE_SERVER_ADDR (default 127.0.0.1:8080)
+```
+
+Publishing = `http_*` keys in `META(...)` (META only accepts string/number/list
+literals, so booleans are written as strings: `http_public="true"`):
+
+| META key | Meaning |
+|---|---|
+| `http_route` | root-level path (leading `/` optional); `api`/`healthz`/`assets`/`static` prefixes reserved |
+| `http_method` | `"GET"`/`"POST"`/`"PUT"`/`"PATCH"`/`"DELETE"`/`"HEAD"` (default POST); `"OPTIONS"` rejected (auto-served); invalid → hard error, no fallback |
+| `http_public` | `"true"` → no token required (default `"false"`) |
+| `http_timeout_ms` | VM timeout override (0 = plan default) |
+| `http_cache_ttl` | response cache seconds for GET/HEAD/DELETE (0 = off); header `X-Tinypipe-Cache: HIT` |
+
+Inputs per method: GET/HEAD/DELETE → query params; POST/PUT/PATCH → JSON body.
+HEAD executes like GET, returns headers only (no body). OPTIONS never executes
+the graph — published paths answer CORS preflight automatically (204 + `Allow`).
+**Header isolation:** published routes never read request headers — inputs come
+only from query/body and env is always empty, so `Authorization`/`Cookie` can
+never reach the graph. Wrong method → 405 + `Allow` header. Different methods
+can share a path from different graphs; same (path, method) pair is owned by
+one graph (409). Invalid `http_*` keys / duplicate routes / reserved paths →
+startup fails fast for existing graphs, or 400/409 on create/update.
+
+Endpoint map (CLI → REST):
+
+| CLI | Endpoint | Auth |
+|---|---|---|
+| check | `POST /api/check` | token |
+| create | `POST /api/graphs` | token |
+| update | `PUT /api/graphs/{id}` | token |
+| deploy / rollback | `POST /api/graphs/{id}/deploy` · `.../rollback` | token |
+| versions / list | `GET /api/graphs/{id}/versions` · `GET /api/graphs` | open |
+| execute | `POST /api/graphs/{id}/execute` | open |
+| resume / scheduler | `POST /api/executions/{id}/resume` · `POST /api/scheduler/run` | token |
+| executions | `GET /api/executions?graph_id=` · `GET /api/executions/{id}` | token |
+| plan / report | `GET /api/graphs/{id}/plan?format=&view=&direction=&profile=` · `GET /api/report?profile=&env=K=V` | token |
+| profiles | `GET`/`POST`/`DELETE /api/profiles/{name}` | token |
+| tools | `GET /api/tools` (open) · `POST /api/tools/test` (token) | mixed |
+| daemon | `GET /api/daemon/status?addr=` | open |
+| dynamic code | `POST /api/run` `{code, inputs?, env?, pause_after?}` — compiled + LRU-cached (64), no audit | token |
+| health | `GET /healthz` | open |
+
+Execution responses: `{status: completed|paused|failed, execution_id,
+duration_us, nodes_executed, output?, error?}` (paused → 202, failed → 422,
+mutation compile errors → 400, route conflicts → 409). Pause/resume/scheduler
+and execution history require `TINYPIPE_SERVER_AUDIT=1`; with audit off no
+request writes to the DB (paused responses are returned but cannot be resumed).
 
 ## The DSL — restricted Python
 
@@ -194,3 +257,12 @@ tinypipe-cli deploy dashboard_seeds 1
 7. Keep loop bodies minimal — every iteration re-executes the body nodes.
 8. Validate with `check` before `create`; expect failures at runtime to be visible in
    `executions list/show` with per-node steps.
+
+### Kuruş-int rule (money is integer kuruş)
+
+The type system is `int`/`float` only — there is no Decimal/money type. Money amounts are
+always integer **kuruş** (100 kuruş = 1 TL): store, compute and return amounts as `int`
+(e.g. `price = 2499` means 24.99 TL), never as `float`. If a computation involves division,
+round back to integer kuruş at the boundary — the money value itself must never be a float.
+Name money variables with a `_kurus` (or `_cents`) suffix so the unit is explicit:
+`vat_kurus`, `total_cents`.

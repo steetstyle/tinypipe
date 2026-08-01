@@ -55,6 +55,7 @@ func (t *Tool) toProto() *tinypipev1.ToolDefinition {
 // Worker — daemon bağlantısını yönetir.
 type Worker struct {
 	addr    string
+	apiKey  string
 	mu      sync.Mutex // grpc-go SendMsg goroutine-safe değil
 	stream  grpc.BidiStreamingClient[tinypipev1.TaskResponse, tinypipev1.TaskRequest]
 	conn    *grpc.ClientConn
@@ -73,6 +74,12 @@ func New(addr string) *Worker {
 		backoffBase: 2 * time.Second,
 		backoffMax:  30 * time.Second,
 	}
+}
+
+// SetAPIKey — daemon kayıt anahtarını ayarlar (TINYPIPE_DAEMON_API_KEY).
+// Daemon auth açıkken eksik/yanlış anahtar kaydı reddedilir.
+func (w *Worker) SetAPIKey(key string) {
+	w.apiKey = key
 }
 
 // RegisterTool — tool kaydeder. Aynı adla tekrar kayıt hata döndürür.
@@ -130,12 +137,12 @@ func (w *Worker) runOnce(ctx context.Context) error {
 	w.mu.Unlock()
 	log.Printf("worker: connected to daemon at %s (%d tools)", w.addr, len(w.tools))
 
-	// Kayıt mesajı: ilk TaskResponse'ta registered_tools gider.
+	// Kayıt mesajı: ilk TaskResponse'ta registered_tools (+ api_key) gider.
 	protos := make([]*tinypipev1.ToolDefinition, 0, len(w.tools))
 	for _, t := range w.tools {
 		protos = append(protos, t.toProto())
 	}
-	registration := &tinypipev1.TaskResponse{RegisteredTools: protos}
+	registration := &tinypipev1.TaskResponse{RegisteredTools: protos, ApiKey: w.apiKey}
 	w.sendLocked(registration)
 
 	for {

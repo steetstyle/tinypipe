@@ -88,6 +88,8 @@ impl WorkerGroup {
 pub struct Daemon {
     addr: String,
     default_timeout: Duration,
+    /// Worker kayıt API anahtarı. `None` = auth kapalı (herkes kayıt olabilir).
+    api_key: Option<String>,
     tool_groups: DashMap<String, Arc<WorkerGroup>>,
     tool_defs: DashMap<String, ToolDefinition>,
     pending: DashMap<String, PendingTask>,
@@ -104,11 +106,18 @@ impl Daemon {
         Daemon {
             addr: addr.into(),
             default_timeout,
+            api_key: None,
             tool_groups: DashMap::new(),
             tool_defs: DashMap::new(),
             pending: DashMap::new(),
             in_flight: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Worker kaydı için API anahtarı zorunlu kılar. `None` = auth kapalı.
+    pub fn with_api_key(mut self, key: Option<String>) -> Self {
+        self.api_key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        self
     }
 
     pub fn addr(&self) -> &str {
@@ -186,6 +195,7 @@ impl Daemon {
                     output_json: String::new(),
                     error_message: "worker disconnected".to_string(),
                     registered_tools: Vec::new(),
+                    api_key: String::new(),
                 });
             }
         }
@@ -287,11 +297,32 @@ impl ToolWorkerService for DaemonServer {
     ) -> Result<Response<Self::ConnectWorkerStream>, Status> {
         let mut inbound = request.into_inner();
 
-        // 1. İlk mesaj = kayıt (registered_tools)
+        // 1. İlk mesaj = kayıt (registered_tools + api_key)
         let first = inbound
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("worker sent no registration message"))?;
+
+        // 1a. API anahtarı doğrulaması (auth açıksa).
+        // Karşılaştırma sabit zamanlıdır (timing saldırısına karşı basit önlem).
+        if let Some(expected) = &self.0.api_key {
+            let provided = first.api_key.as_bytes();
+            let ok = provided.len() == expected.len()
+                && provided
+                    .iter()
+                    .zip(expected.as_bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0;
+            if !ok {
+                tracing::warn!(
+                    tools = first.registered_tools.len(),
+                    "worker registration rejected: invalid api key"
+                );
+                return Err(Status::unauthenticated(
+                    "invalid daemon api key — set TINYPIPE_DAEMON_API_KEY on the worker",
+                ));
+            }
+        }
 
         let worker_id = uuid::Uuid::new_v4().to_string();
         let daemon_owned = self.0.clone();

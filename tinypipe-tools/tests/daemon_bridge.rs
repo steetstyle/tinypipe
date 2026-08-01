@@ -38,6 +38,7 @@ async fn spawn_echo_worker(addr: std::net::SocketAddr, tool: &str) {
         output_json: String::new(),
         error_message: String::new(),
         registered_tools: vec![def(tool)],
+        api_key: String::new(),
     };
     let (resp_tx, resp_rx) = tokio::sync::mpsc::channel::<TaskResponse>(16);
     resp_tx.send(registration).await.unwrap();
@@ -58,6 +59,7 @@ async fn spawn_echo_worker(addr: std::net::SocketAddr, tool: &str) {
                 success: true,
                 output_json: format!(r#"{{"echoed":{}}}"#, task.args_json),
                 error_message: String::new(),
+                api_key: String::new(),
                 registered_tools: Vec::new(),
             };
             if resp_tx.send(resp).await.is_err() {
@@ -118,6 +120,7 @@ async fn bridge_dispatches_kwargs_and_env() {
         output_json: String::new(),
         error_message: String::new(),
         registered_tools: vec![def("probe")],
+        api_key: String::new(),
     };
     let (resp_tx, resp_rx) = tokio::sync::mpsc::channel::<TaskResponse>(16);
     resp_tx.send(registration).await.unwrap();
@@ -136,6 +139,7 @@ async fn bridge_dispatches_kwargs_and_env() {
                 ),
                 error_message: String::new(),
                 registered_tools: Vec::new(),
+                api_key: String::new(),
             };
             resp_tx.send(resp).await.unwrap();
         }
