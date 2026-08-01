@@ -16,5 +16,4 @@ thiserror.workspace = true
 tracing.workspace = true
 rustpython-parser = "0.4"
 rustpython-ast = "0.4"
-bincode.workspace = true
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "blocking"] }

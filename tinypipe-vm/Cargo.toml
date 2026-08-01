@@ -16,6 +16,7 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile = "3"
 tinypipe-tools = { path = "../tinypipe-tools" }
+tinypipe-compiler = { path = "../tinypipe-compiler" }
 
 [[bench]]
 name = "bench_mock"

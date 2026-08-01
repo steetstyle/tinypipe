@@ -1,7 +1,7 @@
 //! `tinypipe-compiler` Backend — optimize + codegen.
 //!
 //! Frontend (parse → sanitize → transform → validate) bir `ExecutionPlan` üretir.
-//! Backend bu plan'ı alır, optimize eder ve `CompiledPlan` (binary bincode) olarak kodlar.
+//! Backend bu plan'ı alır, optimize eder ve `CompiledPlan` (binary FlatBuffers) olarak kodlar.
 //!
 //! # Akış
 //!
@@ -15,7 +15,7 @@
 //! codegen::codegen()         ──▶ CompiledPlan (uint32 index'ler, binary)
 //!     │
 //!     ▼
-//! bincode::serialize()       ──▶ Vec<u8> (storage'a yazılır)
+//! to_fb_bytes()             ──▶ Vec<u8> (storage'a yazılır)
 //! ```
 
 pub mod codegen;

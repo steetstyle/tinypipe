@@ -1,7 +1,7 @@
 //! `tinypipe-vm` — pause/resume checkpointing.
 //!
 //! `Checkpoint`, yürütmenin herhangi bir noktasında alınan tam anlık görüntüdür
-//! (bincode ile serialize edilebilir). `PausePolicy`, hangi koşullarda checkpoint
+//! `PausePolicy`, hangi koşullarda checkpoint
 //! alınacağını belirler; `StepObserver` ise node bazlı izleme sağlar.
 
 use std::collections::{HashMap, HashSet};
@@ -51,7 +51,7 @@ pub struct LoopState {
 }
 
 /// Yürütme state'inin tam anlık görüntüsü. serde_json ile serialize edilir
-/// (Value `#[serde(untagged)]` olduğu için bincode kullanılamaz).
+/// (Value `#[serde(untagged)]` olduğu için JSON kullanılır).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     /// Çalıştırılan node sayısı (budget hesabı dahil).

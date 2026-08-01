@@ -373,7 +373,6 @@ fn cmd_create(name: &str, code: &str) {
     println!("  Name: {}", name);
     println!("  Nodes: {}", output.compiled.metadata.node_count);
     println!("  Edges: {}", output.compiled.metadata.edge_count);
-    println!("  Binary (bincode): {} bytes", output.binary.len());
     println!("  Binary (FlatBuffers): {} bytes", output.fb_binary.len());
     println!("  Optimizations: {:?}", output.optimizations);
 
@@ -643,10 +642,9 @@ fn cmd_update(id: &str, code: &str) {
                 .expect("Failed to save compiled plan");
             println!("✓ Graph updated: {} (version {})", id, version.0);
             println!(
-                "  Nodes: {}, Edges: {}, Binary (bincode): {} bytes, FB: {} bytes",
+                "  Nodes: {}, Edges: {}, Binary (FlatBuffers): {} bytes",
                 output.compiled.metadata.node_count,
                 output.compiled.metadata.edge_count,
-                output.binary.len(),
                 output.fb_binary.len()
             );
         }

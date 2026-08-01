@@ -3,7 +3,7 @@
 //! Takes Restricted Python code (already sanitized), walks the AST,
 //! and produces an `ExecutionPlan` suitable for the tinypipe-vm interpreter.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use parser::ast::{self, Ranged};
 use parser::source_code::{LineIndex, SourceLocation};
@@ -78,9 +78,6 @@ struct TransformEngine<'a> {
     // Variable context: maps variable name → node id that LAST wrote it.
     var_map: HashMap<String, String>,
 
-    // Set of node IDs that are terminators (return, error) — no outgoing control flow
-    terminal_nodes: HashSet<String>,
-
     // Node ID counter
     next_id: u32,
 
@@ -107,7 +104,6 @@ impl<'a> TransformEngine<'a> {
             nodes: Vec::new(),
             edges: Vec::new(),
             var_map: HashMap::new(),
-            terminal_nodes: HashSet::new(),
             next_id: 0,
             current_branch: None,
             current_group: None,
@@ -232,6 +228,7 @@ impl<'a> TransformEngine<'a> {
 
         // Track the previous statement's last node for control-flow edges
         let mut prev_last: Option<String> = None;
+        let mut prev_terminal = false;
 
         // Transform each statement in the function body
         for stmt in &func.body {
@@ -239,14 +236,15 @@ impl<'a> TransformEngine<'a> {
 
             // Add control-flow edge from previous statement's last node to this
             // statement's first node. This enforces sequential execution order.
-            // Skip if previous statement ends with a terminal (return/error).
+            // Skip if previous statement is terminal (return/error/all-return if).
             if let Some(prev) = &prev_last {
-                if !self.is_return_node(prev) {
+                if !prev_terminal {
                     self.edges.push(Edge::control(prev, &first_id));
                 }
             }
 
             prev_last = Some(last_id);
+            prev_terminal = Self::stmt_is_terminal(stmt);
         }
 
         Ok(())
@@ -397,18 +395,20 @@ impl<'a> TransformEngine<'a> {
 
             // ── Return ─────────────────────────────────────────
             ast::Stmt::Return(s) => {
-                let output_id = if let Some(v) = &s.value {
+                let (first_id, output_id) = if let Some(v) = &s.value {
                     let val_id = self.transform_expr_to_node(v)?;
                     // Create an Act node to represent the output
                     let id = self.push_node(Opcode::Act, vec![("type", "return".into())]);
                     self.push_edge(&val_id, &id);
-                    id
+                    // FIRST = değer calc'i: önceki statement'ın kontrol zinciri
+                    // değere ulaşsın (if'in ardındaki return'de ölü dal durumunda
+                    // değer calc'i enable edilmeli; Act'e zincirlemek onu atlar).
+                    (val_id, id)
                 } else {
-                    self.push_node(Opcode::Act, vec![("type", "return".into())])
+                    let id = self.push_node(Opcode::Act, vec![("type", "return".into())]);
+                    (id.clone(), id)
                 };
-                // Mark as terminal — no outgoing control flow to subsequent statements
-                self.terminal_nodes.insert(output_id.clone());
-                Ok((output_id.clone(), output_id))
+                Ok((first_id, output_id))
             }
 
             // ── If / elif / else ───────────────────────────────
@@ -445,15 +445,26 @@ impl<'a> TransformEngine<'a> {
                 // The LOOP node's outgoing edge to the body carries this variable's value.
                 self.var_map.insert(target_name.clone(), loop_id.clone());
 
-                // Transform body — track first and last nodes for LOOP→body edge
+                // Transform body — track first and last nodes for LOOP→body edge.
+                // Ardışık statement'lar kontrol edge'leriyle zincirlenir (fonksiyon
+                // gövdesindeki gibi) — aksi halde topo sıra, if'in ardındaki
+                // statement'ı if'ten ÖNCE sıralayabilir (break/continue gating'i
+                // bozulur).
                 let mut body_first: Option<String> = None;
                 let mut body_last: Option<String> = None;
+                let mut body_prev_terminal = false;
                 for child in &s.body {
                     let (cid, last_id) = self.transform_stmt(child, &body_last)?;
+                    if let Some(prev) = &body_last {
+                        if !body_prev_terminal {
+                            self.edges.push(Edge::control(prev, &cid));
+                        }
+                    }
                     if body_first.is_none() {
                         body_first = Some(cid);
                     }
                     body_last = Some(last_id);
+                    body_prev_terminal = Self::stmt_is_terminal(child);
                 }
 
                 // Add LOOP→first_body unconditional edge:
@@ -527,14 +538,18 @@ impl<'a> TransformEngine<'a> {
                 let id = self.gen_id();
                 Ok((id.clone(), id))
             }
-            ast::Stmt::Break(_) | ast::Stmt::Continue(_) => {
-                // These are valid inside loops but we handle them at the loop level
-                let id = self.gen_id();
+            ast::Stmt::Break(_) => {
+                // Döngü gövdesinde VM tarafından onurlandırılan break marker'ı.
+                let id = self.push_node(Opcode::Act, vec![("type", "break".into())]);
+                Ok((id.clone(), id))
+            }
+            ast::Stmt::Continue(_) => {
+                // Döngü gövdesinde VM tarafından onurlandırılan continue marker'ı.
+                let id = self.push_node(Opcode::Act, vec![("type", "continue".into())]);
                 Ok((id.clone(), id))
             }
             ast::Stmt::Raise(_) => {
                 let id = self.push_node(Opcode::Error, vec![("message", "raised by code".into())]);
-                self.terminal_nodes.insert(id.clone());
                 Ok((id.clone(), id))
             }
             ast::Stmt::Assert(s) => {
@@ -644,9 +659,22 @@ impl<'a> TransformEngine<'a> {
 
     // ── If / elif / else transform ─────────────────────────────
 
-    /// Check if a node is a terminal (return, error) that stops execution flow.
-    fn is_return_node(&self, node_id: &str) -> bool {
-        self.terminal_nodes.contains(node_id)
+    /// Check if a statement unconditionally stops execution flow (return/error),
+    /// or is an if/elif/else where ALL branches terminate. AST-level check:
+    /// an all-return if/elif chain must be treated as terminal by the enclosing
+    /// statement, otherwise the outer if creates a spurious MERGE and an
+    /// unconditional edge from the inner DECIDE.
+    fn stmt_is_terminal(stmt: &ast::Stmt) -> bool {
+        match stmt {
+            ast::Stmt::Return(_) | ast::Stmt::Raise(_) => true,
+            ast::Stmt::If(s) => {
+                !s.body.is_empty()
+                    && !s.orelse.is_empty()
+                    && s.body.iter().all(Self::stmt_is_terminal)
+                    && s.orelse.iter().all(Self::stmt_is_terminal)
+            }
+            _ => false,
+        }
     }
 
     fn transform_if(&mut self, s: &ast::StmtIf) -> Result<(String, String), Vec<TransformError>> {
@@ -684,6 +712,13 @@ impl<'a> TransformEngine<'a> {
         if let Some(last) = &body_last {
             self.push_cond_edge(&decide_id, last, "true");
         }
+        // Multi-statement dallarda zincirin İLK node'unu da gate'le (ilk != son):
+        // elif/else zincirleri outer decide'ın kararıyla ertelenmeli — aksi halde
+        // eager condition calc'leri ve alt decide'lar yanlış dalda çalışıp
+        // ctx'i bozar (ör. loop içinde elif çift-sayımı).
+        if body_first.is_some() && body_first != body_last {
+            self.push_cond_edge(&decide_id, body_first.as_ref().unwrap(), "true");
+        }
 
         // Transform else / elif branches
         let var_map_before_false = self.var_map.clone();
@@ -706,14 +741,15 @@ impl<'a> TransformEngine<'a> {
         if let Some(last) = &orelse_last {
             self.push_cond_edge(&decide_id, last, "false");
         }
+        // Multi-statement orelse zincirinde (elif/else) ilk node'u da gate'le —
+        // elif koşulu yalnızca outer decide false olduğunda değerlendirilmeli.
+        if orelse_first.is_some() && orelse_first != orelse_last {
+            self.push_cond_edge(&decide_id, orelse_first.as_ref().unwrap(), "false");
+        }
 
-        // Determine if each branch is terminal (ends with return/error)
-        let body_is_terminal = body_last
-            .as_ref()
-            .map_or(false, |id| self.is_return_node(id));
-        let orelse_is_terminal = orelse_last
-            .as_ref()
-            .map_or(false, |id| self.is_return_node(id));
+        // Determine if each branch is terminal (all statements end with return/error)
+        let body_is_terminal = !s.body.is_empty() && s.body.iter().all(Self::stmt_is_terminal);
+        let orelse_is_terminal = !s.orelse.is_empty() && s.orelse.iter().all(Self::stmt_is_terminal);
 
         // If ALL branches exist and ALL are terminal, no MERGE needed.
         // Note: an empty orelse branch (no else clause) does NOT make the if "fully terminal"
@@ -744,6 +780,13 @@ impl<'a> TransformEngine<'a> {
         // Fall-through: if the true branch is terminal and there's no else,
         // connect DECIDE(false) → MERGE so the false path reaches the merge.
         if body_is_terminal && s.orelse.is_empty() {
+            self.push_cond_edge(&decide_id, &merge_id, "false");
+        }
+        // Non-terminal `if` without else: DECIDE(false) → MERGE kenarı hem
+        // validator'ın "2 çıkış kenarı" kuralını karşılar hem de false yolunun
+        // fall-through ile MERGE'e ulaşmasını sağlar. VM, dead-branch veri
+        // öncüllerini (true dalı çalışmazsa) MERGE için esnetir.
+        if !body_is_terminal && s.orelse.is_empty() {
             self.push_cond_edge(&decide_id, &merge_id, "false");
         }
         // If the false branch is terminal and there IS an else clause but no

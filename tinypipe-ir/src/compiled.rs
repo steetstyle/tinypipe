@@ -2,13 +2,12 @@
 //!
 //! v1'de `ExecutionPlan` JSON string ID'ler kullanır (O(n) linear scan).
 //! v2'de `CompiledPlan` uint32 index'ler kullanır (O(1) random access) ve
-//! `bincode` veya `FlatBuffers` ile binary serialize edilir — JSON'un ~%20'si boyutunda.
+//! `FlatBuffers` ile binary serialize edilir — JSON'un ~%20'si boyutunda.
 //!
-//! # Çift Format (Dual-Format)
+//! # Format
 //!
 //! | Format | Yöntem | Kullanım |
 //! |--------|--------|----------|
-//! | Bincode | `to_bytes()` / `from_bytes()` | Legacy, dev, debugging |
 //! | FlatBuffers | `to_fb_bytes()` / `from_fb_bytes()` | **Canonical**, cross-language, schema-verified |
 //!
 //! # Dönüşüm
@@ -251,16 +250,6 @@ impl CompiledPlan {
             .iter()
             .filter(|e| e.from_index == node_index)
             .collect()
-    }
-
-    /// Binary serialize (bincode).
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        Ok(bincode::serialize(self)?)
-    }
-
-    /// Binary deserialize (bincode).
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(bincode::deserialize(bytes)?)
     }
 
     // ─── FlatBuffers serialization ───────────────────────────────
@@ -737,15 +726,6 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_roundtrip() {
-        let plan = sample_plan();
-        let compiled = CompiledPlan::from_execution_plan(&plan, vec![]);
-        let bytes = compiled.to_bytes().expect("serialize");
-        let deserialized = CompiledPlan::from_bytes(&bytes).expect("deserialize");
-        assert_eq!(compiled, deserialized);
-    }
-
-    #[test]
     fn test_fb_roundtrip() {
         let plan = sample_plan();
         let compiled = CompiledPlan::from_execution_plan(&plan, vec![]);
@@ -831,11 +811,11 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_is_smaller_than_json() {
+    fn test_fb_is_smaller_than_json() {
         let plan = sample_plan();
         let compiled = CompiledPlan::from_execution_plan(&plan, vec![]);
         let json = serde_json::to_string(&plan).unwrap();
-        let bytes = compiled.to_bytes().expect("serialize");
+        let bytes = compiled.to_fb_bytes().expect("serialize");
         assert!(
             bytes.len() < json.len(),
             "binary ({} bytes) should be smaller than JSON ({} bytes)",

@@ -1,27 +1,21 @@
 //! `CompiledExecutor` — Zero-copy DAG interpreter for `CompiledPlan`.
 //!
 //! Unlike `Executor` (which works with `ExecutionPlan` via string ID lookups),
-//! `CompiledExecutor` works directly with `CompiledPlan` (binary FlatBuffers or bincode,
+//! `CompiledExecutor` works directly with `CompiledPlan` (binary FlatBuffers,
 //! uint32 index'ler). Key differences:
 //!
 //! - **O(1) node access**: `compiled.nodes.get(index)` instead of `plan.get_node(id)`
 //! - **No HashMap for node lookup**: indices are direct array offsets
-//! - **Format-agnostic**: accepts plan from either `CompiledPlan::from_fb_bytes()` (canonical)
-//!   or `CompiledPlan::from_bytes(bincode)` (legacy)
+//! - **Single canonical format**: `CompiledPlan::from_fb_bytes()`
 //! - **Smaller memory footprint**: Compact compiled format
 //!
 //! # Usage
 //!
 //! ```ignore
-//! // FlatBuffers (canonical)
 //! let bytes: Vec<u8> = storage.load_plan(&graph_id)?;
 //! let plan = CompiledPlan::from_fb_bytes(&bytes)?;
 //! let executor = CompiledExecutor::new(&plan, &registry);
 //! let result = executor.execute(inputs)?;
-//!
-//! // Bincode (legacy)
-//! let plan = CompiledPlan::from_bytes(&bytes)?;
-//! let executor = CompiledExecutor::new(&plan, &registry);
 //! ```
 
 use std::cell::Cell;
@@ -45,7 +39,7 @@ enum NodeOutcome {
     Paused(LoopState),
 }
 
-/// Execution engine for CompiledPlan (binary bincode or FlatBuffers format).
+/// Execution engine for CompiledPlan (binary FlatBuffers format).
 pub struct CompiledExecutor<'a> {
     plan: &'a CompiledPlan,
     registry: &'a dyn ToolRegistry,
@@ -491,6 +485,80 @@ impl<'a> CompiledExecutor<'a> {
 
         tracing::trace!(node = node.index, op = ?node.op, "node executing");
 
+        // ── Branch gating: a node with incoming conditional edges from a DECIDE
+        // belongs to that branch. It may be enabled by value edges from eager
+        // calcs, but must not run unless its branch condition matches the
+        // DECIDE's decision. (Data edges propagate values, not branch status.)
+        // MERGE join noktasıdır: koşullu kenarlarının tümü uyuşmazsa (ör. elif
+        // fall-through zinciri) ertelenir — ama canlı bir dalın tamamladığı
+        // UNCONDITIONAL data kenarı varsa (üretici çıktı ürettiyse) ateşlenir.
+        let branch_mismatch = if node.op == Opcode::Merge {
+            let uncond_ran = self.plan.edges.iter().any(|e| {
+                e.to_index == node.index
+                    && e.kind == EdgeKind::Data
+                    && e.condition.is_none()
+                    && node_outputs.contains_key(&e.from_index)
+            });
+            !uncond_ran
+                && self.plan.edges.iter().any(|e| {
+                    e.to_index == node.index
+                        && e.kind == EdgeKind::Data
+                        && matches!(
+                            self.plan.nodes.get(e.from_index as usize).map(|n| &n.op),
+                            Some(Opcode::Decide)
+                        )
+                        && e.condition
+                            .as_deref()
+                            .map(|c| {
+                                c.eq_ignore_ascii_case("true") || c.eq_ignore_ascii_case("false")
+                            })
+                            .unwrap_or(false)
+                        && {
+                            let want = e
+                                .condition
+                                .as_deref()
+                                .map(|c| c.eq_ignore_ascii_case("true"))
+                                .unwrap_or(false);
+                            match node_outputs.get(&e.from_index) {
+                                Some(Value::Bool(b)) => *b != want,
+                                // Decide hasn't recorded a decision yet — defer.
+                                _ => true,
+                            }
+                        }
+                })
+        } else {
+            self.plan.edges.iter().any(|e| {
+                e.to_index == node.index
+                    && e.kind == EdgeKind::Data
+                    && matches!(
+                        self.plan.nodes.get(e.from_index as usize).map(|n| &n.op),
+                        Some(Opcode::Decide)
+                    )
+                    && e.condition
+                        .as_deref()
+                        .map(|c| {
+                            c.eq_ignore_ascii_case("true") || c.eq_ignore_ascii_case("false")
+                        })
+                        .unwrap_or(false)
+                    && {
+                        let want = e
+                            .condition
+                            .as_deref()
+                            .map(|c| c.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+                        match node_outputs.get(&e.from_index) {
+                            Some(Value::Bool(b)) => *b != want,
+                            // Decide hasn't recorded a decision yet — defer.
+                            _ => true,
+                        }
+                    }
+            })
+        };
+        if branch_mismatch {
+            tracing::trace!(node = node.index, "branch condition not met — deferred");
+            return Ok(NodeOutcome::Ok);
+        }
+
         // Check control-flow dependencies: all control predecessors must have completed.
         let idx = node.index as usize;
         let n = self.plan.nodes.len();
@@ -505,6 +573,32 @@ impl<'a> CompiledExecutor<'a> {
             // This ensures sequential ordering: e.g., a statement after an if/else
             // with an early-return branch only executes when the fall-through path
             // reaches the MERGE node.
+            return Ok(NodeOutcome::Ok);
+        }
+
+        // Data predecessors that have not produced a value must block this node.
+        // A producer inside a not-taken branch never runs; consuming it would
+        // fabricate a value (or error) from a dead path. Input nodes are exempt:
+        // a missing input means "no value provided", handled by resolve fallbacks.
+        // Loop-body producers are exempt too: with 0 iterations the body never
+        // runs, but its consumers read the (still valid) context variables.
+        // Branch-gated (dead) producers are exempt: their branch wasn't taken,
+        // so the consumer (e.g. a MERGE) must proceed with the live path alone.
+        let data_pred_missing = self.plan.edges.iter().any(|e| {
+            e.to_index == node.index
+                && e.kind == EdgeKind::Data
+                && !node_outputs.contains_key(&e.from_index)
+                && !matches!(
+                    self.plan.nodes.get(e.from_index as usize).map(|n| &n.op),
+                    Some(Opcode::Input)
+                )
+                && !loop_bodies
+                    .values()
+                    .any(|set| set.contains(&e.from_index))
+                && !self.is_branch_dead(e.from_index, node_outputs)
+        });
+        if data_pred_missing {
+            tracing::trace!(node = node.index, "data predecessor(s) pending — deferred");
             return Ok(NodeOutcome::Ok);
         }
 
@@ -706,30 +800,8 @@ impl<'a> CompiledExecutor<'a> {
             }
 
             Opcode::Decide => {
-                // Native compiled format: source/op/value
-                let source = node
-                    .args
-                    .iter()
-                    .find(|a| a.key == "source")
-                    .map(|a| resolve_arg_value(&a.value, ctx, node_outputs))
-                    .unwrap_or(Value::Null);
-                let op = node
-                    .args
-                    .iter()
-                    .find(|a| a.key == "op")
-                    .map(|a| trim_quotes(&a.value).to_string())
-                    .unwrap_or_default();
-                let cmp_val = node
-                    .args
-                    .iter()
-                    .find(|a| a.key == "value")
-                    .map(|a| parse_json_value(&a.value))
-                    .unwrap_or(Value::Null);
-
-                // Compiled format: condition string (e.g. "x > 0")
-                let decision = if !op.is_empty() {
-                    evaluate_condition(&source, &op, &cmp_val)?
-                } else if let Some(cond) = node
+                // DSL `if` koşulu: condition string (örn. "x > 0").
+                let decision = if let Some(cond) = node
                     .args
                     .iter()
                     .find(|a| a.key == "condition")
@@ -767,13 +839,29 @@ impl<'a> CompiledExecutor<'a> {
                     } else {
                         // No explicit content: read the predecessor's computed value
                         // along incoming data edges (graph-faithful return semantics).
+                        // Prefer unconditional edges — a DECIDE's conditional edge
+                        // carries only the branch decision, not the branch value.
                         let pred_value = self
                             .plan
                             .edges
                             .iter()
-                            .filter(|e| e.to_index == node.index && e.kind == EdgeKind::Data)
+                            .filter(|e| {
+                                e.to_index == node.index
+                                    && e.kind == EdgeKind::Data
+                                    && e.condition.is_none()
+                            })
                             .filter_map(|e| node_outputs.get(&e.from_index).cloned())
-                            .next_back();
+                            .next_back()
+                            .or_else(|| {
+                                self.plan
+                                    .edges
+                                    .iter()
+                                    .filter(|e| {
+                                        e.to_index == node.index && e.kind == EdgeKind::Data
+                                    })
+                                    .filter_map(|e| node_outputs.get(&e.from_index).cloned())
+                                    .next_back()
+                            });
                         if let Some(v) = pred_value {
                             *output = Some(v.clone());
                             node_outputs.insert(node.index, v);
@@ -1132,12 +1220,32 @@ impl<'a> CompiledExecutor<'a> {
         loop_cursor: Option<(u32, usize)>,
         pause: Option<&PausePolicy>,
     ) -> Result<NodeOutcome, ExecutionError> {
-        let max_iter = node
+        let max_iter_static = node
             .args
             .iter()
             .find(|a| a.key == "max_iterations")
             .map(|a| a.value.parse::<u32>().unwrap_or(100))
             .unwrap_or(100);
+        // Dinamik loop bound: LOOP'a data edge ile bağlı range(...) calc'i
+        // runtime iterasyon sayısını taşır (örn. `for i in range(len(items))`).
+        // Statik max_iterations yalnızca range calc'i olmayan planlar için
+        // fallback olarak kullanılır (döngü güvenliği node_budget'ta).
+        let mut max_iter = max_iter_static;
+        for edge in &self.plan.edges {
+            if edge.to_index == node.index && edge.kind == EdgeKind::Data {
+                // Input kaynakları veri taşır, loop bound değil — atla.
+                if matches!(
+                    self.plan.nodes.get(edge.from_index as usize).map(|n| &n.op),
+                    Some(Opcode::Input)
+                ) {
+                    continue;
+                }
+                if let Some(Value::Int(bound)) = node_outputs.get(&edge.from_index) {
+                    max_iter = (*bound).max(0) as u32;
+                    break;
+                }
+            }
+        }
         let target_name = node
             .args
             .iter()
@@ -1166,7 +1274,6 @@ impl<'a> CompiledExecutor<'a> {
                 }
             }
         }
-
         if !data_anchors.is_empty() {
             let mut body_set: HashSet<u32> = HashSet::new();
             for to in &data_anchors {
@@ -1207,6 +1314,8 @@ impl<'a> CompiledExecutor<'a> {
                 );
                 // Check for break condition via DECIDE node in body
                 let mut should_break = false;
+                // `continue` marker'ı bu iterasyonun kalan gövdesini atlar.
+                let mut skip_rest = false;
 
                 for (body_pos, body_idx) in body_vec.iter().enumerate() {
                     // Skip, sadece devam edilen iterasyonun ilk start_body_pos node'u
@@ -1214,10 +1323,83 @@ impl<'a> CompiledExecutor<'a> {
                     if iteration == start_iteration && body_pos < start_body_pos {
                         continue;
                     }
+                    if skip_rest {
+                        continue;
+                    }
 
                     let body_node = self.plan.get_node(*body_idx).ok_or_else(|| {
                         ExecutionError::NodeNotFound(format!("body index {}", body_idx))
                     })?;
+
+                    // ── Branch gating (inline): DECIDE'dan gelen koşullu data
+                    // edge'lerinin kararla uyuşmadığı dal node'ları bu iterasyonda
+                    // çalışmaz — ana passtaki gating ile aynı kural. MERGE join
+                    // noktasıdır: canlı bir dalın tamamladığı unconditional data
+                    // kenarı varsa ateşlenir.
+                    let branch_mismatch = if body_node.op == Opcode::Merge {
+                        let uncond_ran = self.plan.edges.iter().any(|e| {
+                            e.to_index == *body_idx
+                                && e.kind == EdgeKind::Data
+                                && e.condition.is_none()
+                                && node_outputs.contains_key(&e.from_index)
+                        });
+                        !uncond_ran && self.plan.edges.iter().any(|e| {
+                            e.to_index == *body_idx
+                                && e.kind == EdgeKind::Data
+                                && matches!(
+                                    self.plan.nodes.get(e.from_index as usize).map(|n| &n.op),
+                                    Some(Opcode::Decide)
+                                )
+                                && e.condition
+                                    .as_deref()
+                                    .map(|c| c.eq_ignore_ascii_case("true") || c.eq_ignore_ascii_case("false"))
+                                    .unwrap_or(false)
+                                && {
+                                    let want = e
+                                        .condition
+                                        .as_deref()
+                                        .map(|c| c.eq_ignore_ascii_case("true"))
+                                        .unwrap_or(false);
+                                    match node_outputs.get(&e.from_index) {
+                                        Some(Value::Bool(b)) => *b != want,
+                                        // Karar henüz yoksa ertelenmek yerine bu
+                                        // iterasyonda atlanır (Decide, topo sırada
+                                        // tüketicilerden önce çalışır).
+                                        _ => true,
+                                    }
+                                }
+                        })
+                    } else {
+                        self.plan.edges.iter().any(|e| {
+                            e.to_index == *body_idx
+                                && e.kind == EdgeKind::Data
+                                && matches!(
+                                    self.plan.nodes.get(e.from_index as usize).map(|n| &n.op),
+                                    Some(Opcode::Decide)
+                                )
+                                && e.condition
+                                    .as_deref()
+                                    .map(|c| c.eq_ignore_ascii_case("true") || c.eq_ignore_ascii_case("false"))
+                                    .unwrap_or(false)
+                                && {
+                                    let want = e
+                                        .condition
+                                        .as_deref()
+                                        .map(|c| c.eq_ignore_ascii_case("true"))
+                                        .unwrap_or(false);
+                                    match node_outputs.get(&e.from_index) {
+                                        Some(Value::Bool(b)) => *b != want,
+                                        // Karar henüz yoksa ertelenmek yerine bu
+                                        // iterasyonda atlanır (Decide, topo sırada
+                                        // tüketicilerden önce çalışır).
+                                        _ => true,
+                                    }
+                                }
+                        })
+                    };
+                    if branch_mismatch {
+                        continue;
+                    }
 
                     // Budget and time checks
                     *node_count += 1;
@@ -1331,32 +1513,19 @@ impl<'a> CompiledExecutor<'a> {
                             }
                         }
                         Opcode::Decide => {
-                            let source = body_node
+                            // DSL `if` Decides'ı `condition` string'i taşır; break,
+                            // ayrı bir Act(type="break") marker'ı ile yapılır.
+                            let decision = if let Some(c) = body_node
                                 .args
                                 .iter()
-                                .find(|a| a.key == "source")
-                                .map(|a| resolve_arg_value(&a.value, ctx, node_outputs))
-                                .unwrap_or(Value::Null);
-                            let op = body_node
-                                .args
-                                .iter()
-                                .find(|a| a.key == "op")
-                                .map(|a| trim_quotes(&a.value).to_string())
-                                .unwrap_or_default();
-                            let cmp_val = body_node
-                                .args
-                                .iter()
-                                .find(|a| a.key == "value")
-                                .map(|a| parse_json_value(&a.value))
-                                .unwrap_or(Value::Null);
-
-                            let decision = evaluate_condition(&source, &op, &cmp_val)?;
+                                .find(|a| a.key == "condition")
+                                .map(|a| trim_quotes(&a.value))
+                            {
+                                is_truthy(&eval_expression(c, ctx, node_outputs)?)
+                            } else {
+                                false
+                            };
                             node_outputs.insert(body_node.index, Value::Bool(decision));
-
-                            // Check if this is a break condition
-                            if !decision {
-                                should_break = true;
-                            }
                         }
                         Opcode::Input => {
                             // Re-read input each iteration (allows loop variable updates)
@@ -1387,6 +1556,8 @@ impl<'a> CompiledExecutor<'a> {
                                 if let Some(v) = content {
                                     node_outputs.insert(body_node.index, v);
                                 } else {
+                                    // Prefer unconditional data edges (branch value
+                                    // calc) over the DECIDE's conditional edge.
                                     let pred_value = self
                                         .plan
                                         .edges
@@ -1394,9 +1565,25 @@ impl<'a> CompiledExecutor<'a> {
                                         .filter(|e| {
                                             e.to_index == body_node.index
                                                 && e.kind == EdgeKind::Data
+                                                && e.condition.is_none()
                                         })
-                                        .filter_map(|e| node_outputs.get(&e.from_index).cloned())
-                                        .next_back();
+                                        .filter_map(|e| {
+                                            node_outputs.get(&e.from_index).cloned()
+                                        })
+                                        .next_back()
+                                        .or_else(|| {
+                                            self.plan
+                                                .edges
+                                                .iter()
+                                                .filter(|e| {
+                                                    e.to_index == body_node.index
+                                                        && e.kind == EdgeKind::Data
+                                                })
+                                                .filter_map(|e| {
+                                                    node_outputs.get(&e.from_index).cloned()
+                                                })
+                                                .next_back()
+                                        });
                                     if let Some(v) = pred_value {
                                         node_outputs.insert(body_node.index, v);
                                     } else {
@@ -1404,6 +1591,12 @@ impl<'a> CompiledExecutor<'a> {
                                     }
                                 }
                                 should_break = true;
+                            } else if action_type == "break" {
+                                // `break` marker'ı: loop'u bitir.
+                                should_break = true;
+                            } else if action_type == "continue" {
+                                // `continue` marker'ı: kalan gövdeyi atla.
+                                skip_rest = true;
                             } else {
                                 node_outputs.insert(
                                     body_node.index,
@@ -1419,7 +1612,7 @@ impl<'a> CompiledExecutor<'a> {
                     // Break kararı pause'dan önce onurlandırılır: decide zaten
                     // loop'u bitirdiyse pause'a takılıp bir sonraki segmentte
                     // loop yeniden başlamamalı.
-                    if should_break {
+                    if should_break || skip_rest {
                         break;
                     }
 
@@ -1436,6 +1629,52 @@ impl<'a> CompiledExecutor<'a> {
 
                 if should_break {
                     break;
+                }
+            }
+        }
+
+        // Continuation nodes fed only by loop-body producers (e.g. the return-expr
+        // calc after `for i in range(...)`) must run even when the body executed
+        // 0 times — their values come from context, not from body outputs.
+        if !loop_skipped.contains(&node.index) {
+            // Body hiç çalışmadıysa (0 iterasyon) veya erken break/continue'da
+            // son calcs üretilmediyse: saf okuma calc'lerini (output yazmayan)
+            // ctx'ten değerlendir ki continuation bunları tüketebilsin —
+            // örn. `return total` boş dizide total'i döner.
+            let body_set = loop_bodies.get(&node.index).cloned().unwrap_or_default();
+            for nd in &self.plan.nodes {
+                if !body_set.contains(&nd.index) || nd.op != Opcode::Calc {
+                    continue;
+                }
+                if nd.args.iter().any(|a| a.key == "output") {
+                    continue;
+                }
+                if node_outputs.contains_key(&nd.index) {
+                    continue;
+                }
+                if let Some(expr) = nd.args.iter().find(|a| a.key == "expr") {
+                    if let Ok(v) = eval_expression(&expr.value, ctx, node_outputs) {
+                        node_outputs.insert(nd.index, v);
+                    }
+                }
+            }
+            for nd in &self.plan.nodes {
+                if enabled.contains(&nd.index) || loop_skipped.contains(&nd.index) {
+                    continue;
+                }
+                let preds: Vec<u32> = self
+                    .plan
+                    .edges
+                    .iter()
+                    .filter(|e| e.to_index == nd.index && e.kind == EdgeKind::Data)
+                    .map(|e| e.from_index)
+                    .collect();
+                if !preds.is_empty()
+                    && preds
+                        .iter()
+                        .all(|p| loop_bodies.get(&node.index).map_or(false, |b| b.contains(p)))
+                {
+                    enabled.insert(nd.index);
                 }
             }
         }
@@ -1478,6 +1717,31 @@ impl<'a> CompiledExecutor<'a> {
     /// Control edges are handled separately: they increment the target's control_satisfied
     /// counter but do NOT directly enable the target (which must also check data edges).
     #[allow(clippy::too_many_arguments)]
+    /// Bir node'un "ölü dal"da olup olmadığı: DECIDE'dan gelen koşullu data
+    /// edge'lerinden biri, kaydedilmiş kararla uyuşmayan bir dalı işaret ediyorsa
+    /// o dal çalışmayacaktır. Karar henüz yoksa ölü sayılmaz (ertelenir).
+    fn is_branch_dead(&self, node_index: u32, node_outputs: &HashMap<u32, Value>) -> bool {
+        self.plan.edges.iter().any(|e| {
+            e.to_index == node_index
+                && e.kind == EdgeKind::Data
+                && matches!(
+                    self.plan.nodes.get(e.from_index as usize).map(|n| &n.op),
+                    Some(Opcode::Decide)
+                )
+                && e.condition
+                    .as_deref()
+                    .map(|c| c.eq_ignore_ascii_case("true") || c.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+                && match node_outputs.get(&e.from_index) {
+                    Some(Value::Bool(b)) => {
+                        let want = e.condition.as_deref().unwrap_or("").eq_ignore_ascii_case("true");
+                        *b != want
+                    }
+                    _ => false,
+                }
+        })
+    }
+
     fn propagate_edges(
         &self,
         node: &CompiledNode,
@@ -1519,8 +1783,26 @@ impl<'a> CompiledExecutor<'a> {
 
             let should_enable = match &edge.condition {
                 Some(ref condition) => {
-                    let result = eval_expression(condition, ctx, node_outputs)?;
-                    is_truthy(&result)
+                    // Branch edges from a DECIDE carry literal "true"/"false"
+                    // conditions that must be matched against the DECIDE's
+                    // computed decision value — not evaluated statically.
+                    let src_is_decide = matches!(
+                        self.plan.nodes.get(node.index as usize).map(|n| &n.op),
+                        Some(Opcode::Decide)
+                    );
+                    if src_is_decide
+                        && (condition == "true" || condition == "false")
+                        && matches!(node_outputs.get(&node.index), Some(Value::Bool(_)))
+                    {
+                        let decision = match node_outputs.get(&node.index) {
+                            Some(Value::Bool(b)) => *b,
+                            _ => false,
+                        };
+                        decision == (condition == "true")
+                    } else {
+                        let result = eval_expression(condition, ctx, node_outputs)?;
+                        is_truthy(&result)
+                    }
                 }
                 None => true,
             };
@@ -1631,6 +1913,141 @@ impl<'a> CompiledExecutor<'a> {
 
 // ─── Expression evaluation helpers ───────────────────────────────────
 
+// ── Accessor chain parsing (attribute + subscript) ──────────────────
+
+/// Bir accessor zincirinin parçası: `.field` veya `[key]`.
+enum Accessor {
+    /// `obj.field` — alan adı.
+    Field(String),
+    /// `obj[key]` — key ifadesi (runtime'da değerlendirilir).
+    Index(String),
+}
+
+/// `expr`'i top-level accessor zincirine böler: `(base, accessors)`.
+///
+/// Quote ve iç içe bracket duyarlı: `d["a.b"]`, `d[a["x"]]`, `items[0].name`
+/// doğru ayrışır. Zincirden sonra artık karakter varsa (`items[i] + 1`,
+/// `"x" + d["y"]`) `None` döner — aritmetik/concat dalları ifadeyi kendileri
+/// işler. Negatif sayılar ve float'lar buraya düşmez (önceki dallar yakalar).
+fn split_accessors(expr: &str) -> Option<(String, Vec<Accessor>)> {
+    let b = expr.as_bytes();
+    let n = expr.len();
+    let mut depth: i32 = 0;
+    let mut quote: Option<u8> = None;
+    let mut accessors: Vec<Accessor> = Vec::new();
+    let mut first_start: usize = 0;
+    let mut last_end: usize = 0;
+    let mut found = false;
+    let mut i: usize = 0;
+
+    while i < n {
+        let c = b[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => quote = Some(c),
+            b'[' if depth == 0 && i > 0 => {
+                let close = find_matching_bracket(expr, i)?;
+                let key = expr[i + 1..close].to_string();
+                if key.trim().is_empty() {
+                    return None;
+                }
+                accessors.push(Accessor::Index(key));
+                if !found {
+                    first_start = i;
+                    found = true;
+                }
+                last_end = close + 1;
+                i = close + 1;
+                continue;
+            }
+            b'.' if depth == 0 && i > 0 && i + 1 < n => {
+                let mut j = i + 1;
+                while j < n && !matches!(b[j], b'.' | b'[') {
+                    j += 1;
+                }
+                let field = expr[i + 1..j].trim();
+                if field.is_empty() {
+                    return None;
+                }
+                accessors.push(Accessor::Field(field.to_string()));
+                if !found {
+                    first_start = i;
+                    found = true;
+                }
+                last_end = j;
+                i = j;
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if !found {
+        return None;
+    }
+    if !expr[last_end..].trim().is_empty() {
+        return None;
+    }
+    let base = expr[..first_start].trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some((base.to_string(), accessors))
+}
+
+/// `expr[i]` bir `[` ise eşleşen `]` konumunu döndürür (quote + depth aware).
+fn find_matching_bracket(expr: &str, open: usize) -> Option<usize> {
+    let b = expr.as_bytes();
+    let mut depth: i32 = 1;
+    let mut quote: Option<u8> = None;
+    let mut j = open + 1;
+    while j < expr.len() {
+        let c = b[j];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            j += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => quote = Some(c),
+            b'[' | b'(' | b'{' => depth += 1,
+            b']' | b')' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Debug/error mesajları için değer tip adı.
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 /// Simple expression evaluator for CALC nodes and edge conditions.
 pub fn eval_expression(
     expr: &str,
@@ -1663,24 +2080,88 @@ pub fn eval_expression(
     }
 
     // range(...) — yalnızca loop bound olarak kullanılır (for i in range(n)).
-    if let Some(inner) = expr.strip_prefix("range(") {
-        if let Some(args_str) = inner.strip_suffix(')') {
-            let nums: Option<Vec<i64>> = args_str
-                .split(',')
-                .map(|a| a.trim().parse::<i64>().ok())
-                .collect();
-            if let Some(nums) = nums {
-                return match nums.as_slice() {
+    // İfade `range(...)` ile başlar ve eşleşen kapanış parantezi tam sonda
+    // olmalıdır (örn. `range(n) + 1` buraya düşmez).
+    if expr.starts_with("range(") {
+        if let Some(close) = find_matching_bracket(expr, 5) {
+            if close == expr.len() - 1 {
+                let args_str = &expr[6..close];
+                let parts = split_top_level_commas(args_str);
+                let args: Vec<&str> = parts
+                    .iter()
+                    .map(|a| a.trim())
+                    .filter(|a| !a.is_empty())
+                    .collect();
+                // Literal fast path: range(10), range(1, 5)
+                let nums: Option<Vec<i64>> = args
+                    .iter()
+                    .map(|a| a.parse::<i64>().ok())
+                    .collect();
+                if let Some(nums) = nums {
+                    return match nums.as_slice() {
+                        [stop] => Ok(Value::Int(*stop)),
+                        [start, stop] => Ok(Value::Int(stop - start)),
+                        [start, stop, step] if *step > 0 => {
+                            Ok(Value::Int((stop - start).max(0) / step))
+                        }
+                        _ => Err(ExecutionError::EvalError(format!(
+                            "cannot evaluate: {}",
+                            expr
+                        ))),
+                    };
+                }
+                // Dynamic path: range(len(items)), range(n), ... — argümanlar
+                // runtime'da değerlendirilir (ctx lookup, accessor zinciri vb.).
+                let mut vals: Vec<i64> = Vec::new();
+                for a in &args {
+                    match eval_expression(a, ctx, outputs)? {
+                        Value::Int(i) => vals.push(i),
+                        Value::Float(f) => vals.push(f as i64),
+                        v => {
+                            return Err(ExecutionError::EvalError(format!(
+                                "range() arguments must be integers, got: {}",
+                                type_name(&v)
+                            )));
+                        }
+                    }
+                }
+                return match vals.as_slice() {
                     [stop] => Ok(Value::Int(*stop)),
                     [start, stop] => Ok(Value::Int(stop - start)),
                     [start, stop, step] if *step > 0 => {
                         Ok(Value::Int((stop - start).max(0) / step))
                     }
+                    [_, _, _step] => Err(ExecutionError::EvalError(
+                        "range() step must be a positive integer".into(),
+                    )),
                     _ => Err(ExecutionError::EvalError(format!(
                         "cannot evaluate: {}",
                         expr
                     ))),
                 };
+            }
+        }
+    }
+
+    // len(...) — dizi/string/object uzunluğu: len(items), len(items[0].tags).
+    // Tırnaklı literal (`"len(x)"`) string olarak döner — builtin değildir.
+    // `len(s) + len(d)` gibi ifadelerde eşleşen kapanış tam sonda olmalıdır.
+    if !was_quoted && expr.starts_with("len(") {
+        if let Some(close) = find_matching_bracket(expr, 3) {
+            if close == expr.len() - 1 {
+                let arg = expr[4..close].trim();
+                if !arg.is_empty() {
+                    let val = eval_expression(arg, ctx, outputs)?;
+                    return match &val {
+                        Value::Array(a) => Ok(Value::Int(a.len() as i64)),
+                        Value::String(s) => Ok(Value::Int(s.chars().count() as i64)),
+                        Value::Object(m) => Ok(Value::Int(m.len() as i64)),
+                        v => Err(ExecutionError::EvalError(format!(
+                            "len() requires an array, string or object, got: {}",
+                            type_name(v)
+                        ))),
+                    };
+                }
             }
         }
     }
@@ -1834,30 +2315,104 @@ pub fn eval_expression(
         }
     }
 
-    // Attribute access: obj.field → Object'ten alan okuma (r.body gibi).
-    // Float parse önce yapıldığı için 3.14 buraya düşmez.
-    if let Some(dot) = expr.rfind('.') {
-        if dot > 0 && dot < expr.len() - 1 {
-            let base = &expr[..dot];
-            let field = &expr[dot + 1..];
-            if let Ok(base_val) = eval_expression(base, ctx, outputs) {
-                match base_val {
-                    Value::Object(m) => {
-                        if let Some(v) = m.get(field) {
-                            return Ok(v.clone());
+    // Attribute/subscript zinciri: obj.field, items[i], items[i].name, d["a"]["b"].
+    // Strict semantik: eksik anahtar/indeks, null subscript ve tip uyuşmazlığı
+    // açık hata verir — opsiyonel erişim için `dict.get` / `array.find` tool'ları.
+    // Quoted literal'ler (`"a.b"`, `"text.reverse"`) tam çözülemezse olduğu gibi
+    // string döner (was_quoted) — eski davranışla uyumlu.
+    if let Some((base, accessors)) = split_accessors(expr) {
+        let quoted_fail = |msg: String| -> Result<Value, ExecutionError> {
+            if was_quoted {
+                Ok(Value::String(expr.to_string()))
+            } else {
+                Err(ExecutionError::EvalError(msg))
+            }
+        };
+        let base_val = match eval_expression(&base, ctx, outputs) {
+            Ok(v) => v,
+            Err(_) => {
+                return quoted_fail(format!("cannot evaluate: {}", expr));
+            }
+        };
+        let mut v = base_val;
+        for acc in &accessors {
+            match acc {
+                Accessor::Field(name) => match v {
+                    Value::Object(m) => match m.get(name) {
+                        Some(val) => v = val.clone(),
+                        None => {
+                            return quoted_fail(format!("cannot evaluate: {}", expr));
                         }
-                    }
+                    },
                     Value::Array(items) => {
-                        if let Ok(idx) = field.parse::<usize>() {
-                            if let Some(v) = items.get(idx) {
-                                return Ok(v.clone());
+                        if let Ok(idx) = name.parse::<usize>() {
+                            if let Some(val) = items.get(idx) {
+                                v = val.clone();
+                                continue;
                             }
                         }
+                        return quoted_fail(format!("cannot evaluate: {}", expr));
                     }
-                    _ => {}
+                    _ => {
+                        return quoted_fail(format!("cannot evaluate: {}", expr));
+                    }
+                },
+                Accessor::Index(key_str) => {
+                    let key_val = eval_expression(key_str, ctx, outputs)?;
+                    match (v, key_val) {
+                        (Value::Array(items), Value::Int(i)) => {
+                            let len = items.len() as i64;
+                            // Negatif indeks: Python semantiği (len + i).
+                            let idx = if i < 0 { len + i } else { i };
+                            if idx < 0 || idx >= len {
+                                return quoted_fail(format!(
+                                    "subscript: index {} out of bounds (len {})",
+                                    i, len
+                                ));
+                            }
+                            v = items[idx as usize].clone();
+                        }
+                        (Value::Object(m), Value::String(k)) => match m.get(&k) {
+                            Some(val) => v = val.clone(),
+                            None => {
+                                return quoted_fail(format!(
+                                    "subscript: key \"{}\" not found",
+                                    k
+                                ));
+                            }
+                        },
+                        (Value::Object(m), Value::Int(k)) => {
+                            let ks = k.to_string();
+                            match m.get(&ks) {
+                                Some(val) => v = val.clone(),
+                                None => {
+                                    return quoted_fail(format!(
+                                        "subscript: key \"{}\" not found",
+                                        ks
+                                    ));
+                                }
+                            }
+                        }
+                        (Value::Array(_), Value::String(k)) => {
+                            return quoted_fail(format!(
+                                "subscript: array cannot be indexed by string \"{}\"",
+                                k
+                            ));
+                        }
+                        (Value::Null, _) => {
+                            return quoted_fail("subscript: cannot subscript null".to_string());
+                        }
+                        (v, _) => {
+                            return quoted_fail(format!(
+                                "subscript: cannot subscript value of type {}",
+                                type_name(&v)
+                            ));
+                        }
+                    }
                 }
             }
         }
+        return Ok(v);
     }
 
     if was_quoted {
@@ -1882,8 +2437,9 @@ fn resolve_numeric(key: &str, ctx: &Context, outputs: &HashMap<u32, Value>) -> O
             return Some(f as i64);
         }
     }
-    // Attribute/subscript expressions: "c.count" — evaluate like eval_expression
-    if key.contains('.') || key.contains('[') {
+    // Attribute/subscript/call expressions: "c.count", "items[i]", "len(items)" —
+    // evaluate like eval_expression.
+    if key.contains('.') || key.contains('[') || key.contains('(') {
         if let Ok(val) = eval_expression(key, ctx, outputs) {
             if let Some(f) = val.as_f64() {
                 return Some(f as i64);
@@ -1901,6 +2457,11 @@ fn trim_quotes(value: &str) -> &str {
 
 pub fn resolve_arg_value(value_str: &str, ctx: &Context, outputs: &HashMap<u32, Value>) -> Value {
     let s = value_str.trim();
+    // Yeni format `"x"` → tırnaklı string her zaman LITERAL'dır: ctx değişkeniyle
+    // isim çakışması literal'i ezmemeli (örn. key="product_id" + input product_id).
+    if s.starts_with('"') && s.ends_with('"') && !is_concat_expr(s) {
+        return Value::String(trim_quotes(s).to_string());
+    }
     // Strip JSON string quotes for context lookup
     let clean = trim_quotes(s);
     // Try context first (e.g. source="x" → ctx.get("x"))
@@ -2060,64 +2621,6 @@ fn is_truthy(val: &Value) -> bool {
     }
 }
 
-fn evaluate_condition(source: &Value, op: &str, compare: &Value) -> Result<bool, ExecutionError> {
-    fn numeric_pair<'a>(
-        a: &'a Value,
-        b: &'a Value,
-        op: &str,
-    ) -> Result<(f64, f64), ExecutionError> {
-        let a = value_to_f64(a).ok_or_else(|| {
-            ExecutionError::ConditionError(format!(
-                "condition '{op}': operand '{}' is not numeric",
-                format_value(a)
-            ))
-        })?;
-        let b = value_to_f64(b).ok_or_else(|| {
-            ExecutionError::ConditionError(format!(
-                "condition '{op}': operand '{}' is not numeric",
-                format_value(b)
-            ))
-        })?;
-        Ok((a, b))
-    }
-
-    match op {
-        "eq" => Ok(source == compare),
-        "neq" => Ok(source != compare),
-        "gt" => {
-            let (a, b) = numeric_pair(source, compare, op)?;
-            Ok(a > b)
-        }
-        "gte" => {
-            let (a, b) = numeric_pair(source, compare, op)?;
-            Ok(a >= b)
-        }
-        "lt" => {
-            let (a, b) = numeric_pair(source, compare, op)?;
-            Ok(a < b)
-        }
-        "lte" => {
-            let (a, b) = numeric_pair(source, compare, op)?;
-            Ok(a <= b)
-        }
-        "contains" => {
-            let a = match source {
-                Value::String(s) => s.clone(),
-                _ => format!("{:?}", source),
-            };
-            let b = match compare {
-                Value::String(s) => s.clone(),
-                _ => format!("{:?}", compare),
-            };
-            Ok(a.contains(&b))
-        }
-        _ => Err(ExecutionError::ConditionError(format!(
-            "unknown operator: {}",
-            op
-        ))),
-    }
-}
-
 // ── Shared eval helpers ──
 
 /// Compare two Values for equality, supporting cross-type comparisons.
@@ -2257,6 +2760,256 @@ mod tests {
         );
     }
 
+    // ── len() / range() builtin tests ────────────────────────────
+
+    #[test]
+    fn test_eval_len_builtin() {
+        let outputs = HashMap::new();
+        let items = Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let ctx = eval_ctx(&[("items", items)]);
+        assert_eq!(
+            eval_expression("len(items)", &ctx, &outputs).unwrap(),
+            Value::Int(3)
+        );
+        assert_eq!(
+            eval_expression("len(items) + 1", &ctx, &outputs).unwrap(),
+            Value::Int(4)
+        );
+
+        let sctx = eval_ctx(&[("s", Value::String("merhaba".into()))]);
+        assert_eq!(
+            eval_expression("len(s)", &sctx, &outputs).unwrap(),
+            Value::Int(7)
+        );
+
+        let mut d = HashMap::new();
+        d.insert("a".into(), Value::Int(1));
+        d.insert("b".into(), Value::Int(2));
+        let octx = eval_ctx(&[("d", Value::Object(d))]);
+        assert_eq!(
+            eval_expression("len(d)", &octx, &outputs).unwrap(),
+            Value::Int(2)
+        );
+
+        let ictx = eval_ctx(&[("n", Value::Int(5))]);
+        let err = eval_expression("len(n)", &ictx, &outputs)
+            .expect_err("len of an int must error");
+        assert!(err.to_string().contains("requires an array"));
+
+        // Quoted literal stays a string — not a builtin call.
+        assert_eq!(
+            eval_expression("\"len(items)\"", &ctx, &outputs).unwrap(),
+            Value::String("len(items)".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_range_dynamic_args() {
+        let outputs = HashMap::new();
+        let ctx = eval_ctx(&[("n", Value::Int(4))]);
+        assert_eq!(
+            eval_expression("range(n)", &ctx, &outputs).unwrap(),
+            Value::Int(4)
+        );
+        assert_eq!(
+            eval_expression("range(1, n)", &ctx, &outputs).unwrap(),
+            Value::Int(3)
+        );
+        assert_eq!(
+            eval_expression("range(0, n, 2)", &ctx, &outputs).unwrap(),
+            Value::Int(2)
+        );
+        // Literal path unchanged
+        assert_eq!(
+            eval_expression("range(5)", &ctx, &outputs).unwrap(),
+            Value::Int(5)
+        );
+    }
+
+    // ── Subscript / attribute chain tests ──────────────────────────
+
+    fn eval_ctx(pairs: &[(&str, Value)]) -> Context {
+        let mut ctx = Context::new();
+        for (k, v) in pairs {
+            ctx.set(k.to_string(), v.clone());
+        }
+        ctx
+    }
+
+    fn cart_fixture() -> Value {
+        let mut o1 = HashMap::new();
+        o1.insert("product_id".into(), Value::Int(101));
+        o1.insert("name".into(), Value::String("elma".into()));
+        o1.insert("qty".into(), Value::Int(2));
+        let mut o2 = HashMap::new();
+        o2.insert("product_id".into(), Value::Int(202));
+        o2.insert("name".into(), Value::String("armut".into()));
+        o2.insert("qty".into(), Value::Int(1));
+        Value::Array(vec![Value::Object(o1), Value::Object(o2)])
+    }
+
+    #[test]
+    fn test_eval_subscript_dict_constant_key() {
+        let mut d = HashMap::new();
+        d.insert("key".into(), Value::Int(42));
+        d.insert("a.b".into(), Value::String("dot".into()));
+        let ctx = eval_ctx(&[("d", Value::Object(d))]);
+        let outputs = HashMap::new();
+        assert_eq!(
+            eval_expression("d[\"key\"]", &ctx, &outputs).unwrap(),
+            Value::Int(42)
+        );
+        // Key içinde nokta: quote-aware ayrıştırma
+        assert_eq!(
+            eval_expression("d[\"a.b\"]", &ctx, &outputs).unwrap(),
+            Value::String("dot".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_subscript_array_index() {
+        let ctx = eval_ctx(&[
+            ("items", Value::Array(vec![Value::Int(10), Value::Int(20), Value::Int(30)])),
+            ("i", Value::Int(1)),
+        ]);
+        let outputs = HashMap::new();
+        assert_eq!(
+            eval_expression("items[i]", &ctx, &outputs).unwrap(),
+            Value::Int(20)
+        );
+        assert_eq!(
+            eval_expression("items[2]", &ctx, &outputs).unwrap(),
+            Value::Int(30)
+        );
+        // Negatif indeks — Python semantiği
+        assert_eq!(
+            eval_expression("items[-1]", &ctx, &outputs).unwrap(),
+            Value::Int(30)
+        );
+        assert_eq!(
+            eval_expression("items[-3]", &ctx, &outputs).unwrap(),
+            Value::Int(10)
+        );
+        // Aritmetik ifadeli anahtar: items[i + 1]
+        assert_eq!(
+            eval_expression("items[i + 1]", &ctx, &outputs).unwrap(),
+            Value::Int(30)
+        );
+    }
+
+    #[test]
+    fn test_eval_subscript_chain() {
+        let ctx = eval_ctx(&[("cart", cart_fixture()), ("i", Value::Int(1))]);
+        let outputs = HashMap::new();
+        // items[i].name zinciri
+        assert_eq!(
+            eval_expression("cart[i].name", &ctx, &outputs).unwrap(),
+            Value::String("armut".into())
+        );
+        // İç içe subscript: cart[i]["product_id"]
+        assert_eq!(
+            eval_expression("cart[i][\"product_id\"]", &ctx, &outputs).unwrap(),
+            Value::Int(202)
+        );
+        // int key → to_string lookup
+        let mut m = HashMap::new();
+        m.insert("5".into(), Value::String("five".into()));
+        let ctx2 = eval_ctx(&[("d", Value::Object(m))]);
+        assert_eq!(
+            eval_expression("d[5]", &ctx2, &outputs).unwrap(),
+            Value::String("five".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_subscript_missing_errors() {
+        let ctx = eval_ctx(&[
+            ("d", Value::Object(HashMap::new())),
+            ("items", Value::Array(vec![Value::Int(1)])),
+        ]);
+        let outputs = HashMap::new();
+        let err = eval_expression("d[\"x\"]", &ctx, &outputs).unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "expected not found, got: {err}"
+        );
+        let err = eval_expression("items[5]", &ctx, &outputs).unwrap_err();
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "expected out of bounds, got: {err}"
+        );
+        let err = eval_expression("items[-2]", &ctx, &outputs).unwrap_err();
+        assert!(err.to_string().contains("out of bounds"));
+        // Tip uyuşmazlığı: array string key ile
+        let err = eval_expression("items[\"x\"]", &ctx, &outputs).unwrap_err();
+        assert!(
+            err.to_string().contains("string"),
+            "expected string error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_eval_subscript_null_base_errors() {
+        let mut d = HashMap::new();
+        d.insert("a".into(), Value::Null);
+        let ctx = eval_ctx(&[("d", Value::Object(d))]);
+        let outputs = HashMap::new();
+        let err = eval_expression("d[\"a\"][\"b\"]", &ctx, &outputs).unwrap_err();
+        assert!(
+            err.to_string().contains("null"),
+            "expected null error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_eval_subscript_arithmetic_and_concat() {
+        let ctx = eval_ctx(&[
+            ("items", Value::Array(vec![Value::Int(10), Value::Int(20)])),
+            ("d", {
+                let mut m = HashMap::new();
+                m.insert("n".into(), Value::Int(5));
+                m.insert("s".into(), Value::String("ab".into()));
+                Value::Object(m)
+            }),
+        ]);
+        let outputs = HashMap::new();
+        // Aritmetik: items[0] + items[1]
+        assert_eq!(
+            eval_expression("items[0] + items[1]", &ctx, &outputs).unwrap(),
+            Value::Int(30)
+        );
+        // Concat: "a" + d["s"]
+        assert_eq!(
+            eval_expression("\"x\" + d[\"s\"]", &ctx, &outputs).unwrap(),
+            Value::String("xab".into())
+        );
+        // items[i] == 5 karşılaştırması
+        let ctx2 = eval_ctx(&[("items", Value::Array(vec![Value::Int(5)]))]);
+        assert_eq!(
+            eval_expression("items[0] == 5", &ctx2, &outputs).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_eval_quoted_strings_with_dots_stay_strings() {
+        let ctx = Context::new();
+        let outputs = HashMap::new();
+        // Tool adları / literal string'ler attribute olarak yorumlanmaz
+        assert_eq!(
+            eval_expression("\"text.reverse\"", &ctx, &outputs).unwrap(),
+            Value::String("text.reverse".into())
+        );
+        assert_eq!(
+            eval_expression("\"a.b\"", &ctx, &outputs).unwrap(),
+            Value::String("a.b".into())
+        );
+        assert_eq!(
+            eval_expression("\"d[x]\"", &ctx, &outputs).unwrap(),
+            Value::String("d[x]".into())
+        );
+    }
+
     // ── Integration tests ─────────────────────────────────────────
 
     #[test]
@@ -2349,15 +3102,13 @@ mod tests {
             vec![
                 Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
                 Node::new("decide1", Opcode::Decide)
-                    .with_arg("source", "x".into())
-                    .with_arg("op", "gt".into())
-                    .with_arg("value", 0i64.into()),
+                    .with_arg("condition", "x > 0".into()),
                 Node::new("true_branch", Opcode::Act)
                     .with_arg("type", "return".into())
-                    .with_arg("value", "\"ok\"".into()),
+                    .with_arg("value", "\"yes\"".into()),
                 Node::new("false_branch", Opcode::Act)
                     .with_arg("type", "return".into())
-                    .with_arg("value", "\"ok\"".into()),
+                    .with_arg("value", "\"no\"".into()),
             ],
             vec![
                 Edge::new("input1", "decide1"),
@@ -2372,7 +3123,7 @@ mod tests {
         inputs.set("x".into(), Value::Int(5));
         let result = executor.execute(inputs).expect("execution should succeed");
         // Should have executed true_branch (3 nodes: input1, decide1, true_branch)
-        assert!(result.output.is_some(), "should have output");
+        assert_eq!(result.output, Some(Value::String("yes".into())));
         assert_eq!(result.node_count, 3);
     }
 
@@ -2382,15 +3133,13 @@ mod tests {
             vec![
                 Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
                 Node::new("decide1", Opcode::Decide)
-                    .with_arg("source", "x".into())
-                    .with_arg("op", "gt".into())
-                    .with_arg("value", 0i64.into()),
+                    .with_arg("condition", "x > 0".into()),
                 Node::new("true_branch", Opcode::Act)
                     .with_arg("type", "return".into())
-                    .with_arg("value", "\"ok\"".into()),
+                    .with_arg("value", "\"yes\"".into()),
                 Node::new("false_branch", Opcode::Act)
                     .with_arg("type", "return".into())
-                    .with_arg("value", "\"ok\"".into()),
+                    .with_arg("value", "\"no\"".into()),
             ],
             vec![
                 Edge::new("input1", "decide1"),
@@ -2404,29 +3153,117 @@ mod tests {
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(-5));
         let result = executor.execute(inputs).expect("execution should succeed");
-        // Should have executed false_branch
-        assert!(result.output.is_some());
+        // Should have executed false_branch (3 nodes: input1, decide1, false_branch)
+        assert_eq!(result.output, Some(Value::String("no".into())));
         assert_eq!(result.node_count, 3);
     }
 
     #[test]
-    fn test_evaluate_condition_type_mismatch_errors() {
-        let err = evaluate_condition(&Value::String("abc".into()), "lt", &Value::Int(5))
-            .expect_err("non-numeric source must error");
-        assert!(matches!(err, ExecutionError::ConditionError(_)));
-        assert!(err.to_string().contains("not numeric"));
+    fn test_compiled_execute_decide_early_return_fallthrough() {
+        // `if x > 0: return "pos"` + fallthrough `return "nonpos"`:
+        // the true-branch return's value must come from its branch calc
+        // (not the DECIDE's boolean), and the false path must reach the
+        // MERGE-gated return only when the condition is false.
+        let plan = ExecutionPlan::new(
+            vec![
+                Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
+                Node::new("calc1", Opcode::Calc).with_arg("expr", "x > 0".into()),
+                Node::new("decide1", Opcode::Decide)
+                    .with_arg("condition", "x > 0".into()),
+                Node::new("calc_true", Opcode::Calc).with_arg("expr", "\"pos\"".into()),
+                Node::new("act_true", Opcode::Act).with_arg("type", "return".into()),
+                Node::new("merge1", Opcode::Merge),
+                Node::new("calc_false", Opcode::Calc).with_arg("expr", "\"nonpos\"".into()),
+                Node::new("act_false", Opcode::Act).with_arg("type", "return".into()),
+            ],
+            vec![
+                Edge::new("input1", "calc1"),
+                Edge::new("calc1", "decide1"),
+                Edge::new("calc_true", "act_true"),
+                Edge::with_condition("decide1", "act_true", "true"),
+                Edge::with_condition("decide1", "merge1", "false"),
+                Edge::new("calc_false", "act_false"),
+                Edge::control("merge1", "act_false"),
+            ],
+        );
+        let compiled = compile_plan(plan);
+        let registry = mock_tools();
 
-        let err = evaluate_condition(&Value::Int(5), "gte", &Value::String("5".into()))
-            .expect_err("non-numeric compare must error");
-        assert!(matches!(err, ExecutionError::ConditionError(_)));
+        let executor = CompiledExecutor::new(&compiled, &registry);
+        let mut inputs = Context::new();
+        inputs.set("x".into(), Value::Int(5));
+        let result = executor.execute(inputs).expect("true path should succeed");
+        assert_eq!(result.output, Some(Value::String("pos".into())));
 
-        let ok = evaluate_condition(&Value::Int(3), "lt", &Value::Int(5))
-            .expect("numeric compare must succeed");
-        assert!(ok);
+        let executor = CompiledExecutor::new(&compiled, &registry);
+        let mut inputs = Context::new();
+        inputs.set("x".into(), Value::Int(-5));
+        let result = executor.execute(inputs).expect("false path should succeed");
+        assert_eq!(result.output, Some(Value::String("nonpos".into())));
+    }
 
-        let ok = evaluate_condition(&Value::Float(5.5), "gte", &Value::Int(5))
-            .expect("int/float mixed compare must succeed");
-        assert!(ok);
+    #[test]
+    fn test_compiled_execute_dead_branch_isolation() {
+        // `if item == null: return {"found": false}` + fallthrough reading
+        // `item.name`: when the true branch is taken, the fallthrough producer
+        // (control-gated by the MERGE) never runs, so the return calc that is
+        // data-fed by it must be deferred too — a strict subscript on null
+        // must never fire from a dead path.
+        let plan = ExecutionPlan::new(
+            vec![
+                Node::new("input1", Opcode::Input).with_arg("name", "item".into()),
+                Node::new("calc1", Opcode::Calc).with_arg("expr", "item == null".into()),
+                Node::new("decide1", Opcode::Decide)
+                    .with_arg("condition", "item == null".into()),
+                Node::new("calc_true", Opcode::Calc)
+                    .with_arg("expr", "{\"found\": false}".into()),
+                Node::new("act_true", Opcode::Act).with_arg("type", "return".into()),
+                Node::new("merge1", Opcode::Merge),
+                Node::new("calc_qty", Opcode::Calc).with_arg("expr", "item.qty".into()),
+                Node::new("calc_val", Opcode::Calc).with_arg("expr", "item.name".into()),
+                Node::new("act_false", Opcode::Act).with_arg("type", "return".into()),
+            ],
+            vec![
+                Edge::new("input1", "calc1"),
+                Edge::new("calc1", "decide1"),
+                Edge::new("calc_true", "act_true"),
+                Edge::with_condition("decide1", "act_true", "true"),
+                Edge::with_condition("decide1", "merge1", "false"),
+                Edge::control("merge1", "calc_qty"),
+                Edge::new("input1", "calc_val"),
+                Edge::new("calc_qty", "calc_val"),
+                Edge::new("calc_val", "act_false"),
+                Edge::control("calc_qty", "act_false"),
+            ],
+        );
+        let compiled = compile_plan(plan);
+        let registry = mock_tools();
+
+        // Miss: item is null — early return must fire, fallthrough must not run.
+        let executor = CompiledExecutor::new(&compiled, &registry);
+        let mut inputs = Context::new();
+        inputs.set("item".into(), Value::Null);
+        let result = executor.execute(inputs).expect("miss path should succeed");
+        let mut expected = HashMap::new();
+        expected.insert("found".to_string(), Value::Bool(false));
+        assert_eq!(result.output, Some(Value::Object(expected)));
+        assert!(
+            !result
+                .execution_order
+                .iter()
+                .any(|id| id == "calc_qty" || id == "calc_val"),
+            "fallthrough nodes must not run on the early-return path"
+        );
+
+        // Hit: item has a name — fallthrough runs and returns it.
+        let executor = CompiledExecutor::new(&compiled, &registry);
+        let mut inputs = Context::new();
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), Value::String("elma".into()));
+        item.insert("qty".to_string(), Value::Int(2));
+        inputs.set("item".into(), Value::Object(item));
+        let result = executor.execute(inputs).expect("hit path should succeed");
+        assert_eq!(result.output, Some(Value::String("elma".into())));
     }
 
     #[test]
@@ -2531,6 +3368,20 @@ mod tests {
         let outputs = HashMap::new();
         let v = resolve_arg_value("users_resp.body", &ctx, &outputs);
         assert_eq!(v, Value::String("{\"a\": 1}".into()));
+    }
+
+    #[test]
+    fn test_resolve_arg_value_quoted_literal_beats_ctx_collision() {
+        // Tırnaklı literal, aynı isimde ctx değişkeniyle çakışsa bile literal kalmalı:
+        // `call("array.find", key="product_id", ...)` + input `product_id` aynı anda olabilir.
+        let mut ctx = Context::new();
+        ctx.set("product_id".into(), Value::Int(101));
+        let outputs = HashMap::new();
+        let v = resolve_arg_value("\"product_id\"", &ctx, &outputs);
+        assert_eq!(v, Value::String("product_id".into()));
+        // Tırnaksız token hâlâ ctx referansı.
+        let v = resolve_arg_value("product_id", &ctx, &outputs);
+        assert_eq!(v, Value::Int(101));
     }
 
     #[test]
@@ -3045,15 +3896,12 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_from_fb_matches_bincode() {
-        // Same plan, both formats → same execution result
+    fn test_execute_from_fb() {
         let plan = ExecutionPlan::new(
             vec![
                 Node::new("input1", Opcode::Input).with_arg("name", "x".into()),
                 Node::new("decide1", Opcode::Decide)
-                    .with_arg("source", "x".into())
-                    .with_arg("op", "gt".into())
-                    .with_arg("value", 0i64.into()),
+                    .with_arg("condition", "x > 0".into()),
                 Node::new("true_branch", Opcode::Act)
                     .with_arg("type", "return".into())
                     .with_arg("value", "\"ok\"".into()),
@@ -3068,26 +3916,17 @@ mod tests {
             ],
         );
         let compiled = compile_plan(plan);
-        let bincode_bytes = compiled.to_bytes().expect("bincode serialize");
         let fb_bytes = compiled.to_fb_bytes().expect("FB serialize");
 
         let registry = mock_tools();
         let mut inputs = Context::new();
         inputs.set("x".into(), Value::Int(10));
 
-        // Execute from bincode
-        let plan_bincode = CompiledPlan::from_bytes(&bincode_bytes).unwrap();
-        let exec_bincode = CompiledExecutor::new(&plan_bincode, &registry);
-        let result_bincode = exec_bincode.execute(inputs.clone()).expect("bincode exec");
-
-        // Execute from FB
         let plan_fb = CompiledPlan::from_fb_bytes(&fb_bytes).expect("FB deserialize");
         let exec_fb = CompiledExecutor::new(&plan_fb, &registry);
         let result_fb = exec_fb.execute(inputs).expect("FB exec");
 
-        assert_eq!(result_bincode.output, result_fb.output);
-        assert_eq!(result_bincode.node_count, result_fb.node_count);
-        assert_eq!(result_bincode.execution_order, result_fb.execution_order);
+        assert_eq!(result_fb.output, Some(Value::String("ok".into())));
     }
 
     #[test]

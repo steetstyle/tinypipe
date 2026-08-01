@@ -302,8 +302,10 @@ pub fn validate(plan: &ExecutionPlan) -> Result<(), Vec<ValidationError>> {
             .unwrap_or(&[]);
         match node.op {
             Opcode::Decide | Opcode::Switch => {
-                // Branch nodes must have exactly 2 outgoing edges with conditions
-                if out_edges.len() != 2 {
+                // Branch nodes must have at least 2 outgoing edges with conditions
+                // (true+false). Ek conditional edge'ler meşrudur: dal zincirinin
+                // ilk node'unu gate'leyen branch-membership kenarları.
+                if out_edges.len() < 2 {
                     errors.push(ValidationError {
                         node_id: node.id.clone(),
                         message: format!(

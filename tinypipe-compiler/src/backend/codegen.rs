@@ -1,15 +1,13 @@
-//! Codegen — Opcode AST (ExecutionPlan) → CompiledPlan (binary FlatBuffers/bincode, uint32 index'ler).
+//! Codegen — Opcode AST (ExecutionPlan) → CompiledPlan (binary FlatBuffers, uint32 index'ler).
 //!
 //! v1 codegen: JSON-based `ExecutionPlan` (string ID'ler, O(n) linear scan).
-//! v2 codegen: `CompiledPlan` (uint32 index'ler, O(1) random access, dual-format).
+//! v2 codegen: `CompiledPlan` (uint32 index'ler, O(1) random access, FlatBuffers).
 //!
 //! # Akış
 //!
 //! 1. Optimize: `optimize::optimize_all(plan)` — constant folding, dead node elimination
 //! 2. Compile: `CompiledPlan::from_execution_plan(plan, optimizations)` — string→uint32 mapping
-//! 3. Serialize:
-//!    - `bincode::serialize(&compiled)` → `binary` (legacy)
-//!    - `compiled.to_fb_bytes()` → `fb_binary` (canonical, cross-language)
+//! 3. Serialize: `compiled.to_fb_bytes()` → `fb_binary` (canonical, cross-language)
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -36,11 +34,9 @@ impl std::fmt::Display for CodegenError {
 pub struct CodegenOutput {
     /// The finalized compiled plan.
     pub compiled: CompiledPlan,
-    /// Binary serialization (bincode).
-    pub binary: Vec<u8>,
     /// FlatBuffers serialization (canonical format).
     pub fb_binary: Vec<u8>,
-    /// Number of bytes in the bincode binary output.
+    /// Number of bytes in the FlatBuffers output.
     pub binary_size_bytes: usize,
     /// Topological node order (string IDs, for backward compat).
     pub execution_order: Vec<String>,
@@ -54,7 +50,7 @@ pub struct CodegenOutput {
 /// 1. Run optimization passes (constant folding, dead node elimination)
 /// 2. Fill in compilation metadata
 /// 3. Convert string IDs → uint32 indices
-/// 4. Serialize to bincode binary
+/// 4. Serialize to FlatBuffers binary
 ///
 /// `schema_hashes` is an optional map from tool name → schema hash,
 /// populated at compile time from the tool registry. When empty,
@@ -154,44 +150,19 @@ pub fn codegen_with_schema_hashes(
     // Step 3: Convert to CompiledPlan
     let compiled = CompiledPlan::from_execution_plan(&plan, optimizations.clone());
 
-    // Step 4: Serialize to bincode + FlatBuffers binary
-    let binary = bincode::serialize(&compiled).map_err(|e| CodegenError {
-        message: format!("bincode serialisation failed: {}", e),
-    })?;
-    let binary_size_bytes = binary.len();
+    // Step 4: Serialize to FlatBuffers binary
     let fb_binary = compiled.to_fb_bytes().map_err(|e| CodegenError {
         message: format!("FlatBuffers serialisation failed: {}", e),
     })?;
+    let binary_size_bytes = fb_binary.len();
 
     Ok(CodegenOutput {
         compiled,
-        binary,
         fb_binary,
         binary_size_bytes,
         execution_order,
         optimizations,
     })
-}
-
-/// Legacy codegen: JSON-based (v1). Useful for debugging and testing.
-pub fn codegen_json(
-    plan: ExecutionPlan,
-) -> Result<(tinypipe_ir::plan::ExecutionPlan, String), CodegenError> {
-    let mut plan = plan;
-
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    plan.metadata.compiled_at = format!("{}", now);
-    plan.metadata.node_count = plan.nodes.len() as u32;
-    plan.metadata.edge_count = plan.edges.len() as u32;
-
-    let json = serde_json::to_string_pretty(&plan).map_err(|e| CodegenError {
-        message: format!("JSON serialisation failed: {}", e),
-    })?;
-
-    Ok((plan, json))
 }
 
 #[cfg(test)]
@@ -223,20 +194,21 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_binary_roundtrip() {
+    fn test_codegen_fb_roundtrip() {
         let output = codegen(sample_plan()).expect("codegen should succeed");
-        let deserialized = CompiledPlan::from_bytes(&output.binary).expect("deserialize");
+        let deserialized =
+            CompiledPlan::from_fb_bytes(&output.fb_binary).expect("deserialize");
         assert_eq!(output.compiled, deserialized);
     }
 
     #[test]
-    fn test_codegen_binary_smaller_than_json() {
+    fn test_codegen_fb_smaller_than_json() {
         let output = codegen(sample_plan()).expect("codegen should succeed");
         let json = serde_json::to_string(&output.compiled).unwrap();
         assert!(
-            output.binary.len() < json.len(),
+            output.fb_binary.len() < json.len(),
             "binary ({} bytes) should be smaller than JSON ({} bytes)",
-            output.binary.len(),
+            output.fb_binary.len(),
             json.len()
         );
     }
@@ -296,14 +268,6 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_json_v1_legacy() {
-        let (plan, json) = codegen_json(sample_plan()).expect("JSON codegen should succeed");
-        assert!(!json.is_empty());
-        assert_eq!(plan.metadata.node_count, 3);
-        assert_eq!(plan.metadata.edge_count, 2);
-    }
-
-    #[test]
     fn test_codegen_all_opcodes() {
         // Prove all 11 opcodes pass through codegen generically.
         // Each opcode is handled by CompiledPlan::from_execution_plan() which
@@ -358,8 +322,9 @@ mod tests {
                 op
             );
         }
-        // Binary serialization roundtrip
-        let deserialized = CompiledPlan::from_bytes(&output.binary).expect("binary roundtrip");
+        // FlatBuffers serialization roundtrip
+        let deserialized =
+            CompiledPlan::from_fb_bytes(&output.fb_binary).expect("FB roundtrip");
         assert_eq!(output.compiled, deserialized);
     }
 }

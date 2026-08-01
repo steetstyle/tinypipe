@@ -43,8 +43,6 @@ pub enum ExecutionError {
     CallFailed(String, String),
     #[error("Expression evaluation failed: {0}")]
     EvalError(String),
-    #[error("Branch condition evaluation failed: {0}")]
-    ConditionError(String),
     #[error("LOOP iteration limit ({0}) exceeded")]
     LoopLimitExceeded(u32),
     #[error("Execution time limit ({0}ms) exceeded")]

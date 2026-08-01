@@ -5,8 +5,10 @@
 //!
 //! Ağır bağımlılıklar (ureq, postgres) yalnızca ilgili tool dosyasında kullanılır.
 
+pub mod array_find;
 pub mod array_len;
 pub mod count_where;
+pub mod dict_get;
 pub mod echo;
 pub mod env;
 pub mod http_request;
@@ -50,7 +52,8 @@ pub fn mock_tools() -> MockToolRegistry {
 }
 
 /// Tam registry: temel tool'lar + gerçek `http_request` + `postgres`
-/// + JSON/array yardımcıları (`json.parse`, `array.len`, `list.get`, `array.count_where`).
+/// + JSON/array yardımcıları (`json.parse`, `array.len`, `list.get`,
+/// `array.count_where`, `array.find`, `dict.get`).
 pub fn default_tools() -> MockToolRegistry {
     let reg = mock_tools();
     http_request::register(&reg);
@@ -60,6 +63,8 @@ pub fn default_tools() -> MockToolRegistry {
     array_len::register(&reg);
     list_get::register(&reg);
     count_where::register(&reg);
+    array_find::register(&reg);
+    dict_get::register(&reg);
     reg
 }
 
@@ -76,7 +81,7 @@ mod tests {
     #[test]
     fn test_default_tools_factory() {
         let reg = default_tools();
-        assert_eq!(reg.tool_count(), 17); // 14 + env.*
+        assert_eq!(reg.tool_count(), 19); // 16 + env.*
         assert!(reg.tool_names().contains(&"env.get".to_string()));
         assert!(reg.tool_names().contains(&"http_request".to_string()));
         assert!(reg.tool_names().contains(&"postgres".to_string()));
@@ -85,5 +90,7 @@ mod tests {
         assert!(reg.tool_names().contains(&"array.len".to_string()));
         assert!(reg.tool_names().contains(&"list.get".to_string()));
         assert!(reg.tool_names().contains(&"array.count_where".to_string()));
+        assert!(reg.tool_names().contains(&"array.find".to_string()));
+        assert!(reg.tool_names().contains(&"dict.get".to_string()));
     }
 }

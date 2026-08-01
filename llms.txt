@@ -130,13 +130,21 @@ request writes to the DB (paused responses are returned but cannot be resumed).
 
 One function named `graph`. Everything is a pure dataflow: no control-flow side effects
 beyond the DAG. **Allowed:** arithmetic, comparisons, boolean ops, `if/elif/else`,
-bounded `for i in range(...)`, `call("tool", ...)`, dict/array literals, constant-key subscripting
-(`d["key"]`, `items[0]`), attribute access on results (`resp.body`, `users.count`),
+bounded `for i in range(...)`, `call("tool", ...)`, dict/array literals, subscripting
+with any key expression (`d["key"]`, `items[0]`, `items[i]`, `items[a + b]`,
+`items[obj.attr]`, nested `d["a"]["b"]`, chains `items[i].name`; negative indices
+use Python semantics `len + i`), attribute access on results (`resp.body`, `users.count`),
 string concatenation with `+` (NO f-strings — `"..." + x` is the idiom).
+
+**Subscript semantics are STRICT:** missing key / out-of-bounds index / subscripting
+`null` → runtime error. For optional lookups use the lenient tools:
+`call("array.find", array=items, key="product_id", value=101)` → first match or `null`;
+`call("dict.get", obj=d, key="x", default=0)` → value, default, or `null`. Check
+`null` with `== null`. Slicing (`items[a:b]`) is forbidden.
 
 **Forbidden (compiler rejects):** `import`, `class`, `lambda`, `while`, `try/except`, `async`,
 comprehensions, f-strings, walrus `:=`, `global`, `nonlocal`, `yield`, `del`, decorators,
-nested functions, dynamic subscript keys (`items[a + b]`), `**kwargs`.
+nested functions, slicing (`items[a:b]`), `**kwargs`.
 
 ### Module-level metadata: `META(...)`
 
@@ -204,7 +212,9 @@ call value; child internals merge into the caller context. Recursion depth limit
 | `json.parse` | `json` (string) → parsed JSON value (arrays/objects/numbers/strings/bools). |
 | `array.len` | `array` → element count. |
 | `array.count_where` | `array`, `key` (string), `value` → count of items where `item[key] == value`. |
-| `list.get` | `array`, `index` → element at index. |
+| `array.find` | `array`, `key` (string), `value` → first item where `item[key] == value`, or `null` (cross-type numeric equality; lenient — for "may not exist" lookups). |
+| `dict.get` | `obj`, `key` (string/int), optional `default` → value, `default`, or `null` (lenient). |
+| `list.get` | `array`, `index` → element at index (errors on out of bounds). |
 | `string.len` | → string length. |
 | `math.add` / `math.mul` | `a`, `b` → arithmetic (use `+`/`*` in expressions instead when possible). |
 | `env.get` | `key`, optional `default`. Literal string keys are statically detected; dynamic keys skip the pre-check and fail at runtime if missing. |

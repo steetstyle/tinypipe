@@ -13,7 +13,7 @@
 //!
 //! ## Backend
 //! - `optimize`: Constant folding, dead node elimination, fusion
-//! - `codegen`: ExecutionPlan → CompiledPlan (uint32 index, binary bincode)
+//! - `codegen`: ExecutionPlan → CompiledPlan (uint32 index, binary FlatBuffers)
 
 pub mod auto_repair;
 pub mod backend;
@@ -27,7 +27,7 @@ pub mod validator;
 pub mod llm;
 
 // Re-export main entry points
-pub use backend::codegen::{codegen, codegen_json, CodegenOutput};
+pub use backend::codegen::{codegen, CodegenOutput};
 pub use backend::optimize;
 
 /// Full pipeline: parse + sanitize + transform + validate + optimize + codegen.

@@ -456,23 +456,12 @@ impl<'a> SanitizerEngine<'a> {
             | ast::Expr::Set(_)
             | ast::Expr::Slice(_) => {}
 
-            // ── Subscript: dynamic key yasağı ──────────────────
+            // ── Subscript: tüm anahtar ifadeleri serbest, slice yasak ──
             ast::Expr::Subscript(e) => {
-                let key_allowed = match e.slice.as_ref() {
-                    // Constant keys (int, str) — allowed
-                    ast::Expr::Constant(_) => true,
-                    // Variable keys (items[key]) — allowed (static reference)
-                    ast::Expr::Name(_) => true,
-                    // Attribute keys (items[obj.attr]) — allowed
-                    ast::Expr::Attribute(_) => true,
-                    // Slice (items[1:10]) — the parser yields ast::ExprSlice for slices
-                    ast::Expr::Slice(_) => true,
-                    // Everything else = dynamic key → blocked
-                    _ => false,
-                };
-                if !key_allowed {
+                // Slicing (items[a:b]) VM'de desteklenmiyor — açık hata.
+                if matches!(e.slice.as_ref(), ast::Expr::Slice(_)) {
                     self.err(expr, format_args!(
-                        "dynamic subscript key is forbidden (only literal, variable, attribute, and slice keys allowed)"
+                        "slicing (items[a:b]) is not supported — use a single index"
                     ));
                 }
             }
@@ -1313,26 +1302,30 @@ mod tests {
     }
 
     #[test]
-    fn allow_subscript_slice() {
-        assert!(sanitize("def graph():\n    x = items[1:10]\n    return x").is_ok());
+    fn allow_subscript_dynamic_key() {
+        assert!(sanitize("def graph():\n    x = items[a + b]\n    return x").is_ok());
     }
 
     #[test]
-    fn reject_subscript_dynamic_key() {
-        let result = sanitize("def graph():\n    x = items[a + b]\n    return x");
-        assert!(result.is_err(), "dynamic key (a + b) should be rejected");
+    fn allow_subscript_computed_key() {
+        assert!(sanitize("def graph():\n    x = items[func()]\n    return x").is_ok());
     }
 
     #[test]
-    fn reject_subscript_computed_key() {
-        let result = sanitize("def graph():\n    x = items[func()]\n    return x");
-        assert!(result.is_err(), "computed key (func()) should be rejected");
+    fn allow_subscript_bool_key() {
+        assert!(sanitize("def graph():\n    x = items[x > 0]\n    return x").is_ok());
     }
 
     #[test]
-    fn reject_subscript_bool_key() {
-        let result = sanitize("def graph():\n    x = items[x > 0]\n    return x");
-        assert!(result.is_err(), "boolean expression key should be rejected");
+    fn reject_subscript_slice() {
+        let result = sanitize("def graph():\n    x = items[1:10]\n    return x");
+        assert!(result.is_err(), "slicing should be rejected");
+        let e = result.unwrap_err();
+        assert!(
+            e[0].message.contains("slicing"),
+            "expected slicing message, got: {}",
+            e[0].message
+        );
     }
 
     #[test]
@@ -1356,8 +1349,9 @@ mod tests {
     }
 
     #[test]
-    fn allow_slice() {
-        assert!(sanitize("x = items[1:10:2]").is_ok());
+    fn reject_slice() {
+        let e = sanitize("x = items[1:10:2]").unwrap_err();
+        assert!(e[0].message.contains("slicing"), "got: {}", e[0].message);
     }
 
     // ──────── Blocked ────────────────────────────────────────────

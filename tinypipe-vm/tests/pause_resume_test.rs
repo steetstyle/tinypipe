@@ -165,9 +165,8 @@ fn loop_plan() -> ExecutionPlan {
                 .with_arg("expr", "x + 1".into())
                 .with_arg("output", "x".into()),
             Node::new("body_decide", Opcode::Decide)
-                .with_arg("source", "x".into())
-                .with_arg("op", "lt".into())
-                .with_arg("value", 5i64.into()),
+                .with_arg("condition", "x >= 5".into()),
+            Node::new("body_break", Opcode::Act).with_arg("type", "break".into()),
             Node::new("output", Opcode::Act)
                 .with_arg("type", "return".into())
                 .with_arg("value", "x".into()),
@@ -176,6 +175,7 @@ fn loop_plan() -> ExecutionPlan {
             Edge::new("input_x", "loop1"),
             Edge::new("loop1", "body_calc"),
             Edge::new("body_calc", "body_decide"),
+            Edge::with_condition("body_decide", "body_break", "true"),
             Edge::control("loop1", "output"),
         ],
     )
@@ -188,7 +188,7 @@ fn test_pause_resume_mid_loop() {
     let exec = CompiledExecutor::new(&compiled, &reg);
 
     let full = exec.execute(inputs(0)).unwrap();
-    // x=0 → x<5 iken devam: iter0: 1, iter1: 2 ... iter4: 5, 5<5 false → break
+    // x=0 → iter0: 1, iter1: 2 ... iter4: x=5, 5>=5 → break marker → x=5 döner.
     assert_eq!(full.output, Some(Value::Int(5)));
 
     // Loop gövdesi ortasında duraklat: body_node sayımı dahil toplam 3. node'da pause
