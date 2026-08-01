@@ -124,6 +124,8 @@ b5d2b135-0ca3-4ef6-ba95-ef52110a4587  hello                v 4  deployed       3
 
 # Inspect the compiled plan (text, default)
 $ tinypipe-cli plan hello
+```
+
 ```text
 Graph: hello (v1)
 Format: FlatBuffers (508 bytes)
@@ -654,7 +656,6 @@ $ tinypipe-daemon
 WARN tinypipe_daemon: worker auth: NO key configured — generated random key;
     workers must set TINYPIPE_DAEMON_API_KEY=4f2c1a9e-...
 
-
 # Option C: disable auth entirely (open network only — never on the internet)
 $ tinypipe-daemon --no-auth        # or TINYPIPE_DAEMON_NO_AUTH=1
 ```
@@ -663,6 +664,7 @@ The Go worker SDK passes the key with `Worker.SetAPIKey(...)`; `examples/go-work
 reads `TINYPIPE_DAEMON_API_KEY` automatically. A worker with a wrong/missing key is
 rejected with `Unauthenticated` and its tools never register.
 
+```bash
 # See the remote tools next to built-ins
 $ tinypipe-cli tools list
 Built-in tools (16): array.len, echo, env.get, ...
